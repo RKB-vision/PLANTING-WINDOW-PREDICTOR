@@ -1,3 +1,6 @@
 numpy
 opencv-python
 ultralytics
+pandas
+scikit-learn
+joblib

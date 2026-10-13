@@ -41,7 +41,7 @@ The ESP32-CAM / Cloudinary / OpenCV measurement pipeline
 ```bash
 cd /Users/visionary/Documents/CODING/EMBEDDED
 source .venv/bin/activate
-pip install pandas scikit-learn joblib    # already present in the project venv
+pip install -r requirements.txt
 ```
 
 ## Quick start

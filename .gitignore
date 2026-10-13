@@ -1,0 +1,21 @@
+# Python environments and caches
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration and OS files
+.env
+.DS_Store
+
+# Runtime databases and generated data
+*.db
+*.sqlite
+*.sqlite3
+
+# Generated model artifacts
+models/
+models_demo/
+*.joblib
