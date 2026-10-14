@@ -151,3 +151,4 @@ requirements are met, the candidate is trained **excluding** the holdout
 plants, and the candidate must score a strictly lower holdout MAE than the
 deployed model on the **same held-out plants** - otherwise the current model
 is kept.
+# PLANTING-WINDOW-PREDICTOR
