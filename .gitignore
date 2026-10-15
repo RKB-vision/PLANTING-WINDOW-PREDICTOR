@@ -14,8 +14,21 @@ __pycache__/
 *.db
 *.sqlite
 *.sqlite3
+# migration backups (never commit copied DBs)
+*.bak-*
 
 # Generated model artifacts
 models/
 models_demo/
 *.joblib
+
+# Secrets - server-side only; the committed example uses placeholders
+.streamlit/secrets.toml
+.streamlit/config.toml.local
+supabase/.temp/
+supabase/.branches/
+
+# Private / per-user exports and local artifacts
+exports/
+private/
+*.private.csv

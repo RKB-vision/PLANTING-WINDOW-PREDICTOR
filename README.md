@@ -26,11 +26,18 @@ feedback loop.
 | `plant_feedback.py` | CLI workflow: register, observe, predict, transplant, due reminders, submit feedback, history, species-status, list. |
 | `demo_workflow.py` | Scripted end-to-end SYNTHETIC demonstration (steps 0-6, including retrain comparison). |
 | `plantreadiness/db.py` | SQLite schema + validation + duplicate protection + date/growth arithmetic. |
+| `plantreadiness/repository.py` | Repository layer: `SQLiteRepository` (CLI/local) + `SupabaseRepository` (user-scoped CRUD, RLS identity, error translation). UI/CLI never embed SQL. |
+| `plantreadiness/services.py` | Shared business logic used by BOTH the CLI and the web app (register, observe, transplant, feedback, corrections, predictions, CSV import/export, dashboard summary). |
 | `plantreadiness/csv_import.py` | Real CSV import (append-only, idempotent) + data-quality checks + growth analysis. |
 | `plantreadiness/synthetic.py` | Reproducible synthetic generator (documented assumptions, not botanical facts). |
 | `plantreadiness/model.py` | Countdown training, grouped validation, artefacts + metadata, fallback selection, retrain gate. |
 | `plantreadiness/config.py` | Constants: paths, minimum data requirements, standard messages. |
-| `tests/` | Automated tests (dates, growth, duplicates, missing data, fallback, separation, integration). |
+| `webapp/` | Streamlit web app: `app.py` (entry + auth gate), `settings.py` (secrets/backend), `auth.py`, `components.py`, `pages/` (Dashboard, Register, Observation, Predictions, Transplant & feedback, Species & data). |
+| `supabase/migrations/` | Versioned SQL: `0001_initial_schema.sql` (tables/keys/FKs/uniques/triggers) + `0002_row_level_security.sql` (per-user RLS on all 8 tables). |
+| `scripts/migrate_sqlite_to_supabase.py` | Safe SQLite -> Supabase migration: dry-run by default, backup before apply, duplicate detection, idempotent re-run, per-source (real/synthetic) reporting; signs in as the destination user (no service-role key). |
+| `scripts/verify_rls.py` | Two-account isolation check using only the anon key + two ordinary sessions (proves RLS, doesn't assume it). |
+| `tests/` | Automated tests (dates, growth, duplicates, missing data, fallback, separation, integration, repository/auth, services, migration, secrets, Streamlit forms). |
+| `DEPLOYMENT.md` | Full deployment guide: Supabase setup, migrations, auth, secrets, local run, GitHub, Streamlit Community Cloud, production secrets, RLS verification, backup/export. |
 | `REPORT.md` | Limitations report: what is demonstrated only with synthetic data. |
 
 The ESP32-CAM / Cloudinary / OpenCV measurement pipeline
@@ -43,6 +50,31 @@ cd /Users/visionary/Documents/CODING/EMBEDDED
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
+
+## Quick start - one command
+
+```bash
+./run.sh            # set up (venv, deps, local SQLite config + DB), then
+                    # open the web app at http://localhost:8501
+```
+
+The first run creates `.venv/`, installs dependencies, writes a local-dev
+`.streamlit/secrets.toml` (backend `sqlite`, only if none exists - your
+Supabase config is never overwritten), and initialises `plant_readiness.db`.
+Re-running is always safe.
+
+```bash
+./run.sh demo       # train the labelled SYNTHETIC DEMO models, then open
+                    # the web app (Predictions page can then use them)
+./run.sh test       # run the full automated test suite (211 tests)
+./run.sh cli ...    # CLI passthrough, e.g. ./run.sh cli list
+./run.sh help       # show usage
+
+PORT=8502 ./run.sh          # serve on another port
+HEADLESS=1 ./run.sh         # do not auto-open the browser (servers/SSH)
+```
+
+## Quick start (manual / CLI)
 
 ## Quick start
 
@@ -124,13 +156,45 @@ validation and reported MAE in days against a mean-baseline.
 
 ## Database
 
-SQLite (`plant_readiness.db`, created on first use) with tables
+The CLI uses SQLite (`plant_readiness.db`, created on first use) with tables
 `plants`, `observations`, `readiness_events`, `feedback_14d`:
 primary/foreign keys, CHECK constraints, duplicate protection
 (one observation per plant per date, one feedback record per transplant,
 feedback is immutable after submission), and `data_source` on every row to
 keep `real` and `synthetic` separated. Historical observations and feedback
 are never overwritten.
+
+The web app uses **Supabase PostgreSQL** with the equivalent schema
+(`supabase/migrations/`), splitting transplants and 14-day feedback into
+separate linked tables plus a `feedback_corrections` audit table, and
+enforcing **per-user Row Level Security** so one account can never see or
+touch another account's data. Both backends are reached only through the
+repository layer, so the UI never embeds SQL.
+
+## Web app (Streamlit + Supabase)
+
+A multi-user web interface backed by Supabase (Postgres + Auth + RLS):
+
+```bash
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml
+# fill in backend + credentials (see DEPLOYMENT.md)
+streamlit run webapp/app.py
+```
+
+Six pages: **Dashboard** (real metrics only), **Register plant**,
+**Record observation** (auto age/growth-rate, growth chart, never invents
+values), **Predictions** (same fallback logic as the CLI, with honest
+explanations when prediction is unavailable), **Transplant & 14-day
+feedback** (due = transplant + 14 days; pending/due/overdue/completed;
+duplicates blocked; explicit corrections preserving audit history), and
+**Species & data management** (evidence counts, CSV import with
+preview/validation, CSV export, search/filter).
+
+All configuration is server-side (`.streamlit/secrets.toml`, gitignored).
+The app only ever uses the **anon (public) key** with signed-in user
+sessions, so RLS is always enforced; a service-role key is refused loudly
+at startup. Full setup, deployment, RLS-verification and backup
+instructions are in [`DEPLOYMENT.md`](DEPLOYMENT.md).
 
 ## Tests
 
@@ -141,7 +205,13 @@ python -m unittest discover -s tests -v
 Covers: date arithmetic (readiness target, +14-day due dates), growth
 calculation (including missing/deceased plants), duplicate feedback and
 observation protection, species fallback levels, real/synthetic
-data-source separation, CSV import, and the end-to-end demo workflow.
+data-source separation, CSV import, and the end-to-end demo workflow; plus
+the web stack: repository layer (Supabase client mocked - ownership
+scoping, error translation), services (both backends), migration
+planning/apply/idempotent re-run safety, secrets handling (missing keys,
+placeholder detection, service-role rejection), and the Streamlit forms
+via `AppTest` (setup gate, navigation, register/observation/feedback
+validation, honest prediction refusal, CSV export).
 
 ## Retraining policy
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -438,17 +438,28 @@ def load_selection(selection: dict, models_dir: Path) -> dict:
 
 
 def predict_days_remaining(selection: dict, observation: dict) -> dict:
-    """Predict days remaining from one observation dict.
+    """Predict days remaining and estimated readiness date from one observation.
 
     ``observation`` must provide the plant's species/variety and the feature
-    values of its latest (pre-readiness) measurement. Returns prediction,
-    uncertainty from validation metrics, and labelling.
+    values of its latest (pre-readiness) measurement.
+
+    If an ``observation_date`` is present, calculates:
+        predicted_readiness_date = observation_date + timedelta(days=round(raw))
+
+    Negative prediction policy:
+    Does NOT clamp negative values to 0.0 to hide model behavior. If raw < 0,
+    past_readiness is True, status is 'past_readiness', and a descriptive note
+    is included indicating readiness was reached prior to this observation.
     """
     if selection["level"] == 4 or not selection.get("artifact"):
         return {
             "available": False,
-            "message": config.UNAVAILABLE_MESSAGE,
+            # selection.message already equals config.UNAVAILABLE_MESSAGE,
+            # plus an explanatory note (e.g. "synthetic models exist but were
+            # NOT used") - surfacing it keeps the refusal honest.
+            "message": selection.get("message") or config.UNAVAILABLE_MESSAGE,
             "synthetic": False,
+            "predicted_readiness_date": None,
         }
 
     meta = selection["artifact"]["metadata"]
@@ -458,13 +469,37 @@ def predict_days_remaining(selection: dict, observation: dict) -> dict:
     X = pd.DataFrame([row], columns=FEATURE_COLUMNS)
 
     raw = float(selection["artifact"]["model"].predict(X)[0])
-    clipped = max(raw, 0.0)
     metrics = meta.get("validation_metrics", {})
+
+    obs_date_str = observation.get("observation_date")
+    predicted_date_str = None
+    if obs_date_str:
+        try:
+            obs_d = datetime.strptime(str(obs_date_str).split("T")[0].strip(), "%Y-%m-%d").date()
+            pred_d = obs_d + timedelta(days=int(round(raw)))
+            predicted_date_str = pred_d.isoformat()
+        except Exception:
+            predicted_date_str = None
+
+    past_readiness = raw < 0
+    readiness_status = "past_readiness" if past_readiness else ("ready_today" if round(raw, 1) == 0.0 else "ready_soon")
+    status_note = None
+    if past_readiness:
+        status_note = (
+            f"Readiness passed: model estimates seedling passed transplant-ready "
+            f"stage approximately {abs(round(raw, 1))} days before this observation."
+        )
+
     return {
         "available": True,
         "days_remaining_raw": round(raw, 2),
-        "days_remaining": round(clipped, 1),
-        "clamped": raw < 0,
+        "days_remaining": round(raw, 1),
+        "past_readiness": past_readiness,
+        "readiness_status": readiness_status,
+        "status_note": status_note,
+        "clamped": False,
+        "predicted_readiness_date": predicted_date_str,
+        "observation_date": obs_date_str,
         "mae_days": metrics.get("mae_days"),
         "mae_days_std": metrics.get("mae_days_std"),
         "baseline_mae_days": metrics.get("baseline_mean_mae_days"),

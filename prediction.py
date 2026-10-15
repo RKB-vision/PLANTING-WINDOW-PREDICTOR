@@ -41,91 +41,28 @@ from pathlib import Path
 
 from plantreadiness import config
 from plantreadiness import db as dbm
-from plantreadiness import model as mdl
+from plantreadiness import services as svc
+from plantreadiness.repository import SQLiteRepository
 
 
 # --------------------------------------------------------------------------- #
-# Core prediction
+# Core prediction (thin wrappers over the shared service layer)
 # --------------------------------------------------------------------------- #
 
 
 def predict_for_plant(conn, plant_id: int, models_dir: Path,
                       allow_synthetic: bool = False) -> dict:
     """Species-aware prediction for a registered plant's latest observation."""
-    plant = dbm.get_plant(conn, plant_id)
-    species = plant["species"]
-    variety = plant["variety"]
-    plant_source = plant["data_source"]
-
-    obs = dbm.latest_observation(conn, plant_id)
-    if obs is None:
-        return {
-            "available": False,
-            "message": "No observations recorded for this plant yet - "
-                       "the system is still collecting data.",
-            "synthetic": False,
-            "plant_id": plant_id,
-            "species": species,
-            "variety": variety,
-            "plant_data_source": plant_source,
-            "readiness_event_counts": dbm.readiness_event_counts(
-                conn, species, variety, data_source="real"),
-        }
-
-    if plant_source == "real" and allow_synthetic:
-        # never silent: flag it loudly in the result
-        pass
-
-    selection = mdl.select_model(
-        species, variety, models_dir, allow_synthetic=allow_synthetic)
-    # Real plants must not silently use synthetic models: select_model only
-    # returns a synthetic artefact when allow_synthetic=True, which the caller
-    # requested explicitly.
-    mdl.load_selection(selection, models_dir)
-
-    observation = {
-        "age_days": obs["age_days"],
-        "height_cm": obs["height_cm"],
-        "growth_rate_cm_per_day": obs["growth_rate_cm_per_day"],
-        "canopy_width_cm": obs["canopy_width_cm"],
-        "visible_true_leaf_count": obs["visible_true_leaf_count"],
-        "species": species,
-        "variety": variety,
-    }
-    result = mdl.predict_days_remaining(selection, observation)
-    result.update({
-        "plant_id": plant_id,
-        "species": species,
-        "variety": variety,
-        "plant_data_source": plant_source,
-        "observation_date": obs["observation_date"],
-        "observation": dict(obs),
-        "readiness_event_counts": dbm.readiness_event_counts(
-            conn, species, variety, data_source="real"),
-        "synthetic_note": (
-            "SYNTHETIC DEMO: provisional prediction from simulated data - "
-            "not a botanical finding."
-            if result.get("synthetic") else None),
-    })
-    # A real plant using a synthetic model must always be explicit:
-    if result.get("synthetic") and plant_source == "real":
-        result["cross_source_warning"] = (
-            "This is a REAL plant being shown an explicitly-enabled "
-            "SYNTHETIC DEMO prediction. Do not treat it as evidence.")
-    return result
+    return svc.predict_for_plant(SQLiteRepository(conn), plant_id, models_dir,
+                                 allow_synthetic=allow_synthetic)
 
 
 def predict_ad_hoc(species: str, variety: str | None,
                    observation: dict, models_dir: Path,
                    allow_synthetic: bool = False) -> dict:
     """Prediction from values given on the command line."""
-    selection = mdl.select_model(species, variety, models_dir,
-                                 allow_synthetic=allow_synthetic)
-    mdl.load_selection(selection, models_dir)
-    observation = dict(observation)
-    observation["species"] = species
-    observation["variety"] = variety
-    return mdl.predict_days_remaining(selection, observation)
+    return svc.predict_ad_hoc(species, variety, observation, models_dir,
+                              allow_synthetic=allow_synthetic)
 
 
 # --------------------------------------------------------------------------- #
@@ -174,9 +111,11 @@ def format_result(result: dict) -> str:
     lines.append(result.get("message", ""))
     lines.append(f"Estimated days remaining until transplant-ready stage: "
                  f"{result['days_remaining']}")
-    if result.get("clamped"):
-        lines.append(f"  (raw model output was {result['days_remaining_raw']} "
-                     f"days - clamped at 0; readiness may already have passed)")
+    if result.get("predicted_readiness_date"):
+        lines.append(f"Estimated readiness date : {result['predicted_readiness_date']} "
+                     f"(calculated from observation on {result.get('observation_date')})")
+    if result.get("past_readiness"):
+        lines.append(f"  PAST READINESS WARNING: {result.get('status_note')}")
     if result.get("mae_days") is not None:
         lines.append(f"Validation MAE     : +/- {result['mae_days']} days "
                      f"(std {result.get('mae_days_std')}) on grouped CV")

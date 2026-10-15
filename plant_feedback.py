@@ -38,7 +38,8 @@ from pathlib import Path
 
 from plantreadiness import config
 from plantreadiness import db as dbm
-from plantreadiness import model as mdl
+from plantreadiness import services as svc
+from plantreadiness.repository import SQLiteRepository
 
 
 # --------------------------------------------------------------------------- #
@@ -92,8 +93,9 @@ def _print_reminders(conn, as_of: date | None = None) -> None:
 
 
 def cmd_register(conn, args) -> int:
-    pid = dbm.register_plant(
-        conn, species=args.species, variety=args.variety,
+    repo = SQLiteRepository(conn)
+    pid = svc.register_plant(
+        repo, species=args.species, variety=args.variety,
         date_started=args.date_started,
         data_source=args.source,
         growing_conditions=args.conditions,
@@ -119,6 +121,48 @@ def cmd_observe(conn, args) -> int:
     return 0
 
 
+def cmd_readiness(conn, args) -> int:
+    _banner(conn, args.plant)
+    repo = SQLiteRepository(conn)
+    res = svc.record_readiness_event(
+        repo,
+        plant_id=args.plant,
+        readiness_observed_date=args.date,
+        readiness_definition_version=args.version,
+        assessment_source=args.source,
+        notes=args.notes,
+    )
+    print(f"Recorded readiness event #{res['readiness_event_id']} for plant #{args.plant} "
+          f"({res.get('species')}{'/' + res['variety'] if res.get('variety') else ''}) "
+          f"on {args.date} [version: {args.version}, observer: {args.source}].")
+    return 0
+
+
+def cmd_import_camera(conn, args) -> int:
+    repo = SQLiteRepository(conn)
+    csv_path = Path(args.csv)
+    print(f"Importing camera measurements from {csv_path} ...")
+    report = svc.import_camera_measurements(
+        repo,
+        csv_path,
+        default_species=args.species,
+        default_variety=args.variety,
+        auto_register=not args.no_auto_register,
+    )
+    print("Camera measurement import complete:")
+    print(f"  Rows read            : {report['rows_read']}")
+    print(f"  Observations inserted: {report['observations_inserted']}")
+    print(f"  Duplicates skipped   : {report['observations_skipped_duplicate']}")
+    print(f"  Plants auto-created  : {report['plants_registered']}")
+    if report["unmatched_plants"]:
+        print(f"  Unmatched plant IDs  : {report['unmatched_plants']}")
+    if report["issues"]:
+        print(f"  Issues encountered   : {len(report['issues'])}")
+        for issue in report["issues"][:5]:
+            print(f"    - line {issue.get('line')}: {issue.get('problem')}")
+    return 0
+
+
 def cmd_predict(conn, args) -> int:
     from prediction import predict_for_plant, format_result
     _banner(conn, args.plant)
@@ -130,8 +174,9 @@ def cmd_predict(conn, args) -> int:
 
 def cmd_transplant(conn, args) -> int:
     _banner(conn, args.plant)
-    rec = dbm.record_transplant(
-        conn, plant_id=args.plant, transplant_date=args.date,
+    repo = SQLiteRepository(conn)
+    rec = svc.record_transplant(
+        repo, plant_id=args.plant, transplant_date=args.date,
         height_at_transplant_cm=args.height, data_source=args.source)
     print(f"Transplant recorded for plant #{args.plant} on "
           f"{rec['transplant_date']}.")
@@ -149,7 +194,7 @@ def cmd_due(conn, args) -> int:
     as_of = None
     if getattr(args, "as_of", None):
         as_of = dbm.parse_iso_date(args.as_of, "--as-of")
-    rows = dbm.pending_feedback(conn, as_of=as_of)
+    rows = SQLiteRepository(conn).pending_feedback(as_of=as_of)
     if not rows:
         print("No pending 14-day feedback.")
         return 0
@@ -168,8 +213,9 @@ def cmd_submit(conn, args) -> int:
     survived = bool(int(args.survived))
     fb = dbm.get_feedback(conn, args.feedback)
     _banner(conn, fb["plant_id"])
-    result = dbm.submit_feedback(
-        conn, feedback_id=args.feedback,
+    result = svc.submit_feedback(
+        SQLiteRepository(conn),
+        feedback_id=args.feedback,
         feedback_submitted_date=args.submitted_date,
         survived_after_14d=survived,
         height_after_14d_cm=args.height_after,
@@ -194,6 +240,29 @@ def cmd_submit(conn, args) -> int:
     print("\nNote: a 14-day outcome records survival/growth. It does NOT by "
           "itself reveal the exact day readiness began, and it is not "
           "auto-converted into a readiness label.")
+    return 0
+
+
+def cmd_correct(conn, args) -> int:
+    """Amend a submitted outcome - the only path that may edit history."""
+    survived = None if args.survived is None else bool(int(args.survived))
+    result = svc.correct_feedback(
+        SQLiteRepository(conn),
+        feedback_id=args.feedback,
+        feedback_submitted_date=args.submitted_date,
+        survived_after_14d=survived,
+        height_after_14d_cm=args.height_after,
+        visible_condition=args.condition,
+        user_notes=args.notes,
+        reason=args.reason)
+    print(f"Feedback #{args.feedback} corrected (reason: {args.reason}).")
+    print(f"  survived after 14 days : {bool(result['survived_after_14d'])}")
+    print(f"  height after 14 days   : {result['height_after_14d_cm']} cm")
+    print(f"  growth after 14 days   : {result['growth_after_14d_cm']}")
+    print(f"  visible condition      : {result['visible_condition']}")
+    revisions = SQLiteRepository(conn).feedback_revisions(args.feedback)
+    print(f"  audit history          : {len(revisions)} correction(s) "
+          "recorded - original values preserved.")
     return 0
 
 
@@ -266,7 +335,8 @@ def cmd_history(conn, args) -> int:
 
 
 def cmd_species_status(conn, args) -> int:
-    summary = dbm.species_data_summary(conn, args.species, args.variety)
+    summary = SQLiteRepository(conn).species_data_summary(
+        args.species, args.variety)
     print(f"Species status: {args.species}"
           f"{' / ' + args.variety if args.variety else ''}")
     print(f"  plants by source         : {summary['plants']}")
@@ -381,6 +451,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--notes")
     p.set_defaults(func=cmd_submit)
 
+    p = sub.add_parser("correct", parents=[common],
+                       help="amend a submitted 14-day outcome (audited)")
+    p.add_argument("--feedback", type=int, required=True)
+    p.add_argument("--reason", required=True,
+                   help="why the correction is being made (kept in audit)")
+    p.add_argument("--submitted-date", dest="submitted_date")
+    p.add_argument("--survived", choices=["0", "1"],
+                   help="0 = died, 1 = survived")
+    p.add_argument("--height-after", dest="height_after", type=float,
+                   help="height after 14 days (omit to keep current)")
+    p.add_argument("--condition", choices=list(config.VISIBLE_CONDITIONS))
+    p.add_argument("--notes")
+    p.set_defaults(func=cmd_correct)
+
     p = sub.add_parser("history", parents=[common],
                        help="plant history: obs, readiness, feedback")
     p.add_argument("--plant", type=int, required=True)
@@ -398,6 +482,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source", choices=list(config.VALID_SOURCES))
     p.set_defaults(func=cmd_list)
 
+    p = sub.add_parser("readiness", parents=[common],
+                       help="record an observed readiness event (ground truth training label)")
+    p.add_argument("--plant", type=int, required=True)
+    p.add_argument("--date", help="date readiness was verified (default: today)")
+    p.add_argument("--version", required=True,
+                   help="readiness definition version (e.g. v1-nursery-visual)")
+    p.add_argument("--source", required=True,
+                   help="assessment source or observer (e.g. grower-inspection)")
+    p.add_argument("--notes", help="notes on visual criteria observed")
+    p.set_defaults(func=cmd_readiness)
+
+    p = sub.add_parser("import-camera", parents=[common],
+                       help="import daily measurements from ESP32-CAM/OpenCV CSV")
+    p.add_argument("--csv", default="plant_daily_measurements.csv",
+                   help="path to camera CSV (default: plant_daily_measurements.csv)")
+    p.add_argument("--species", default="Super Orange",
+                   help="default species if plant must be registered (default: Super Orange)")
+    p.add_argument("--variety", help="default variety if plant must be registered")
+    p.add_argument("--no-auto-register", action="store_true",
+                   help="do not register unknown plants automatically")
+    p.set_defaults(func=cmd_import_camera)
+
     return parser
 
 
@@ -406,6 +512,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # default dates
     if args.command == "observe" and args.date is None:
+        args.date = date.today().isoformat()
+    if args.command == "readiness" and args.date is None:
         args.date = date.today().isoformat()
     if args.command == "submit" and args.submitted_date is None:
         args.submitted_date = date.today().isoformat()
