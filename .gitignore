@@ -11,6 +11,7 @@ __pycache__/
 .DS_Store
 
 # Runtime databases and generated data
+# Recreate the runtime DB with `python -m plantreadiness.seed`; never commit it.
 *.db
 *.sqlite
 *.sqlite3
@@ -18,9 +19,11 @@ __pycache__/
 *.bak-*
 
 # Generated model artifacts
-models/
+# models/ is committed so collaborators share the reference baseline and
+# the synthetic demo models; scratch models/dirs stay ignored.
 models_demo/
 *.joblib
+!models/**
 
 # Private / per-user exports and local artifacts
 exports/
