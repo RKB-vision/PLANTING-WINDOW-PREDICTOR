@@ -4,7 +4,7 @@
   "variety": null,
   "data_source": "real",
   "source_label": "Super Orange successful cohort",
-  "generated_at": "2026-10-16T04:34:28.045769+00:00",
+  "generated_at": "2026-10-16T05:13:48.654892+00:00",
   "n_plants": 10,
   "n_points": 250,
   "n_plants_contributing_to_medians": 10,
@@ -16,7 +16,7 @@
   },
   "by_age_days": [
     {
-      "age_days": 7,
+      "age_days": 8,
       "n_points": 10,
       "n_plants": 10,
       "median_height_cm": 0.3,
@@ -27,7 +27,7 @@
       "max_days_until_transplant": 26.0
     },
     {
-      "age_days": 8,
+      "age_days": 9,
       "n_points": 10,
       "n_plants": 10,
       "median_height_cm": 0.5,

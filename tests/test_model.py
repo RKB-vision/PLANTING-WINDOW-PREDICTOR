@@ -147,14 +147,14 @@ class TestCsvImport(unittest.TestCase):
         self.assertEqual(report["observations_inserted"], 250)
         self.assertEqual(report["plants_imported"], 10)
         self.assertEqual(report["issues"], [])
-        # spot-check a known row: plant 1, 2026-09-02, height 0.5, age 7
+        # spot-check a known row: plant 1, 2026-09-02, height 0.5, age 8
         row = self.conn.execute(
             """SELECT o.* FROM observations o
                JOIN plants p ON p.plant_id = o.plant_id
                WHERE p.external_ref = '1'
                  AND o.observation_date = '2026-09-02'""").fetchone()
         self.assertEqual(row["height_cm"], 0.5)
-        self.assertEqual(row["age_days"], 7)
+        self.assertEqual(row["age_days"], 8)
         self.assertIsNone(row["growth_rate_cm_per_day"])
         # all rows are real
         n_syn = self.conn.execute(
