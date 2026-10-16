@@ -11,9 +11,8 @@ __pycache__/
 .DS_Store
 
 # Runtime databases and generated data
-# *.db stays ignored, except the shared runtime DB kept for collaboration.
+# Recreate the runtime DB with `python -m plantreadiness.seed`; never commit it.
 *.db
-!plant_readiness.db
 *.sqlite
 *.sqlite3
 # migration backups (never commit copied DBs)

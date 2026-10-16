@@ -75,10 +75,19 @@ Manual refresh: `POST /api/camera/refresh` (optionally `{"species": "..."}`).
 ## Setup
 
 ```bash
-cd /Users/visionary/Documents/CODING/EMBEDDED
-source .venv/bin/activate
+git clone https://github.com/RKB-vision/PLANTING-WINDOW-PREDICTOR.git
+cd PLANTING-WINDOW-PREDICTOR
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+cd nextjs && npm install && cd ..
+
+cp .env.example .env              # then add your Cloudinary credentials
+python -m plantreadiness.seed     # create the local database + reference baseline
 ```
+
+`plant_readiness.db` and `models/` are rebuilt from the committed sources by
+`python -m plantreadiness.seed`; nothing sensitive and no runtime database is
+committed. See *Seeding the database* below.
 
 ## Quick start - one command
 
@@ -209,6 +218,24 @@ working without a reset.
 Storage is **local SQLite on this device** (`plant_readiness.db`), reached only
 through the repository layer, so neither the CLI nor the UI embeds SQL. There
 is no cloud database dependency.
+
+### Seeding the database (collaborators)
+
+`plant_readiness.db` is runtime state - it changes with every measurement or
+feedback submission - so it is **not** committed. Rebuild the shared starting
+point from the committed sources with:
+
+```bash
+python -m plantreadiness.seed            # text report
+python -m plantreadiness.seed --json     # machine-readable report
+```
+
+The seed creates the schema, imports the historical cohort
+(`super_orange_growth_data.csv`, tagged `cohort='reference'`), and rebuilds the
+successful-cohort reference baseline under `models/reference/`. It is
+**idempotent** and never invents data: re-running imports nothing new and
+regenerates the same medians. Camera plants are never part of the seed - they
+are always registered explicitly (see *Camera refresh*).
 
 ## Web app (Next.js + Flask API)
 
