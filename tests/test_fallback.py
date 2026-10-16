@@ -188,7 +188,7 @@ class TestTrainingGuards(unittest.TestCase):
         rows = [
             {"plant_id": i, "species": "Super Orange", "variety": "Early",
              "age_days": 10, "height_cm": 3.0, "growth_rate_cm_per_day": 0.3,
-             "canopy_width_cm": None, "visible_true_leaf_count": None,
+             "stem_width_cm": None, "visible_true_leaf_count": None,
              "days_remaining": 5}
             for i in range(1, 4)   # only 3 plants < MIN_INDEPENDENT_PLANTS
         ]
@@ -200,7 +200,7 @@ class TestTrainingGuards(unittest.TestCase):
         rows = [
             {"plant_id": 1, "species": "Super Orange", "variety": None,
              "age_days": 10, "height_cm": 3.0, "growth_rate_cm_per_day": 0.3,
-             "canopy_width_cm": None, "visible_true_leaf_count": None,
+             "stem_width_cm": None, "visible_true_leaf_count": None,
              "days_remaining": 7},
         ]
         df = mdl.build_training_frame(rows)

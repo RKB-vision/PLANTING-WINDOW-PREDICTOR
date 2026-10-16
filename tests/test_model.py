@@ -10,7 +10,7 @@ from plantreadiness import model as mdl
 from plantreadiness import synthetic
 
 ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = ROOT / "super_orange_growth_data_with_growth_rate.csv"
+CSV_PATH = ROOT / "super_orange_growth_data.csv"
 
 
 def _synthetic_frame(n_plants=12, seed=0):
@@ -29,7 +29,7 @@ def _synthetic_frame(n_plants=12, seed=0):
                 "age_days": age,
                 "height_cm": 0.3 + 0.25 * age + rng.gauss(0, 0.1),
                 "growth_rate_cm_per_day": 0.25 + rng.gauss(0, 0.05),
-                "canopy_width_cm": None,
+                "stem_width_cm": None,
                 "visible_true_leaf_count": None,
                 "days_remaining": ready_age - age,
             })
@@ -75,7 +75,7 @@ class TestGroupedValidation(unittest.TestCase):
                "artifact": artifact, "message": "test"}
         res = mdl.predict_days_remaining(sel, {
             "age_days": 20, "height_cm": 5.0, "growth_rate_cm_per_day": 0.25,
-            "canopy_width_cm": None, "visible_true_leaf_count": None,
+            "stem_width_cm": None, "visible_true_leaf_count": None,
             "species": "Super Orange", "variety": "Early"})
         self.assertTrue(res["available"])
         self.assertGreaterEqual(res["days_remaining"], 0)
@@ -147,22 +147,15 @@ class TestCsvImport(unittest.TestCase):
         self.assertEqual(report["observations_inserted"], 250)
         self.assertEqual(report["plants_imported"], 10)
         self.assertEqual(report["issues"], [])
-        # spot-check a known row: plant 1, 2083-05-02, height 0.5, no rate
+        # spot-check a known row: plant 1, 2026-09-02, height 0.5, age 7
         row = self.conn.execute(
             """SELECT o.* FROM observations o
                JOIN plants p ON p.plant_id = o.plant_id
                WHERE p.external_ref = '1'
-                 AND o.observation_date = '2083-05-02'""").fetchone()
+                 AND o.observation_date = '2026-09-02'""").fetchone()
         self.assertEqual(row["height_cm"], 0.5)
-        self.assertEqual(row["age_days"], 8)
+        self.assertEqual(row["age_days"], 7)
         self.assertIsNone(row["growth_rate_cm_per_day"])
-        # spot-check growth rate row: plant 1, 2083-05-03 -> 0.1
-        row2 = self.conn.execute(
-            """SELECT o.* FROM observations o
-               JOIN plants p ON p.plant_id = o.plant_id
-               WHERE p.external_ref = '1'
-                 AND o.observation_date = '2083-05-03'""").fetchone()
-        self.assertEqual(row2["growth_rate_cm_per_day"], 0.1)
         # all rows are real
         n_syn = self.conn.execute(
             "SELECT COUNT(*) FROM observations "

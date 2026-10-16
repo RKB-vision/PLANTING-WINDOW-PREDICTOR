@@ -13,7 +13,7 @@ from plantreadiness import db as dbm
 from plantreadiness import model as mdl
 
 ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = ROOT / "super_orange_growth_data_with_growth_rate.csv"
+CSV_PATH = ROOT / "super_orange_growth_data.csv"
 
 
 class TestRealWorkflow(unittest.TestCase):
@@ -81,7 +81,7 @@ class TestRealWorkflow(unittest.TestCase):
         rows = [
             {"plant_id": i, "species": "Super Orange", "variety": "Early",
              "age_days": age, "height_cm": 0.3 + 0.25 * age,
-             "growth_rate_cm_per_day": 0.25, "canopy_width_cm": None,
+             "growth_rate_cm_per_day": 0.25, "stem_width_cm": None,
              "visible_true_leaf_count": None,
              "days_remaining": 30 - age}
             for i in range(1, 9)
@@ -180,9 +180,14 @@ class TestDemoEndToEnd(unittest.TestCase):
             conn.close()
         self.assertTrue(res["available"])
         self.assertTrue(res["synthetic"])
-        # a 25-day-old synthetic plant should have a small positive countdown
-        self.assertGreaterEqual(res["days_remaining"], 0)
-        self.assertLess(res["days_remaining"], 30)
+        # The demo keeps a few days of post-readiness monitoring, so the
+        # latest observation can sit just past the readiness date. An honest
+        # model then reports a small countdown that may be slightly negative
+        # ("past_readiness"); it must never be silently clamped to zero.
+        self.assertLess(abs(res["days_remaining"]), 30)
+        self.assertFalse(res["clamped"])
+        self.assertIn(res["readiness_status"],
+                      {"ready_soon", "ready_today", "past_readiness"})
 
     def test_retrain_never_trains_on_holdout(self):
         import model_train

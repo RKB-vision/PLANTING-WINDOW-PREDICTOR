@@ -1,2 +1,2 @@
 day,plant_id,captures_used,average_height_cm,average_width_cm,average_visible_leaves,average_cm_per_pixel,average_confidence,first_capture_timestamp,last_capture_timestamp
-Day-01,Plant-01,1,8.4540,0.8471,2.0000,0.017288,0.6654,2026-10-08T11:26:08,2026-10-08T11:26:08
+Day-01,Plant-01,1,13.3758,1.3376,2.0000,0.027298,0.6641,2026-10-15T19:26:40,2026-10-15T19:26:40

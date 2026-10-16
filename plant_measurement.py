@@ -67,12 +67,21 @@ from typing import Any, cast
 import cv2
 import numpy as np
 
+# Load local secrets (.env) before reading the Cloudinary credentials below, so
+# the standalone CLI works without exporting variables by hand.
+try:  # pragma: no cover - convenience when run from the project root
+    from plantreadiness.dotenv import load_dotenv as _load_dotenv
+    _load_dotenv()
+except Exception:  # pragma: no cover - keep the standalone script working
+    pass
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-CLOUDINARY_CLOUD_NAME = "dmevbj3mv"
+# Cloud name is environment-specific; never hard-code a real one in the repo.
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME", "")
 
 # These are read from your Mac's environment variables.
 # DO NOT put the API secret in the ESP32 code.
@@ -83,11 +92,12 @@ CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
 #
 # Plant01_20261008_082804
 #
-# Change this if you move the camera to another plant.
-CLOUDINARY_PREFIX = "Plant01_"
+# The default prefix can be overridden per source by callers
+# (see plantreadiness.camera_refresh) or via CLOUDINARY_PREFIX.
+CLOUDINARY_PREFIX = os.getenv("CLOUDINARY_PREFIX", "Plant01_")
 
 CLOUDINARY_API_URL = (
-    f"[https://api.cloudinary.com/v1_1/](https://api.cloudinary.com/v1_1/)"
+    f"https://api.cloudinary.com/v1_1/"
     f"{CLOUDINARY_CLOUD_NAME}/resources/image/upload"
 )
 
@@ -168,6 +178,11 @@ class CaptureResult:
 def check_cloudinary_credentials() -> None:
     """Make sure the Cloudinary Admin API credentials exist."""
 
+    if not CLOUDINARY_CLOUD_NAME:
+        raise RuntimeError(
+            "CLOUDINARY_CLOUD_NAME is not set."
+        )
+
     if not CLOUDINARY_API_KEY:
         raise RuntimeError(
             "CLOUDINARY_API_KEY is not set."
@@ -193,10 +208,12 @@ def cloudinary_auth_header() -> str:
     return f"Basic {encoded}"
 
 
-def get_cloudinary_images() -> list[dict[str, Any]]:
+def get_cloudinary_images(
+    prefix: str | None = None,
+) -> list[dict[str, Any]]:
     """
     Get images from Cloudinary whose public ID starts with
-    CLOUDINARY_PREFIX.
+    the given prefix (defaults to CLOUDINARY_PREFIX).
 
     Example:
 
@@ -208,7 +225,7 @@ def get_cloudinary_images() -> list[dict[str, Any]]:
     check_cloudinary_credentials()
 
     params = {
-        "prefix": CLOUDINARY_PREFIX,
+        "prefix": prefix or CLOUDINARY_PREFIX,
         "max_results": 500,
     }
 
@@ -300,6 +317,7 @@ def mark_processed(public_id: str) -> None:
 
 def find_new_cloudinary_images(
     required_count: int,
+    prefix: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Find new Cloudinary images that have not already been processed.
@@ -309,7 +327,7 @@ def find_new_cloudinary_images(
 
     processed_ids = get_processed_ids()
 
-    resources = get_cloudinary_images()
+    resources = get_cloudinary_images(prefix=prefix)
 
     new_images: list[dict[str, Any]] = []
 
@@ -1487,10 +1505,31 @@ def draw_results(
 # PROCESS ONE IMAGE
 # ============================================================
 
+def build_measurement_args(
+    rod_length_cm: float,
+    rod_hue: int = 0,
+    rod_hue_tolerance: int = 12,
+    output: Path | None = None,
+) -> argparse.Namespace:
+    """Build the minimal args namespace process_image() needs.
+
+    Lets non-CLI callers (for example the cloud camera refresh) reuse the
+    vision pipeline without going through argparse.
+    """
+
+    return argparse.Namespace(
+        rod_length_cm=float(rod_length_cm),
+        rod_hue=int(rod_hue),
+        rod_hue_tolerance=int(rod_hue_tolerance),
+        output=RESULT_IMAGE if output is None else Path(output),
+    )
+
+
 def process_image(
     image: np.ndarray,
     args: argparse.Namespace,
     capture_number: int,
+    timestamp: str | None = None,
 ) -> CaptureResult:
 
     reference = detect_reference_rod(
@@ -1551,9 +1590,10 @@ def process_image(
         width_cm,
     ) = measurements
 
-    timestamp = datetime.now().isoformat(
-        timespec="seconds"
-    )
+    if timestamp is None:
+        timestamp = datetime.now().isoformat(
+            timespec="seconds"
+        )
 
     print(
         f"\nCapture {capture_number}:"
@@ -1616,15 +1656,30 @@ def process_image(
 # CSV
 # ============================================================
 
-def write_daily_record(
+DAILY_RECORD_FIELDS = [
+    "day",
+    "plant_id",
+    "captures_used",
+    "average_height_cm",
+    "average_width_cm",
+    "average_visible_leaves",
+    "average_cm_per_pixel",
+    "average_confidence",
+    "first_capture_timestamp",
+    "last_capture_timestamp",
+]
+
+
+def format_daily_record(
     day_label: str,
     plant_id: str,
     results: list[CaptureResult],
-) -> None:
+) -> dict[str, Any]:
+    """Build one daily CSV row (shared schema for the CLI and cloud refresh)."""
 
     if not results:
         raise ValueError(
-            "Cannot write an empty daily record"
+            "Cannot format an empty daily record"
         )
 
     avg_height = float(
@@ -1672,68 +1727,156 @@ def write_daily_record(
         )
     )
 
-    fieldnames = [
-        "day",
-        "plant_id",
-        "captures_used",
-        "average_height_cm",
-        "average_width_cm",
-        "average_visible_leaves",
-        "average_cm_per_pixel",
-        "average_confidence",
-        "first_capture_timestamp",
-        "last_capture_timestamp",
-    ]
+    return {
+        "day": day_label,
+        "plant_id": plant_id,
+        "captures_used": len(results),
+        "average_height_cm": (
+            f"{avg_height:.4f}"
+        ),
+        "average_width_cm": (
+            f"{avg_width:.4f}"
+        ),
+        "average_visible_leaves": (
+            f"{avg_leaves:.4f}"
+        ),
+        "average_cm_per_pixel": (
+            f"{avg_scale:.6f}"
+        ),
+        "average_confidence": (
+            f"{avg_confidence:.4f}"
+        ),
+        "first_capture_timestamp": (
+            results[0].timestamp
+        ),
+        "last_capture_timestamp": (
+            results[-1].timestamp
+        ),
+    }
 
-    file_exists = CSV_FILE.exists()
 
-    with CSV_FILE.open(
+def write_daily_record(
+    day_label: str,
+    plant_id: str,
+    results: list[CaptureResult],
+    csv_file: Path | None = None,
+) -> None:
+    """Append one daily row to the measurement CSV (never overwrites)."""
+
+    row = format_daily_record(
+        day_label,
+        plant_id,
+        results,
+    )
+
+    path = (
+        CSV_FILE
+        if csv_file is None
+        else Path(csv_file)
+    )
+
+    file_exists = path.exists()
+
+    with path.open(
         "a",
         newline="",
         encoding="utf-8",
-    ) as csv_file:
+    ) as file_handle:
 
         writer = csv.DictWriter(
-            csv_file,
-            fieldnames=fieldnames,
+            file_handle,
+            fieldnames=DAILY_RECORD_FIELDS,
         )
 
         if not file_exists:
             writer.writeheader()
 
-        writer.writerow(
-            {
-                "day": day_label,
-                "plant_id": plant_id,
-                "captures_used": len(results),
-                "average_height_cm": (
-                    f"{avg_height:.4f}"
-                ),
-                "average_width_cm": (
-                    f"{avg_width:.4f}"
-                ),
-                "average_visible_leaves": (
-                    f"{avg_leaves:.4f}"
-                ),
-                "average_cm_per_pixel": (
-                    f"{avg_scale:.6f}"
-                ),
-                "average_confidence": (
-                    f"{avg_confidence:.4f}"
-                ),
-                "first_capture_timestamp": (
-                    results[0].timestamp
-                ),
-                "last_capture_timestamp": (
-                    results[-1].timestamp
-                ),
-            }
-        )
+        writer.writerow(row)
 
     print(
         f"\nSaved daily record to: "
-        f"{CSV_FILE}"
+        f"{path}"
     )
+
+
+def cloudinary_capture_timestamp(
+    resource: dict[str, Any],
+) -> str | None:
+    """Best-effort capture time for a Cloudinary resource.
+
+    Cloudinary returns ``created_at`` such as ``2026-10-08T11:26:08Z``.
+    Using it keeps the observation date tied to when the ESP32 took the
+    photo rather than when we happened to process it.
+    """
+
+    created = resource.get("created_at")
+
+    if not created:
+        return None
+
+    return str(created).rstrip("Z")
+
+
+def collect_new_captures_once(
+    required_count: int,
+    args: argparse.Namespace,
+    prefix: str | None = None,
+) -> list[CaptureResult]:
+    """Download and measure up to ``required_count`` new Cloudinary images.
+
+    This is a single pass and never polls, so it is safe to call from a
+    request handler. Cloudinary capture timestamps are preserved.
+    """
+
+    new_images = find_new_cloudinary_images(
+        required_count,
+        prefix=prefix,
+    )
+
+    results: list[CaptureResult] = []
+
+    for resource in new_images:
+
+        if len(results) >= required_count:
+            break
+
+        public_id = resource.get("public_id")
+
+        if not public_id:
+            continue
+
+        local_path = BASE_DIR / f"{public_id}.jpg"
+
+        try:
+
+            image = download_cloudinary_image(
+                resource,
+                local_path,
+            )
+
+            result = process_image(
+                image,
+                args,
+                capture_number=len(results) + 1,
+                timestamp=cloudinary_capture_timestamp(
+                    resource
+                ),
+            )
+
+            results.append(result)
+
+            mark_processed(public_id)
+
+        except Exception as error:
+
+            print(
+                f"Failed to process {public_id}: {error}",
+                file=sys.stderr,
+            )
+
+            continue
+
+    return results
 
 
 # ============================================================

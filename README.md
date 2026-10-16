@@ -26,22 +26,51 @@ feedback loop.
 | `plant_feedback.py` | CLI workflow: register, observe, predict, transplant, due reminders, submit feedback, history, species-status, list. |
 | `demo_workflow.py` | Scripted end-to-end SYNTHETIC demonstration (steps 0-6, including retrain comparison). |
 | `plantreadiness/db.py` | SQLite schema + validation + duplicate protection + date/growth arithmetic. |
-| `plantreadiness/repository.py` | Repository layer: `SQLiteRepository` (CLI/local) + `SupabaseRepository` (user-scoped CRUD, RLS identity, error translation). UI/CLI never embed SQL. |
+| `plantreadiness/repository.py` | Repository layer: `SQLiteRepository` (local storage). UI/CLI never embed SQL. |
 | `plantreadiness/services.py` | Shared business logic used by BOTH the CLI and the web app (register, observe, transplant, feedback, corrections, predictions, CSV import/export, dashboard summary). |
 | `plantreadiness/csv_import.py` | Real CSV import (append-only, idempotent) + data-quality checks + growth analysis. |
 | `plantreadiness/synthetic.py` | Reproducible synthetic generator (documented assumptions, not botanical facts). |
 | `plantreadiness/model.py` | Countdown training, grouped validation, artefacts + metadata, fallback selection, retrain gate. |
 | `plantreadiness/config.py` | Constants: paths, minimum data requirements, standard messages. |
-| `webapp/` | Streamlit web app: `app.py` (entry + auth gate), `settings.py` (secrets/backend), `auth.py`, `components.py`, `pages/` (Dashboard, Register, Observation, Predictions, Transplant & feedback, Species & data). |
-| `supabase/migrations/` | Versioned SQL: `0001_initial_schema.sql` (tables/keys/FKs/uniques/triggers) + `0002_row_level_security.sql` (per-user RLS on all 8 tables). |
-| `scripts/migrate_sqlite_to_supabase.py` | Safe SQLite -> Supabase migration: dry-run by default, backup before apply, duplicate detection, idempotent re-run, per-source (real/synthetic) reporting; signs in as the destination user (no service-role key). |
-| `scripts/verify_rls.py` | Two-account isolation check using only the anon key + two ordinary sessions (proves RLS, doesn't assume it). |
-| `tests/` | Automated tests (dates, growth, duplicates, missing data, fallback, separation, integration, repository/auth, services, migration, secrets, Streamlit forms). |
-| `DEPLOYMENT.md` | Full deployment guide: Supabase setup, migrations, auth, secrets, local run, GitHub, Streamlit Community Cloud, production secrets, RLS verification, backup/export. |
-| `REPORT.md` | Limitations report: what is demonstrated only with synthetic data. |
+| `nextjs/` | Next.js front‑end: species-level dashboard, API proxy routes to the Flask backend, green plant UI. |
+| `tests/` | Automated tests (dates, growth, duplicates, missing data, fallback, separation, integration, repository, services, camera refresh). |
+| `backend/` | Flask API used by the Next.js front-end (species catalog, species prediction, camera refresh, legacy plant prediction). |
+| `plantreadiness/camera_refresh.py` | Auto-refresh: pulls new Cloudinary images, measures them with the vision pipeline and imports the observations (append-only, fail-open). |
+| `AGENTS.md` | Read-first orientation for contributors; links to the canonical architecture. |
+| `docs/ARCHITECTURE.md` | Canonical architecture (purpose, data flow, non-negotiable principles). |
+| `docs/DEPLOYMENT.md` | Running the app locally: prerequisites, backend + front-end, local storage, backup/export. |
+| `docs/REPORT.md` | Limitations report: what is demonstrated only with synthetic data. |
 
 The ESP32-CAM / Cloudinary / OpenCV measurement pipeline
-(`plant_measurement.py`, `plant_daily_measurements.csv`) is **unchanged**.
+(`plant_measurement.py` -> `plant_daily_measurements.csv`) is extended with a
+bounded, fail-open **camera refresh** (`plantreadiness/camera_refresh.py`) that
+the backend runs before a species prediction. It stays single-pass and
+append-only, and never invents growth.
+
+## Camera refresh (ESP32-CAM -> Cloudinary)
+
+Prediction reads the database, so live camera measurements must be imported
+first. The backend does this automatically **before a species prediction** with
+a single-pass, fail-open refresh (`plantreadiness/camera_refresh.py`):
+
+```text
+ESP32-CAM -> Cloudinary -> OpenCV measure -> plant_daily_measurements.csv -> DB
+```
+
+It is a no-op until configured. Register each camera plant first (explicit
+registration - camera images are never auto-assigned to a guessed species),
+then put the variables in a `.env` at the project root (copy `.env.example` to
+`.env`) or export them:
+
+| Variable | Purpose |
+|---|---|
+| `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Server-side Cloudinary admin credentials (never on the ESP32). |
+| `CAMERA_SOURCES` | `Prefix=external_ref` pairs, e.g. `Plant01_=Plant-01`. |
+| `CAMERA_ROD_LENGTH_CM` | Reference-rod length for pixel->cm calibration (default `30`). |
+| `CAMERA_REFRESH_ENABLED` | Optional override; otherwise enabled when credentials + sources exist. |
+| `CAMERA_MIN_REFRESH_INTERVAL_SECONDS` | Throttle between automatic refreshes (default `60`). |
+
+Manual refresh: `POST /api/camera/refresh` (optionally `{"species": "..."}`).
 
 ## Setup
 
@@ -54,24 +83,34 @@ pip install -r requirements.txt
 ## Quick start - one command
 
 ```bash
-./run.sh            # set up (venv, deps, local SQLite config + DB), then
-                    # open the web app at http://localhost:8501
+./run.sh            # installs missing Python/Node dependencies, starts Flask
+                    # + Next.js, then opens the dashboard at http://localhost:3000
 ```
 
-The first run creates `.venv/`, installs dependencies, writes a local-dev
-`.streamlit/secrets.toml` (backend `sqlite`, only if none exists - your
-Supabase config is never overwritten), and initialises `plant_readiness.db`.
-Re-running is always safe.
+The script:
+
+- installs Flask if it is missing from the active environment,
+- installs the Next.js dependencies on first run,
+- starts the Flask API in the background,
+- starts the Next.js development server,
+- cleans up the Flask API when the UI exits.
 
 ```bash
-./run.sh demo       # train the labelled SYNTHETIC DEMO models, then open
-                    # the web app (Predictions page can then use them)
-./run.sh test       # run the full automated test suite (211 tests)
-./run.sh cli ...    # CLI passthrough, e.g. ./run.sh cli list
-./run.sh help       # show usage
+PORT=3001 ./run.sh       # change the Next.js UI port
+PYTHON_BACKEND_URL=http://localhost:8000 ./run.sh
+                          # explicit Flask URL (default)
+```
 
-PORT=8502 ./run.sh          # serve on another port
-HEADLESS=1 ./run.sh         # do not auto-open the browser (servers/SSH)
+If you want to run the API and UI separately:
+
+```bash
+# terminal 1
+PYTHONPATH=$(pwd) FLASK_APP=backend/app.py flask run --port 8000
+
+# terminal 2
+cd nextjs
+npm install
+npm run dev
 ```
 
 ## Quick start (manual / CLI)
@@ -98,7 +137,7 @@ python model_train.py --mode demo --retrain
 ```bash
 # imports the CSV, runs quality checks + growth analysis,
 # then honestly reports that no readiness model can be trained yet
-python model_train.py --mode real --csv super_orange_growth_data_with_growth_rate.csv
+python model_train.py --mode real --csv super_orange_growth_data.csv
 ```
 
 ### 14-day feedback workflow
@@ -157,44 +196,75 @@ validation and reported MAE in days against a mean-baseline.
 ## Database
 
 The CLI uses SQLite (`plant_readiness.db`, created on first use) with tables
-`plants`, `observations`, `readiness_events`, `feedback_14d`:
+`plants`, `observations`, `readiness_events`, `feedback_14d`,
+`prediction_history` and `readiness_assessments`:
 primary/foreign keys, CHECK constraints, duplicate protection
 (one observation per plant per date, one feedback record per transplant,
 feedback is immutable after submission), and `data_source` on every row to
-keep `real` and `synthetic` separated. Historical observations and feedback
-are never overwritten.
+keep `real` and `synthetic` separated. Historical observations, feedback and
+prediction snapshots are never overwritten. New columns/tables are added by a
+lightweight forward-migration in `db.init_db`, so an existing database keeps
+working without a reset.
 
-The web app uses **Supabase PostgreSQL** with the equivalent schema
-(`supabase/migrations/`), splitting transplants and 14-day feedback into
-separate linked tables plus a `feedback_corrections` audit table, and
-enforcing **per-user Row Level Security** so one account can never see or
-touch another account's data. Both backends are reached only through the
-repository layer, so the UI never embeds SQL.
+Storage is **local SQLite on this device** (`plant_readiness.db`), reached only
+through the repository layer, so neither the CLI nor the UI embeds SQL. There
+is no cloud database dependency.
 
-## Web app (Streamlit + Supabase)
+## Web app (Next.js + Flask API)
 
-A multi-user web interface backed by Supabase (Postgres + Auth + RLS):
+The main front-end is a **species-level dashboard**: choose a species, use the
+latest cloud observation date, and the backend aggregates the observations for
+that species/date into a representative cohort.
 
 ```bash
-cp .streamlit/secrets.toml.example .streamlit/secrets.toml
-# fill in backend + credentials (see DEPLOYMENT.md)
-streamlit run webapp/app.py
+cd nextjs
+npm install
+npm run dev
 ```
 
-Six pages: **Dashboard** (real metrics only), **Register plant**,
-**Record observation** (auto age/growth-rate, growth chart, never invents
-values), **Predictions** (same fallback logic as the CLI, with honest
-explanations when prediction is unavailable), **Transplant & 14-day
-feedback** (due = transplant + 14 days; pending/due/overdue/completed;
-duplicates blocked; explicit corrections preserving audit history), and
-**Species & data management** (evidence counts, CSV import with
-preview/validation, CSV export, search/filter).
+The Next.js app talks to the Flask backend in `backend/app.py`. Key endpoints:
 
-All configuration is server-side (`.streamlit/secrets.toml`, gitignored).
-The app only ever uses the **anon (public) key** with signed-in user
-sessions, so RLS is always enforced; a service-role key is refused loudly
-at startup. Full setup, deployment, RLS-verification and backup
-instructions are in [`DEPLOYMENT.md`](DEPLOYMENT.md).
+- `GET /api/species`
+- `POST /api/predict/species`
+- `POST /predict` (legacy, plant-specific)
+- `GET /api/reference` · `POST /api/reference/build` (successful-cohort baseline)
+- `GET|POST /api/assessments` (readiness judgement, separate from prediction)
+- `GET|POST /api/transplant` (transplant record, incl. "did not occur")
+- `GET|POST /api/feedback` (pending / submit the 14-day follow-up)
+- `GET /api/predictions` (append-only prediction history)
+- `GET /api/evaluation` (predictions vs actual transplants)
+
+The dashboard shows current cloud data, representative cohort metrics, real
+readiness-event evidence, and an honest “prediction unavailable” state when
+verified readiness labels are insufficient. When no model exists but a
+successful-cohort reference baseline does, the species endpoint may show a
+clearly-labelled **provisional** estimate instead. Synthetic predictions are
+only shown when explicitly enabled and are always labelled as a synthetic demo.
+
+A separate `/feedback` page records the readiness assessment, the transplant
+record, the 14-day follow-up, and shows prediction history and the
+feedback-driven evaluation.
+
+### Reference baseline + feedback loop
+
+- The **successful-cohort reference baseline** (`plantreadiness/reference.py`)
+  summarises the historical Super Orange cohort: per-plant growth (calendar
+  elapsed days, never invented), medians across independent plants by age and by
+  days-before-transplant, and the contributing-plant count for every median.
+- The historical cohort is imported with `cohort='reference'`. Operational
+  screens (feedback) therefore list only the plants you actually monitor, while
+  the cohort is still used to build the baseline. A plant ID is always one
+  *individual* plant — several plants of the same species have different IDs.
+- The transplant reference uses the **recorded** date when one exists, otherwise
+  the day after the final monitoring day — explicitly flagged as an
+  **assumption**. The historical date is never claimed to be optimal.
+- The baseline is persisted under `models/reference/` and is separate from
+  synthetic or future feedback records. It powers a **provisional** prediction
+  path used only when no validated model is available and explicitly enabled.
+- Feedback is read-only with respect to training: assessments, transplants and
+  14-day outcomes are recorded, prediction snapshots are preserved append-only,
+  and `evaluate_predictions` reports prediction error vs actual transplant date
+  and 14-day survival without ever retraining or promoting a model.
 
 ## Tests
 
@@ -204,14 +274,16 @@ python -m unittest discover -s tests -v
 
 Covers: date arithmetic (readiness target, +14-day due dates), growth
 calculation (including missing/deceased plants), duplicate feedback and
-observation protection, species fallback levels, real/synthetic
-data-source separation, CSV import, and the end-to-end demo workflow; plus
-the web stack: repository layer (Supabase client mocked - ownership
-scoping, error translation), services (both backends), migration
-planning/apply/idempotent re-run safety, secrets handling (missing keys,
-placeholder detection, service-role rejection), and the Streamlit forms
-via `AppTest` (setup gate, navigation, register/observation/feedback
-validation, honest prediction refusal, CSV export).
+observation protection, species fallback levels, real/synthetic data-source
+separation, CSV import, and the end-to-end demo workflow; plus repository
+duplicate/validation behaviour (local SQLite), the service layer, and the
+camera refresh (explicit registration, idempotent import, fail-open). The
+reference baseline,
+provisional estimates, prediction snapshots, readiness assessments,
+transplant records, feedback-driven evaluation (with no-future-leakage and a
+worse-model safeguard) and the Flask feedback/reference API are covered by
+`tests/test_reference.py`, `tests/test_feedback_learning.py` and
+`tests/test_backend_api.py`.
 
 ## Retraining policy
 
@@ -221,4 +293,3 @@ requirements are met, the candidate is trained **excluding** the holdout
 plants, and the candidate must score a strictly lower holdout MAE than the
 deployed model on the **same held-out plants** - otherwise the current model
 is kept.
-# PLANTING-WINDOW-PREDICTOR

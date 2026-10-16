@@ -22,13 +22,26 @@ models/
 models_demo/
 *.joblib
 
-# Secrets - server-side only; the committed example uses placeholders
-.streamlit/secrets.toml
-.streamlit/config.toml.local
-supabase/.temp/
-supabase/.branches/
-
 # Private / per-user exports and local artifacts
 exports/
 private/
 *.private.csv
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# Front-end UI audit screenshots
+ui-audit/
+
+# ESP32-CAM / Cloudinary pipeline artifacts (generated; never commit)
+/Plant*.jpg
+plant_result*.jpg
+plant_captured.jpg
+processed_cloudinary_ids.txt
+captures/
+
+# Local tooling / MCP session artifacts
+.playwright-mcp/

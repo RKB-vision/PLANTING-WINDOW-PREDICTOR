@@ -51,10 +51,13 @@ from plantreadiness.repository import SQLiteRepository
 
 
 def predict_for_plant(conn, plant_id: int, models_dir: Path,
-                      allow_synthetic: bool = False) -> dict:
+                      allow_synthetic: bool = False,
+                      allow_provisional_baseline: bool = False) -> dict:
     """Species-aware prediction for a registered plant's latest observation."""
     return svc.predict_for_plant(SQLiteRepository(conn), plant_id, models_dir,
-                                 allow_synthetic=allow_synthetic)
+                                 allow_synthetic=allow_synthetic,
+                                 allow_provisional_baseline=(
+                                     allow_provisional_baseline))
 
 
 def predict_ad_hoc(species: str, variety: str | None,
@@ -109,8 +112,14 @@ def format_result(result: dict) -> str:
     lines.append(f"Prediction source  : "
                  f"{'SYNTHETIC DEMO' if synthetic_used else result.get('data_source')}")
     lines.append(result.get("message", ""))
-    lines.append(f"Estimated days remaining until transplant-ready stage: "
-                 f"{result['days_remaining']}")
+    days = result.get("days_remaining")
+    if result.get("past_readiness") or (
+            isinstance(days, (int, float)) and days <= 0):
+        lines.append("Transplant-ready stage : Plantable now "
+                     "(readiness estimated to have arrived)")
+    else:
+        lines.append(f"Estimated days remaining until transplant-ready stage: "
+                     f"{days}")
     if result.get("predicted_readiness_date"):
         lines.append(f"Estimated readiness date : {result['predicted_readiness_date']} "
                      f"(calculated from observation on {result.get('observation_date')})")
@@ -157,7 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--height-cm", type=float)
     parser.add_argument("--growth-rate", type=float,
                         help="growth_rate_cm_per_day")
-    parser.add_argument("--canopy-width-cm", type=float)
+    parser.add_argument("--stem-width-cm", type=float)
     parser.add_argument("--true-leaves", type=int)
     parser.add_argument("--db", default=str(config.DEFAULT_DB_PATH))
     parser.add_argument("--models-dir", default=str(config.MODELS_DIR))
@@ -183,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
                 "age_days": args.age_days,
                 "height_cm": args.height_cm,
                 "growth_rate_cm_per_day": args.growth_rate,
-                "canopy_width_cm": args.canopy_width_cm,
+                "stem_width_cm": args.stem_width_cm,
                 "visible_true_leaf_count": args.true_leaves,
             }
             if observation["age_days"] is None and \

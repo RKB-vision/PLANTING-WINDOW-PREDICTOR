@@ -273,7 +273,7 @@ class TestPredictionFallback(ServiceBase):
                     "age_days": age,
                     "height_cm": 0.3 + 0.25 * age + rng.gauss(0, 0.1),
                     "growth_rate_cm_per_day": 0.25 + rng.gauss(0, 0.05),
-                    "canopy_width_cm": None,
+                    "stem_width_cm": None,
                     "visible_true_leaf_count": None,
                     "days_remaining": ready_age - age,
                 })

@@ -14,8 +14,8 @@ Column semantics verified from plant_measurement.py (lines 1205-1213, 1630-1730)
   observations.height_cm.
 * average_width_cm: STEM WIDTH (caliper in cm), computed as
   plant.stem_width_pixels * cm_per_pixel. NOTE: This is NOT canopy width.
-  It is intentionally NOT mapped to canopy_width_cm to avoid biological
-  misrepresentation.
+  It is mapped to ``observations.stem_width_cm`` to preserve the real
+  measurement without misrepresenting it as canopy width.
 * average_visible_leaves: Average detected leaf count ->
   observations.visible_true_leaf_count (rounded to integer).
 * first_capture_timestamp / last_capture_timestamp: ISO timestamps
@@ -73,7 +73,7 @@ def import_camera_measurements(
     Parameters
     ----------
     repo : BaseRepository
-        The database repository (SQLiteRepository or SupabaseRepository).
+        The local database repository (:class:`SQLiteRepository`).
     source : str, Path, or file-like object
         The CSV file path or file-like buffer containing hardware measurements.
     default_species : str
@@ -200,6 +200,16 @@ def import_camera_measurements(
             except (TypeError, ValueError):
                 leaves = None
 
+            # Parse STEM width if present. This is deliberately stored as
+            # stem_width_cm, never canopy_width_cm.
+            try:
+                stem_width = _to_float(row.get("average_width_cm"))
+            except (TypeError, ValueError) as exc:
+                report["issues"].append(
+                    {"line": line_no, "problem": f"Bad average_width_cm: {exc}"}
+                )
+                continue
+
             # Resolve plant in database
             target_plant = ref_to_plant.get(raw_id.lower())
             if target_plant is None and raw_id.isdigit():
@@ -271,7 +281,8 @@ def import_camera_measurements(
                     height_cm=height,
                     age_days=age_days,
                     growth_rate_cm_per_day=growth_rate,
-                    canopy_width_cm=None,  # stem width is NOT canopy width; left None
+                    canopy_width_cm=None,  # stem width is NOT canopy width
+                    stem_width_cm=stem_width,
                     visible_true_leaf_count=leaves,
                     data_source=data_source,
                 )

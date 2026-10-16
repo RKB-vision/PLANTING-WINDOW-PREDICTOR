@@ -1,11 +1,13 @@
+# Computer-vision measurement pipeline (ESP32-CAM -> Cloudinary -> OpenCV)
 numpy
 opencv-python
-ultralytics
+
+# Data / model layer
 pandas
 scikit-learn
 joblib
-# CLI (prediction / feedback / migration) --------------------------------
-# (all above are the existing computer-vision prototype's dependencies)
-# Web app (Streamlit UI + Supabase backend) ------------------------------
-streamlit>=1.66
-supabase>=2.32
+
+# Backend API (Flask)
+flask
+
+# Storage is local SQLite on this device (no cloud database dependency).

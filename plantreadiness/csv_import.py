@@ -4,8 +4,18 @@ Expected columns (the file shipped with the project):
 
     Date, Age_days, Plant_ID, Height_cm, Growth_rate_cm_per_day
 
+Header names may carry surrounding whitespace (``Date      , Age    , ...``),
+so both the header row and every row are normalised by stripping key names
+before validation.
+
 The import is **append-only and idempotent**: rows already stored are skipped,
 never overwritten. Every imported row is marked ``data_source = 'real'``.
+
+Where the CSV does not provide a growth rate, one is *derived* from the
+previous measurement of the same plant (``(h_t - h_{t-1}) / elapsed_days``)
+whenever both heights and a strictly positive interval exist. A derived rate
+is a calculation from real measurements, never an invented value; when the
+interval is missing or non-positive the rate stays ``NULL``.
 
 This module deliberately does NOT create readiness events: the CSV contains
 growth measurements only, no verified readiness assessments. Its job is to
@@ -16,13 +26,92 @@ from __future__ import annotations
 
 import csv
 from collections import defaultdict
+from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
 from . import db as dbm
 
 REQUIRED_COLUMNS = ("Date", "Age_days", "Plant_ID", "Height_cm")
-OPTIONAL_COLUMNS = ("Growth_rate_cm_per_day",)
+COLUMN_ALIASES = {
+    "Age_days": ("Age_days", "Age"),
+}
+
+
+def _age_text(row: dict) -> Optional[str]:
+    for key in COLUMN_ALIASES["Age_days"]:
+        if row.get(key) is not None and str(row.get(key)).strip() != "":
+            return str(row.get(key))
+    return None
+
+
+def _normalise_fieldnames(fieldnames: Optional[list[str]]) -> Optional[list[str]]:
+    """Strip surrounding whitespace from CSV header names."""
+    if fieldnames is None:
+        return None
+    return [str(name).strip() for name in fieldnames]
+
+
+def _normalise_row(row: dict) -> dict:
+    """Strip surrounding whitespace from every row key and value."""
+    out = {}
+    for key, value in row.items():
+        clean_key = str(key).strip() if key is not None else key
+        out[clean_key] = value.strip() if isinstance(value, str) else value
+    return out
+
+
+def _derive_growth_rate(conn, plant_id: int, obs_date: str,
+                        height: Optional[float]) -> Optional[float]:
+    """Derive a growth rate from the plant's previous measurement.
+
+    Returns ``None`` when there is no earlier measurement with a height, or
+    the interval is not strictly positive - a rate is never invented.
+    """
+    if height is None:
+        return None
+    prev = conn.execute(
+        """SELECT observation_date, height_cm FROM observations
+           WHERE plant_id = ? AND observation_date < ?
+             AND height_cm IS NOT NULL
+           ORDER BY observation_date DESC LIMIT 1""",
+        (plant_id, obs_date),
+    ).fetchone()
+    if prev is None:
+        return None
+    try:
+        span = dbm.days_between(prev["observation_date"], obs_date)
+    except dbm.ValidationError:
+        return None
+    if span <= 0:
+        return None
+    return round((float(height) - float(prev["height_cm"])) / span, 4)
+
+
+def _missing_columns(fieldnames: Optional[list[str]]) -> list[str]:
+    if fieldnames is None:
+        return list(REQUIRED_COLUMNS)
+    missing = []
+    for required in REQUIRED_COLUMNS:
+        allowed = COLUMN_ALIASES.get(required, (required,))
+        if not any(col in fieldnames for col in allowed):
+            missing.append(required)
+    return missing
+
+
+def _parse_date(value: Optional[str], field: str) -> date:
+    text = (value or "").strip()
+    try:
+        return dbm.parse_iso_date(text, field)
+    except dbm.ValidationError:
+        # The supplied Super Orange dataset uses day-first dates such as
+        # 02-05-2083; normalise to ISO rather than silently dropping them.
+        for fmt in ("%d-%m-%Y", "%d/%m/%Y"):
+            try:
+                return datetime.strptime(text, fmt).date()
+            except ValueError:
+                continue
+        raise
 
 
 def _to_float(value: Optional[str]) -> Optional[float]:
@@ -34,7 +123,14 @@ def _to_float(value: Optional[str]) -> Optional[float]:
 def _to_int(value: Optional[str]) -> Optional[int]:
     if value is None or str(value).strip() == "":
         return None
-    return int(float(value))
+    text = str(value).strip().lower()
+    for suffix in (" days", " day", "days", "day"):
+        if text.endswith(suffix):
+            text = text[: -len(suffix)].strip()
+            break
+    if text.endswith("d"):
+        text = text[:-1].strip()
+    return int(float(text))
 
 
 # --------------------------------------------------------------------------- #
@@ -42,9 +138,15 @@ def _to_int(value: Optional[str]) -> Optional[int]:
 # --------------------------------------------------------------------------- #
 
 
+# Historical successful-plant cohort: imported purely to build the species
+# reference baseline. Tagged so operational screens can exclude it.
+REFERENCE_COHORT = "reference"
+
+
 def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
                variety: Optional[str] = None,
-               date_started: Optional[str] = None) -> dict:
+               date_started: Optional[str] = None,
+               cohort: str = REFERENCE_COHORT) -> dict:
     """Import measurement rows into the database under ``data_source='real'``.
 
     Returns an import report: counts plus any row-level issues found.
@@ -70,7 +172,8 @@ def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
         reader = csv.DictReader(fh)
         if reader.fieldnames is None:
             raise ValueError(f"CSV {csv_path} has no header row.")
-        missing = [c for c in REQUIRED_COLUMNS if c not in reader.fieldnames]
+        reader.fieldnames = _normalise_fieldnames(reader.fieldnames)
+        missing = _missing_columns(reader.fieldnames)
         if missing:
             raise ValueError(
                 f"CSV {csv_path} is missing required columns: {missing}. "
@@ -78,6 +181,7 @@ def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
             )
 
         for line_no, row in enumerate(reader, start=2):
+            row = _normalise_row(row)
             report["rows_read"] += 1
             raw_ref = (row.get("Plant_ID") or "").strip()
             if not raw_ref:
@@ -86,7 +190,7 @@ def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
                 )
                 continue
             try:
-                obs_date = dbm.parse_iso_date(
+                obs_date = _parse_date(
                     (row.get("Date") or "").strip(), "Date"
                 )
             except dbm.ValidationError as exc:
@@ -96,7 +200,7 @@ def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
             try:
                 height = _to_float(row.get("Height_cm"))
                 growth = _to_float(row.get("Growth_rate_cm_per_day"))
-                age = _to_int(row.get("Age_days"))
+                age = _to_int(_age_text(row))
             except (TypeError, ValueError) as exc:
                 report["issues"].append(
                     {"line": line_no, "problem": f"bad numeric value: {exc}"}
@@ -129,8 +233,17 @@ def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
                         date_started=date_started,
                         data_source="real",
                         external_ref=raw_ref,
+                        cohort=cohort,
                     )
                     report["plants_imported"] += 1
+
+            # Derive a growth rate only when the CSV did not supply one.
+            if growth is None:
+                growth = _derive_growth_rate(
+                    conn, plant_ids[raw_ref], obs_date.isoformat(), height)
+                if growth is not None:
+                    report.setdefault("growth_rates_derived", 0)
+                    report["growth_rates_derived"] += 1
 
             try:
                 dbm.add_observation(
@@ -254,7 +367,9 @@ def analyse_real_data(conn, species: Optional[str] = None,
                 "SELECT COUNT(*) FROM readiness_events WHERE plant_id = ?",
                 (plant_id,)).fetchone()[0]),
         })
-        all_growth_rates.extend(rates)
+        all_growth_rates.extend(
+            rates if rates else ([slope] if slope is not None else [])
+        )
 
     summary = {
         "data_source": data_source,

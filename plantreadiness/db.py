@@ -13,6 +13,7 @@ Design rules (see task sections 4 and 9):
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -72,6 +73,7 @@ CREATE TABLE IF NOT EXISTS observations (
     -- growth rate may legitimately be negative (measurement noise); no sign CHECK
     growth_rate_cm_per_day REAL,
     canopy_width_cm      REAL    CHECK (canopy_width_cm IS NULL OR canopy_width_cm >= 0),
+    stem_width_cm        REAL    CHECK (stem_width_cm IS NULL OR stem_width_cm >= 0),
     visible_true_leaf_count INTEGER
                                        CHECK (visible_true_leaf_count IS NULL
                                               OR visible_true_leaf_count >= 0),
@@ -117,11 +119,74 @@ CREATE TABLE IF NOT EXISTS feedback_14d (
                                            OR visible_condition IN
                                               ('healthy', 'stressed_wilting', 'dead')),
     user_notes              TEXT,
+    -- transplant record detail (assessment does NOT imply a transplant)
+    transplant_occurred     INTEGER NOT NULL DEFAULT 1
+                                      CHECK (transplant_occurred IN (0, 1)),
+    condition_at_transplant TEXT    CHECK (condition_at_transplant IS NULL
+                                           OR condition_at_transplant IN
+                                              ('healthy', 'stressed_wilting', 'dead')),
+    transplant_notes        TEXT,
     data_source             TEXT    NOT NULL
                                       CHECK (data_source IN ('real', 'synthetic')),
     created_at              TEXT    NOT NULL DEFAULT (datetime('now')),
     -- duplicate protection: one transplant/feedback record per plant per date
     UNIQUE (plant_id, transplant_date)
+);
+
+-- Every prediction the system showed is preserved here so it stays
+-- reconstructible: a later model/rule change never rewrites history.
+CREATE TABLE IF NOT EXISTS prediction_history (
+    prediction_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_id                INTEGER REFERENCES plants(plant_id)
+                                       ON DELETE SET NULL,
+    species                 TEXT    NOT NULL,
+    variety                 TEXT,
+    prediction_scope        TEXT    NOT NULL DEFAULT 'plant',
+    observation_date        TEXT,
+    method                  TEXT    NOT NULL,   -- validated_model / synthetic_demo
+                                                -- / historical_reference_baseline
+                                                -- / insufficient_evidence
+    level                   INTEGER,
+    available               INTEGER NOT NULL CHECK (available IN (0, 1)),
+    synthetic               INTEGER NOT NULL DEFAULT 0
+                                      CHECK (synthetic IN (0, 1)),
+    provisional             INTEGER NOT NULL DEFAULT 0
+                                      CHECK (provisional IN (0, 1)),
+    days_remaining          REAL,
+    predicted_readiness_date TEXT,
+    model_name              TEXT,
+    data_source             TEXT    CHECK (data_source IS NULL
+                                           OR data_source IN ('real', 'synthetic')),
+    baseline_version        INTEGER,
+    n_independent_plants    INTEGER,
+    message                 TEXT,
+    limitations             TEXT,               -- JSON array
+    observation_snapshot    TEXT,               -- JSON
+    cohort_snapshot         TEXT,               -- JSON
+    created_at              TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- The user's readiness judgement. Deliberately separate from the system
+-- prediction (kept in ``prediction_snapshot``) and from readiness_events
+-- (which are the only training labels).
+CREATE TABLE IF NOT EXISTS readiness_assessments (
+    assessment_id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_id                INTEGER REFERENCES plants(plant_id)
+                                       ON DELETE SET NULL,
+    species                 TEXT    NOT NULL,
+    variety                 TEXT,
+    assessment_date         TEXT    NOT NULL,
+    readiness_status        TEXT    NOT NULL
+                                      CHECK (readiness_status IN
+                                             ('ready', 'not_ready', 'uncertain')),
+    notes                   TEXT,
+    prediction_id           INTEGER REFERENCES prediction_history(prediction_id)
+                                       ON DELETE SET NULL,
+    prediction_snapshot     TEXT,               -- JSON of the prediction shown
+    assessment_source       TEXT    NOT NULL DEFAULT 'user',
+    data_source             TEXT    NOT NULL
+                                      CHECK (data_source IN ('real', 'synthetic')),
+    created_at              TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_observations_plant
@@ -130,6 +195,12 @@ CREATE INDEX IF NOT EXISTS idx_feedback_due
     ON feedback_14d (feedback_due_date, feedback_submitted_date);
 CREATE INDEX IF NOT EXISTS idx_plants_species
     ON plants (species, variety);
+CREATE INDEX IF NOT EXISTS idx_predictions_plant
+    ON prediction_history (plant_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_predictions_species
+    ON prediction_history (species, variety);
+CREATE INDEX IF NOT EXISTS idx_assessments_plant
+    ON readiness_assessments (plant_id, assessment_date);
 """
 
 
@@ -195,6 +266,28 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(plants)")}
     if "cohort" not in cols:
         conn.execute("ALTER TABLE plants ADD COLUMN cohort TEXT")
+    obs_cols = {r["name"] for r in conn.execute("PRAGMA table_info(observations)")}
+    if "stem_width_cm" not in obs_cols:
+        conn.execute(
+            "ALTER TABLE observations ADD COLUMN stem_width_cm REAL "
+            "CHECK (stem_width_cm IS NULL OR stem_width_cm >= 0)"
+        )
+    # feedback_14d gained transplant-record detail (assessment does not imply
+    # a transplant) - add the columns to databases created before them.
+    fb_cols = {r["name"] for r in conn.execute("PRAGMA table_info(feedback_14d)")}
+    if "transplant_occurred" not in fb_cols:
+        conn.execute(
+            "ALTER TABLE feedback_14d ADD COLUMN transplant_occurred INTEGER "
+            "NOT NULL DEFAULT 1 CHECK (transplant_occurred IN (0, 1))"
+        )
+    if "condition_at_transplant" not in fb_cols:
+        conn.execute(
+            "ALTER TABLE feedback_14d ADD COLUMN condition_at_transplant TEXT"
+        )
+    if "transplant_notes" not in fb_cols:
+        conn.execute(
+            "ALTER TABLE feedback_14d ADD COLUMN transplant_notes TEXT"
+        )
     conn.commit()
     return conn
 
@@ -294,6 +387,7 @@ def add_observation(conn: sqlite3.Connection,
                     height_cm: Optional[float] = None,
                     growth_rate_cm_per_day: Optional[float] = None,
                     canopy_width_cm: Optional[float] = None,
+                    stem_width_cm: Optional[float] = None,
                     visible_true_leaf_count: Optional[int] = None,
                     data_source: Optional[str] = None) -> int:
     """Append an observation. Duplicate (plant, date) is rejected."""
@@ -314,6 +408,8 @@ def add_observation(conn: sqlite3.Connection,
         raise ValidationError("height_cm must be >= 0.")
     if canopy_width_cm is not None and float(canopy_width_cm) < 0:
         raise ValidationError("canopy_width_cm must be >= 0.")
+    if stem_width_cm is not None and float(stem_width_cm) < 0:
+        raise ValidationError("stem_width_cm must be >= 0.")
     if visible_true_leaf_count is not None and int(visible_true_leaf_count) < 0:
         raise ValidationError("visible_true_leaf_count must be >= 0.")
     if growth_rate_cm_per_day is not None:
@@ -334,11 +430,11 @@ def add_observation(conn: sqlite3.Connection,
         cur = conn.execute(
             """INSERT INTO observations
                (plant_id, observation_date, age_days, height_cm,
-                growth_rate_cm_per_day, canopy_width_cm,
+                growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
                 visible_true_leaf_count, data_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plant_id, obs_date.isoformat(), age_days, height_cm,
-             growth_rate_cm_per_day, canopy_width_cm,
+             growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
              visible_true_leaf_count, source),
         )
     except sqlite3.IntegrityError as exc:
@@ -367,6 +463,171 @@ def latest_observation(conn: sqlite3.Connection, plant_id: int) -> Optional[sqli
            ORDER BY observation_date DESC, observation_id DESC LIMIT 1""",
         (plant_id,),
     ).fetchone()
+
+
+# --------------------------------------------------------------------------- #
+# Species-level dashboard / cohort selection
+# --------------------------------------------------------------------------- #
+
+
+def species_dashboard_catalog(conn: sqlite3.Connection,
+                              data_source: str = "real") -> list[dict]:
+    """Species/variety summaries used by the species-level dashboard.
+
+    Returns one entry per species/'' variety combination (empty string for
+    NULL variety) plus the distinct varieties and observation dates that
+    exist for that species. No values are invented or derived here; this is
+    a lightweight inventory of what the dashboard can select.
+    """
+    rows = conn.execute(
+        """SELECT p.species AS species,
+                  COALESCE(p.variety, '') AS variety,
+                  COUNT(DISTINCT p.plant_id) AS plant_count,
+                  COUNT(o.observation_id) AS observation_count,
+                  MAX(o.observation_date) AS latest_observation_date
+           FROM plants p
+           LEFT JOIN observations o
+                  ON o.plant_id = p.plant_id
+                 AND o.data_source = ?
+           GROUP BY p.species, COALESCE(p.variety, '')
+           ORDER BY p.species, COALESCE(p.variety, '')""",
+        (data_source,),
+    ).fetchall()
+
+    catalog: dict[tuple[str, str], dict] = {}
+    for row in rows:
+        item = dict(row)
+        item["varieties"] = []
+        item["available_dates"] = []
+        catalog[(item["species"], item["variety"])] = item
+
+    variety_rows = conn.execute(
+        """SELECT DISTINCT p.species AS species,
+                           COALESCE(p.variety, '') AS variety
+           FROM plants p
+           ORDER BY p.species, COALESCE(p.variety, '')"""
+    ).fetchall()
+    for row in variety_rows:
+        item = dict(row)
+        for key, value in catalog.items():
+            if key[0] == item["species"]:
+                value["varieties"].append(item["variety"])
+
+    date_rows = conn.execute(
+        """SELECT DISTINCT p.species AS species,
+                           COALESCE(p.variety, '') AS variety,
+                           o.observation_date AS observation_date
+           FROM observations o
+           JOIN plants p ON p.plant_id = o.plant_id
+           WHERE o.data_source = ?
+           ORDER BY p.species, COALESCE(p.variety, ''),
+                    o.observation_date DESC""",
+        (data_source,),
+    ).fetchall()
+    for row in date_rows:
+        item = dict(row)
+        for key, value in catalog.items():
+            if key[0] == item["species"]:
+                if item["observation_date"] not in value["available_dates"]:
+                    value["available_dates"].append(item["observation_date"])
+
+    # The grouped row for ('species', '') is the entry used by the UI when
+    # "All varieties" is selected; keep one row per species for simplicity.
+    seen_species: set[str] = set()
+    simplified: list[dict] = []
+    for (species, variety), item in catalog.items():
+        if species in seen_species:
+            base = next(x for x in simplified if x["species"] == species)
+            base["varieties"].extend(
+                v for v in item["varieties"] if v and v not in base["varieties"]
+            )
+            base["available_dates"] = sorted(
+                set(base["available_dates"]) | set(item["available_dates"]),
+                reverse=True,
+            )
+            continue
+        seen_species.add(species)
+        base = dict(item)
+        base["varieties"] = [v for v in base["varieties"] if v]
+        base["available_dates"] = sorted(
+            set(base["available_dates"]), reverse=True
+        )
+        simplified.append(base)
+    return simplified
+
+
+def latest_observation_date_for_species(
+        conn: sqlite3.Connection, species: str,
+        variety: Optional[str] = None,
+        data_source: str = "real") -> Optional[str]:
+    """Most recent real observation date for a species/optional variety."""
+    sql = """SELECT MAX(o.observation_date) AS latest_date
+             FROM observations o
+             JOIN plants p ON p.plant_id = o.plant_id
+             WHERE p.species = ? AND o.data_source = ?"""
+    args: list = [species, data_source]
+    if variety:
+        sql += " AND p.variety = ?"
+        args.append(variety)
+    row = conn.execute(sql, args).fetchone()
+    return row["latest_date"] if row and row["latest_date"] else None
+
+
+def species_cohort_snapshot(conn: sqlite3.Connection, species: str,
+                            variety: Optional[str] = None,
+                            observation_date: Optional[str] = None,
+                            data_source: str = "real") -> dict:
+    """Fetch the raw observation rows behind a species-level prediction.
+
+    The caller may request a date explicitly, otherwise the latest available
+    date is used. Missing data is preserved as missing; no rows are invented.
+    """
+    species = (species or "").strip()
+    if not species:
+        raise ValidationError("species is required.")
+
+    target_date: Optional[str]
+    if observation_date:
+        target_date = parse_iso_date(
+            observation_date, "observation_date").isoformat()
+    else:
+        target_date = latest_observation_date_for_species(
+            conn, species, variety, data_source)
+        if target_date:
+            target_date = parse_iso_date(
+                target_date, "observation_date").isoformat()
+
+    if not target_date:
+        return {
+            "species": species,
+            "variety": variety,
+            "observation_date": None,
+            "rows": [],
+            "row_count": 0,
+            "plants_represented": 0,
+        }
+
+    sql = """SELECT o.*, p.species, p.variety, p.external_ref
+             FROM observations o
+             JOIN plants p ON p.plant_id = o.plant_id
+             WHERE p.species = ? AND o.observation_date = ?
+               AND o.data_source = ?"""
+    args: list = [species, target_date, data_source]
+    if variety:
+        sql += " AND p.variety = ?"
+        args.append(variety)
+    sql += " ORDER BY p.plant_id, o.observation_id"
+
+    rows = [dict(r) for r in conn.execute(sql, args)]
+    return {
+        "species": species,
+        "variety": variety,
+        "observation_date": target_date,
+        "rows": rows,
+        "row_count": len(rows),
+        "plants_represented": len({r["plant_id"] for r in rows}),
+    }
+
 
 
 # --------------------------------------------------------------------------- #
@@ -471,8 +732,17 @@ def record_transplant(conn: sqlite3.Connection,
                       plant_id: int,
                       transplant_date: str,
                       height_at_transplant_cm: Optional[float] = None,
-                      data_source: Optional[str] = None) -> dict:
-    """Register a transplant and create the pending 14-day feedback record."""
+                      data_source: Optional[str] = None,
+                      transplant_occurred: bool = True,
+                      condition_at_transplant: Optional[str] = None,
+                      transplant_notes: Optional[str] = None) -> dict:
+    """Register a transplant and create the pending 14-day feedback record.
+
+    ``transplant_occurred`` distinguishes a transplant that actually happened
+    from a recorded decision/deferral: a readiness *assessment* never implies
+    a transplant. Feedback is only due (and can only be submitted) when the
+    transplant occurred.
+    """
     plant = get_plant(conn, plant_id)
     tdate = parse_iso_date(transplant_date, "transplant_date")
     source = data_source or plant["data_source"]
@@ -480,16 +750,24 @@ def record_transplant(conn: sqlite3.Connection,
         raise ValidationError("transplant data_source must match the plant's.")
     if height_at_transplant_cm is not None and float(height_at_transplant_cm) < 0:
         raise ValidationError("height_at_transplant_cm must be >= 0.")
+    if condition_at_transplant is not None \
+            and condition_at_transplant not in config.VISIBLE_CONDITIONS:
+        raise ValidationError(
+            f"condition_at_transplant must be one of "
+            f"{config.VISIBLE_CONDITIONS}.")
 
     due = feedback_due_date(tdate)
     try:
         cur = conn.execute(
             """INSERT INTO feedback_14d
                (plant_id, transplant_date, feedback_due_date,
-                height_at_transplant_cm, data_source)
-               VALUES (?, ?, ?, ?, ?)""",
+                height_at_transplant_cm, data_source, transplant_occurred,
+                condition_at_transplant, transplant_notes)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
             (plant_id, tdate.isoformat(), due.isoformat(),
-             height_at_transplant_cm, source),
+             height_at_transplant_cm, source,
+             1 if transplant_occurred else 0,
+             condition_at_transplant, transplant_notes),
         )
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -503,6 +781,9 @@ def record_transplant(conn: sqlite3.Connection,
         "transplant_date": tdate.isoformat(),
         "feedback_due_date": due.isoformat(),
         "height_at_transplant_cm": height_at_transplant_cm,
+        "transplant_occurred": bool(transplant_occurred),
+        "condition_at_transplant": condition_at_transplant,
+        "transplant_notes": transplant_notes,
         "data_source": source,
     }
 
@@ -524,7 +805,8 @@ def pending_feedback(conn: sqlite3.Connection,
     sql = """SELECT f.*, p.species, p.variety
              FROM feedback_14d f
              JOIN plants p ON p.plant_id = f.plant_id
-             WHERE f.feedback_submitted_date IS NULL"""
+             WHERE f.feedback_submitted_date IS NULL
+               AND f.transplant_occurred = 1"""
     args: list = []
     if plant_id is not None:
         sql += " AND f.plant_id = ?"
@@ -564,6 +846,10 @@ def submit_feedback(conn: sqlite3.Connection,
             f"Feedback {feedback_id} was already submitted on "
             f"{row['feedback_submitted_date']} - outcomes are immutable."
         )
+    if not row["transplant_occurred"]:
+        raise ValidationError(
+            "This record is a transplant decision that did not occur - there "
+            "is no transplant outcome to follow up.")
 
     sub_date = parse_iso_date(feedback_submitted_date, "feedback_submitted_date")
     transplant = parse_iso_date(row["transplant_date"])
@@ -631,6 +917,220 @@ def feedback_history(conn: sqlite3.Connection,
 
 
 # --------------------------------------------------------------------------- #
+# Prediction history (append-only snapshots)
+# --------------------------------------------------------------------------- #
+
+
+def _json_dump(value) -> Optional[str]:
+    return None if value is None else json.dumps(value, default=str)
+
+
+def _json_load(value):
+    if value is None:
+        return None
+    try:
+        return json.loads(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def save_prediction_snapshot(conn: sqlite3.Connection, *,
+                             species: str,
+                             method: str,
+                             available: bool,
+                             variety: Optional[str] = None,
+                             plant_id: Optional[int] = None,
+                             prediction_scope: str = "plant",
+                             observation_date: Optional[str] = None,
+                             level: Optional[int] = None,
+                             synthetic: bool = False,
+                             provisional: bool = False,
+                             days_remaining: Optional[float] = None,
+                             predicted_readiness_date: Optional[str] = None,
+                             model_name: Optional[str] = None,
+                             data_source: Optional[str] = None,
+                             baseline_version: Optional[int] = None,
+                             n_independent_plants: Optional[int] = None,
+                             message: Optional[str] = None,
+                             limitations=None,
+                             observation_snapshot=None,
+                             cohort_snapshot=None) -> dict:
+    """Persist an immutable snapshot of a prediction shown to the user.
+
+    Snapshots are append-only: a later model or rule change can never rewrite
+    what the system predicted at the time.
+    """
+    species = (species or "").strip()
+    if not species:
+        raise ValidationError("species is required for a prediction snapshot.")
+    if not method:
+        raise ValidationError("method is required for a prediction snapshot.")
+    if data_source is not None and data_source not in config.VALID_SOURCES:
+        raise ValidationError(f"Invalid data_source '{data_source}'.")
+    if plant_id is not None:
+        get_plant(conn, plant_id)  # raises NotFoundError when unknown
+    obs_date = (parse_iso_date(observation_date, "observation_date").isoformat()
+                if observation_date else None)
+    pred_date = (parse_iso_date(predicted_readiness_date,
+                                "predicted_readiness_date").isoformat()
+                 if predicted_readiness_date else None)
+
+    cur = conn.execute(
+        """INSERT INTO prediction_history
+           (plant_id, species, variety, prediction_scope, observation_date,
+            method, level, available, synthetic, provisional, days_remaining,
+            predicted_readiness_date, model_name, data_source, baseline_version,
+            n_independent_plants, message, limitations, observation_snapshot,
+            cohort_snapshot)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (plant_id, species, variety, prediction_scope, obs_date, method, level,
+         1 if available else 0, 1 if synthetic else 0,
+         1 if provisional else 0, days_remaining, pred_date, model_name,
+         data_source, baseline_version, n_independent_plants, message,
+         _json_dump(limitations), _json_dump(observation_snapshot),
+         _json_dump(cohort_snapshot)),
+    )
+    conn.commit()
+    return get_prediction(conn, int(cur.lastrowid))
+
+
+def _prediction_row_to_dict(row: sqlite3.Row) -> dict:
+    out = dict(row)
+    for key in ("limitations", "observation_snapshot", "cohort_snapshot"):
+        out[key] = _json_load(out.get(key))
+    out["available"] = bool(out.get("available"))
+    out["synthetic"] = bool(out.get("synthetic"))
+    out["provisional"] = bool(out.get("provisional"))
+    return out
+
+
+def get_prediction(conn: sqlite3.Connection, prediction_id: int) -> dict:
+    row = conn.execute(
+        "SELECT * FROM prediction_history WHERE prediction_id = ?",
+        (prediction_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"No prediction with prediction_id={prediction_id}.")
+    return _prediction_row_to_dict(row)
+
+
+def list_prediction_history(conn: sqlite3.Connection,
+                            plant_id: Optional[int] = None,
+                            species: Optional[str] = None,
+                            data_source: Optional[str] = None,
+                            scope: Optional[str] = None,
+                            limit: Optional[int] = None) -> list[dict]:
+    sql = "SELECT * FROM prediction_history WHERE 1=1"
+    args: list = []
+    if plant_id is not None:
+        sql += " AND plant_id = ?"
+        args.append(plant_id)
+    if species:
+        sql += " AND species = ?"
+        args.append(species)
+    if data_source:
+        sql += " AND data_source = ?"
+        args.append(data_source)
+    if scope:
+        sql += " AND prediction_scope = ?"
+        args.append(scope)
+    sql += " ORDER BY created_at DESC, prediction_id DESC"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    return [_prediction_row_to_dict(r) for r in conn.execute(sql, args)]
+
+
+# --------------------------------------------------------------------------- #
+# Readiness assessments (user's judgement, distinct from prediction/labels)
+# --------------------------------------------------------------------------- #
+
+
+def record_readiness_assessment(conn: sqlite3.Connection, *,
+                                assessment_date: str,
+                                readiness_status: str,
+                                species: Optional[str] = None,
+                                plant_id: Optional[int] = None,
+                                variety: Optional[str] = None,
+                                notes: Optional[str] = None,
+                                prediction_id: Optional[int] = None,
+                                prediction_snapshot=None,
+                                assessment_source: str = "user",
+                                data_source: Optional[str] = None) -> dict:
+    """Record the user's readiness judgement for a plant/species.
+
+    This is deliberately NOT a readiness *event* (the only training label) and
+    NOT the system prediction: the prediction shown at the time is preserved
+    separately in ``prediction_snapshot``.
+    """
+    if readiness_status not in config.READINESS_ASSESSMENT_STATUSES:
+        raise ValidationError(
+            f"readiness_status must be one of "
+            f"{config.READINESS_ASSESSMENT_STATUSES}.")
+    adate = parse_iso_date(assessment_date, "assessment_date")
+
+    plant = None
+    if plant_id is not None:
+        plant = get_plant(conn, plant_id)
+        species = plant["species"]
+        if variety is None:
+            variety = plant["variety"]
+        if data_source is None:
+            data_source = plant["data_source"]
+    species = (species or "").strip()
+    if not species:
+        raise ValidationError("species is required.")
+    source = data_source or "real"
+    if source not in config.VALID_SOURCES:
+        raise ValidationError(f"Invalid data_source '{source}'.")
+
+    if prediction_id is not None:
+        get_prediction(conn, prediction_id)  # raises NotFoundError if absent
+
+    cur = conn.execute(
+        """INSERT INTO readiness_assessments
+           (plant_id, species, variety, assessment_date, readiness_status,
+            notes, prediction_id, prediction_snapshot, assessment_source,
+            data_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (plant_id, species, variety, adate.isoformat(), readiness_status,
+         notes, prediction_id, _json_dump(prediction_snapshot),
+         assessment_source or "user", source),
+    )
+    conn.commit()
+    return list_readiness_assessments(
+        conn, assessment_id=int(cur.lastrowid))[0]
+
+
+def list_readiness_assessments(conn: sqlite3.Connection,
+                               plant_id: Optional[int] = None,
+                               species: Optional[str] = None,
+                               data_source: Optional[str] = None,
+                               assessment_id: Optional[int] = None
+                               ) -> list[dict]:
+    sql = "SELECT * FROM readiness_assessments WHERE 1=1"
+    args: list = []
+    if assessment_id is not None:
+        sql += " AND assessment_id = ?"
+        args.append(assessment_id)
+    if plant_id is not None:
+        sql += " AND plant_id = ?"
+        args.append(plant_id)
+    if species:
+        sql += " AND species = ?"
+        args.append(species)
+    if data_source:
+        sql += " AND data_source = ?"
+        args.append(data_source)
+    sql += " ORDER BY assessment_date DESC, assessment_id DESC"
+    out = []
+    for row in conn.execute(sql, args):
+        item = dict(row)
+        item["prediction_snapshot"] = _json_load(item.get("prediction_snapshot"))
+        out.append(item)
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # Training-data assembly (readiness targets only)
 # --------------------------------------------------------------------------- #
 
@@ -664,7 +1164,7 @@ def readiness_training_rows(conn: sqlite3.Connection,
                     p.growing_conditions, p.cohort,
                     o.observation_id, o.observation_date, o.age_days,
                     o.height_cm, o.growth_rate_cm_per_day,
-                    o.canopy_width_cm, o.visible_true_leaf_count,
+                    o.stem_width_cm, o.visible_true_leaf_count,
                     er.ready_date AS readiness_observed_date,
                     (SELECT r.readiness_definition_version
                        FROM readiness_events r

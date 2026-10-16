@@ -113,7 +113,7 @@ def cmd_observe(conn, args) -> int:
         conn, plant_id=args.plant, observation_date=args.date,
         age_days=args.age_days, height_cm=args.height,
         growth_rate_cm_per_day=args.growth_rate,
-        canopy_width_cm=args.canopy_width,
+        stem_width_cm=args.stem_width,
         visible_true_leaf_count=args.true_leaves,
         data_source=args.source)
     print(f"Recorded observation #{oid} for plant #{args.plant} "
@@ -412,7 +412,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--age-days", type=int)
     p.add_argument("--height", type=float)
     p.add_argument("--growth-rate", type=float)
-    p.add_argument("--canopy-width", type=float)
+    p.add_argument("--stem-width", type=float)
     p.add_argument("--true-leaves", type=int)
     p.add_argument("--source", choices=list(config.VALID_SOURCES))
     p.set_defaults(func=cmd_observe)

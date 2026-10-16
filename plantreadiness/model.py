@@ -46,7 +46,7 @@ FEATURE_COLUMNS = [
     "age_days",
     "height_cm",
     "growth_rate_cm_per_day",
-    "canopy_width_cm",
+    "stem_width_cm",
     "visible_true_leaf_count",
     "species",
     "variety",
@@ -55,7 +55,7 @@ NUMERIC_FEATURES = [
     "age_days",
     "height_cm",
     "growth_rate_cm_per_day",
-    "canopy_width_cm",
+    "stem_width_cm",
     "visible_true_leaf_count",
 ]
 CATEGORICAL_FEATURES = ["species", "variety"]

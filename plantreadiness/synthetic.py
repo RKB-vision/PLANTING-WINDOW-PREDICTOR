@@ -107,6 +107,16 @@ def _height_on_day(profile: SpeciesProfile, age_days: int,
     return max(0.0, round(base + noise, 3))
 
 
+def _stem_width_on_day(height_cm: float, rng: random.Random) -> float:
+    """Simulated stem width - a rough fraction of height, plus noise.
+
+    Simulated only. The real pipeline measures stem width from the camera
+    (``observations.stem_width_cm``); this exists so the DEMO model has a
+    stem-width signal to learn from.
+    """
+    return max(0.0, round(height_cm * 0.10 + rng.gauss(0.0, 0.02), 3))
+
+
 def _find_readiness_age(profile: SpeciesProfile, rng: random.Random) -> int:
     """First daily assessment at which the assumed rule is satisfied."""
     jitter = rng.randint(-profile.ready_age_jitter_days,
@@ -175,6 +185,7 @@ def generate_demo_cohort(config: DemoConfig,
                         "observation_date": day.isoformat(),
                         "age_days": age,
                         "height_cm": h,
+                        "stem_width_cm": _stem_width_on_day(h, rng),
                         "growth_rate_cm_per_day": rate,
                     })
                     prev_height = h
@@ -281,6 +292,7 @@ def load_cohort_into_db(conn, plants: list[SimPlant],
                     observation_date=obs["observation_date"],
                     age_days=obs["age_days"],
                     height_cm=obs["height_cm"],
+                    stem_width_cm=obs["stem_width_cm"],
                     growth_rate_cm_per_day=obs["growth_rate_cm_per_day"],
                     data_source="synthetic",
                 )

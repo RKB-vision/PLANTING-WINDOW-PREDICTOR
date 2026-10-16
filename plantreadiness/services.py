@@ -1,13 +1,12 @@
 """Service layer - one implementation of every business workflow.
 
-Both the command-line tools and the Streamlit web app call these functions,
-so behaviour (validation, date arithmetic, fallback rules, honest-refusal
-messages) can never drift between the two front-ends.
+The command-line tools, the Flask API and the Next.js front-end all call these
+functions, so behaviour (validation, date arithmetic, fallback rules,
+honest-refusal messages) can never drift between front-ends.
 
 Every function takes a :class:`plantreadiness.repository.BaseRepository`
-instead of a SQLite connection, which is what lets the same code run against
-the local SQLite file during development and against Supabase (RLS-scoped)
-in production.
+instead of a raw SQLite connection, so the storage backend stays isolated
+behind one seam (currently the local SQLite file on this device).
 
 Invariants preserved here (task sections 3, 8, 10):
 
@@ -28,16 +27,18 @@ from __future__ import annotations
 import csv
 import io
 import json
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from . import config
 from . import model as mdl
+from . import reference as ref
 from .db import (DuplicateRecordError, NotFoundError, ValidationError,
                  compute_growth, days_between, feedback_due_date,
                  parse_iso_date)
 from .repository import BaseRepository
+from .camera_refresh import refresh_camera_observations
 
 # Re-exported so front-ends import workflow errors from one place.
 __all__ = [
@@ -45,10 +46,15 @@ __all__ = [
     "register_plant", "record_observation", "record_transplant",
     "submit_feedback", "correct_feedback", "feedback_state",
     "record_readiness_event", "list_readiness_events",
-    "import_camera_measurements",
-    "predict_for_plant", "predict_ad_hoc", "model_status",
+    "import_camera_measurements", "refresh_camera_observations",
+    "predict_for_plant", "predict_ad_hoc", "predict_species_cohort",
+    "model_status",
     "species_model_plan", "preview_csv_import", "run_csv_import",
     "export_table_csv", "dashboard_summary",
+    "build_reference_baseline", "load_reference_baseline",
+    "save_prediction_snapshot", "list_prediction_history",
+    "record_readiness_assessment", "list_readiness_assessments",
+    "evaluate_predictions",
 ]
 
 
@@ -121,6 +127,7 @@ def record_observation(repo: BaseRepository, *, plant_id: int,
                        age_days: Optional[int] = None,
                        growth_rate_cm_per_day: Optional[float] = None,
                        canopy_width_cm: Optional[float] = None,
+                       stem_width_cm: Optional[float] = None,
                        visible_true_leaf_count: Optional[int] = None,
                        data_source: Optional[str] = None,
                        derive_missing: bool = True) -> dict:
@@ -157,6 +164,7 @@ def record_observation(repo: BaseRepository, *, plant_id: int,
         age_days=age_days, height_cm=height_cm,
         growth_rate_cm_per_day=growth_rate_cm_per_day,
         canopy_width_cm=canopy_width_cm,
+        stem_width_cm=stem_width_cm,
         visible_true_leaf_count=visible_true_leaf_count,
         data_source=data_source)
     return {"observation_id": obs_id, "derived": derived,
@@ -248,12 +256,23 @@ def import_camera_measurements(
 def record_transplant(repo: BaseRepository, *, plant_id: int,
                       transplant_date: str,
                       height_at_transplant_cm: Optional[float] = None,
-                      data_source: Optional[str] = None) -> dict:
-    """Create the transplant event and its pending 14-day feedback record."""
+                      data_source: Optional[str] = None,
+                      transplant_occurred: bool = True,
+                      condition_at_transplant: Optional[str] = None,
+                      transplant_notes: Optional[str] = None) -> dict:
+    """Create the transplant event and its pending 14-day feedback record.
+
+    A readiness assessment never implies a transplant: pass
+    ``transplant_occurred=False`` to record a decision/deferral; no feedback
+    is then due.
+    """
     return repo.record_transplant(
         plant_id=plant_id, transplant_date=transplant_date,
         height_at_transplant_cm=height_at_transplant_cm,
-        data_source=data_source)
+        data_source=data_source,
+        transplant_occurred=transplant_occurred,
+        condition_at_transplant=condition_at_transplant,
+        transplant_notes=transplant_notes)
 
 
 def feedback_state(row: dict, as_of: Optional[date] = None) -> dict:
@@ -281,7 +300,7 @@ def _growth_for(row: dict,
     """Growth = after 14d - at transplant, only when both heights exist."""
     height_at = row.get("height_at_transplant_cm")
     if height_at is None:
-        # Supabase schema: height lives on the linked transplant event
+        # Accept either key for the transplant height.
         height_at = row.get("transplant_height_cm")
     return compute_growth(height_at, height_after_14d_cm)
 
@@ -356,8 +375,16 @@ def correct_feedback(repo: BaseRepository, *, feedback_id: int,
 
 
 def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
-                      allow_synthetic: bool = False) -> dict:
-    """Species-aware prediction for a registered plant's latest observation."""
+                      allow_synthetic: bool = False,
+                      allow_provisional_baseline: bool = False) -> dict:
+    """Species-aware prediction for a registered plant's latest observation.
+
+    When no validated/synthetic model is available AND
+    ``allow_provisional_baseline`` is set, the successful-cohort reference
+    baseline may supply a clearly-labelled *provisional* estimate. The flag
+    defaults to off so an ordinary real-plant prediction still refuses
+    honestly (see the honest-refusal contract).
+    """
     plant = repo.get_plant(plant_id)
     if plant is None:
         raise NotFoundError(f"No plant with plant_id={plant_id}.")
@@ -391,7 +418,7 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
         "age_days": obs["age_days"],
         "height_cm": obs["height_cm"],
         "growth_rate_cm_per_day": obs["growth_rate_cm_per_day"],
-        "canopy_width_cm": obs["canopy_width_cm"],
+        "stem_width_cm": obs.get("stem_width_cm"),
         "visible_true_leaf_count": obs["visible_true_leaf_count"],
         "species": species,
         "variety": variety,
@@ -416,6 +443,11 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
         result["cross_source_warning"] = (
             "This is a REAL plant being shown an explicitly-enabled "
             "SYNTHETIC DEMO prediction. Do not treat it as evidence.")
+    if not result.get("available") and allow_provisional_baseline:
+        result = _apply_provisional_baseline(
+            result, models_dir, species, variety, observation)
+    result.setdefault("provisional", False)
+    result.setdefault("method", _method_for(result))
     return result
 
 
@@ -429,6 +461,148 @@ def predict_ad_hoc(species: str, variety: Optional[str], observation: dict,
     observation["species"] = species
     observation["variety"] = variety
     return mdl.predict_days_remaining(selection, observation)
+
+
+# --------------------------------------------------------------------------- #
+# Species-level prediction (latest cloud cohort)
+# --------------------------------------------------------------------------- #
+
+
+def _median(values: Iterable[Optional[float]]) -> Optional[float]:
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return None
+    n = len(vals)
+    mid = n // 2
+    if n % 2:
+        return vals[mid]
+    return (vals[mid - 1] + vals[mid]) / 2
+
+
+def _median_int(values: Iterable[Optional[float]]) -> Optional[int]:
+    med = _median(values)
+    return None if med is None else int(round(med))
+
+
+def _rounded(values: Iterable[Optional[float]],
+             digits: int = 4) -> Optional[float]:
+    med = _median(values)
+    return None if med is None else round(float(med), digits)
+
+
+def predict_species_cohort(repo: BaseRepository, species: str,
+                           variety: Optional[str] = None,
+                           models_dir: Path = Path("models"),
+                           observation_date: Optional[str] = None,
+                           allow_synthetic: bool = False,
+                           allow_provisional_baseline: bool = False) -> dict:
+    """Predict readiness for a species using its latest observed cohort.
+
+    The UI calls this instead of asking the user to choose an individual
+    plant. The backend selects the newest cloud/data date for the species,
+    aggregates the observations recorded on that date, and passes the
+    representative observation to the existing prediction workflow.
+    """
+    models_dir = Path(models_dir)
+    snapshot = repo.species_cohort_snapshot(
+        species, variety, observation_date)
+    rows = snapshot.get("rows", [])
+    target_date = snapshot.get("observation_date")
+
+    event_counts = repo.readiness_event_counts(species, variety,
+                                                data_source="real")
+
+    species_label = f"{species}"
+    if variety:
+        species_label += f" / {variety}"
+
+    if not rows or not target_date:
+        return {
+            "available": False,
+            "message": (
+                f"No real observations found for {species_label} on the "
+                "latest available date - the system is still collecting data."
+            ),
+            "synthetic": False,
+            "species": species,
+            "variety": variety,
+            "observation_date": target_date,
+            "cohort_snapshot": {
+                "aggregation": "population_median",
+                "plants_represented": 0,
+                "row_count": 0,
+                "observation_date": target_date,
+            },
+            "readiness_event_counts": event_counts,
+            "provisional": False,
+            "method": config.METHOD_UNAVAILABLE,
+        }
+
+    heights = [r.get("height_cm") for r in rows]
+    ages = [r.get("age_days") for r in rows]
+    rates = [r.get("growth_rate_cm_per_day") for r in rows]
+    canopy = [r.get("canopy_width_cm") for r in rows]
+    stem = [r.get("stem_width_cm") for r in rows]
+    leaves = [r.get("visible_true_leaf_count") for r in rows]
+
+    cohort_snapshot = {
+        "aggregation": "population_median",
+        "plants_represented": snapshot.get("plants_represented", 0),
+        "row_count": snapshot.get("row_count", len(rows)),
+        "observation_date": target_date,
+        "median_height_cm": _rounded(heights),
+        "min_height_cm": round(
+            min(float(h) for h in heights if h is not None), 4
+        ) if any(h is not None for h in heights) else None,
+        "max_height_cm": round(
+            max(float(h) for h in heights if h is not None), 4
+        ) if any(h is not None for h in heights) else None,
+        "median_age_days": _median_int(ages),
+        "median_growth_rate_cm_per_day": _rounded(rates),
+        "median_canopy_width_cm": _rounded(canopy),
+        "median_stem_width_cm": _rounded(stem),
+        "median_visible_true_leaf_count": _median_int(leaves),
+        "missing_height_count": sum(1 for h in heights if h is None),
+        "missing_age_count": sum(1 for a in ages if a is None),
+    }
+
+    representative_observation = {
+        "age_days": cohort_snapshot["median_age_days"],
+        "height_cm": cohort_snapshot["median_height_cm"],
+        "growth_rate_cm_per_day":
+            cohort_snapshot["median_growth_rate_cm_per_day"],
+        "canopy_width_cm": cohort_snapshot["median_canopy_width_cm"],
+        "stem_width_cm": cohort_snapshot["median_stem_width_cm"],
+        "visible_true_leaf_count":
+            cohort_snapshot["median_visible_true_leaf_count"],
+        "observation_date": target_date,
+    }
+
+    result = predict_ad_hoc(
+        species, variety, representative_observation, models_dir,
+        allow_synthetic=allow_synthetic)
+
+    result.update({
+        "species": species,
+        "variety": variety,
+        "observation_date": target_date,
+        "prediction_scope": "species_cohort",
+        "cohort_snapshot": cohort_snapshot,
+        "readiness_event_counts": event_counts,
+        "synthetic_note": (
+            "SYNTHETIC DEMO: provisional prediction from simulated data - "
+            "not a botanical finding."
+            if result.get("synthetic") else None),
+    })
+    if not result.get("available") and allow_provisional_baseline:
+        result = _apply_provisional_baseline(
+            result, Path(models_dir), species, variety,
+            representative_observation)
+        # keep the species context that _apply preserves via **result
+        result["prediction_scope"] = "species_cohort"
+    result.setdefault("provisional", False)
+    result.setdefault("method", _method_for(result))
+    return result
 
 
 # --------------------------------------------------------------------------- #
@@ -489,6 +663,396 @@ def species_model_plan(repo: BaseRepository, species: str,
         "min_requirements": {
             "independent_plants": config.MIN_INDEPENDENT_PLANTS,
             "readiness_events": config.MIN_READINESS_EVENTS},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Reference baseline + prediction history + readiness assessments
+# --------------------------------------------------------------------------- #
+
+
+def _method_for(result: dict) -> str:
+    """Label which method produced a prediction result (for snapshots)."""
+    explicit = result.get("method")
+    if explicit:
+        return explicit
+    if result.get("synthetic"):
+        return config.METHOD_SYNTHETIC_DEMO
+    if result.get("available"):
+        return config.METHOD_VALIDATED_MODEL
+    return config.METHOD_UNAVAILABLE
+
+
+def _coerce_level(value) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_provisional_baseline(result: dict, models_dir: Path, species: str,
+                                variety: Optional[str],
+                                observation: Optional[dict]) -> dict:
+    """Replace an unavailable result with a provisional baseline estimate.
+
+    Only called when the model-based prediction was unavailable, so a working
+    model is never silently replaced. The estimate stays explicitly labelled
+    provisional and the reference transplant date is flagged as an assumption.
+    """
+    baseline = ref.load_baseline(Path(models_dir), species, variety)
+    estimate = ref.provisional_estimate(baseline, observation or {})
+    merged = dict(result)
+    if not estimate.get("available"):
+        merged["provisional"] = False
+        merged["baseline_available"] = bool(baseline)
+        merged["baseline_note"] = estimate.get("message")
+        return merged
+    merged.update({
+        "available": True,
+        "method": config.METHOD_REFERENCE_BASELINE,
+        "provisional": True,
+        "synthetic": False,
+        "data_source": "real",
+        "days_remaining": estimate.get("days_remaining"),
+        "predicted_readiness_date": estimate.get("predicted_readiness_date"),
+        "days_remaining_uncertainty_days":
+            estimate.get("days_remaining_uncertainty_days"),
+        "reference_basis": estimate.get("reference_basis"),
+        "reference_group": estimate.get("reference_group"),
+        "n_independent_plants": estimate.get("n_independent_plants"),
+        "reference_transplant_is_assumption":
+            estimate.get("reference_transplant_is_assumption"),
+        "insufficient_growth_history":
+            estimate.get("insufficient_growth_history"),
+        "history_note": estimate.get("history_note"),
+        "baseline_version": estimate.get("baseline_version"),
+        "message": (estimate.get("message")
+                    or config.PROVISIONAL_BASELINE_MESSAGE),
+        "limitations": estimate.get("limitations", []),
+        "synthetic_note": None,
+    })
+    return merged
+
+
+def build_reference_baseline(repo: BaseRepository, species: str, *,
+                             models_dir: Path, variety: Optional[str] = None,
+                             data_source: str = "real",
+                             save: bool = True) -> dict:
+    """Build (and by default persist) the successful-cohort reference baseline.
+
+    Safe to repeat: the JSON is regenerated from stored measurements, and
+    re-importing the same source produces the same medians.
+    """
+    baseline = ref.build_reference_from_repo(
+        repo, species, variety=variety, data_source=data_source)
+    path = None
+    if save:
+        path = ref.save_baseline(Path(models_dir), baseline)
+    summary = ref.baseline_summary(baseline)
+    summary["path"] = str(path) if path else None
+    return summary
+
+
+def load_reference_baseline(models_dir: Path, species: str,
+                            variety: Optional[str] = None) -> Optional[dict]:
+    """Load a persisted reference baseline summary (or ``None``)."""
+    baseline = ref.load_baseline(Path(models_dir), species, variety)
+    if baseline is None:
+        return None
+    return ref.baseline_summary(baseline)
+
+
+def save_prediction_snapshot(repo: BaseRepository, result: dict, *,
+                             plant_id: Optional[int] = None,
+                             prediction_scope: Optional[str] = None,
+                             observation_snapshot: Optional[dict] = None,
+                             cohort_snapshot: Optional[dict] = None) -> dict:
+    """Persist an immutable snapshot of a prediction result (append-only)."""
+    species = (result.get("species") or "").strip()
+    if not species:
+        raise ValidationError(
+            "prediction result has no species; cannot save a snapshot.")
+    data_source = result.get("data_source")
+    if data_source not in config.VALID_SOURCES:
+        data_source = result.get("plant_data_source")
+    if data_source not in config.VALID_SOURCES:
+        data_source = None
+    days = result.get("days_remaining")
+    if days is None:
+        days = result.get("days_remaining_raw")
+    return repo.save_prediction_snapshot(
+        species=species,
+        variety=result.get("variety"),
+        method=_method_for(result),
+        available=bool(result.get("available")),
+        plant_id=plant_id if plant_id is not None else result.get("plant_id"),
+        prediction_scope=(prediction_scope
+                          or result.get("prediction_scope") or "plant"),
+        observation_date=result.get("observation_date"),
+        level=_coerce_level(result.get("level")),
+        synthetic=bool(result.get("synthetic")),
+        provisional=bool(result.get("provisional")),
+        days_remaining=days,
+        predicted_readiness_date=result.get("predicted_readiness_date"),
+        model_name=result.get("model_name"),
+        data_source=data_source,
+        baseline_version=result.get("baseline_version"),
+        n_independent_plants=result.get("n_independent_plants"),
+        message=result.get("message"),
+        limitations=result.get("limitations"),
+        observation_snapshot=(observation_snapshot
+                              if observation_snapshot is not None
+                              else result.get("observation")),
+        cohort_snapshot=(cohort_snapshot if cohort_snapshot is not None
+                         else result.get("cohort_snapshot")),
+    )
+
+
+def list_prediction_history(repo: BaseRepository, *,
+                            plant_id: Optional[int] = None,
+                            species: Optional[str] = None,
+                            data_source: Optional[str] = None,
+                            scope: Optional[str] = None,
+                            limit: Optional[int] = None) -> list[dict]:
+    return repo.list_prediction_history(
+        plant_id=plant_id, species=species, data_source=data_source,
+        scope=scope, limit=limit)
+
+
+def record_readiness_assessment(
+        repo: BaseRepository, *,
+        assessment_date: str,
+        readiness_status: str,
+        plant_id: Optional[int] = None,
+        species: Optional[str] = None,
+        variety: Optional[str] = None,
+        notes: Optional[str] = None,
+        prediction_id: Optional[int] = None,
+        prediction_snapshot: Optional[dict] = None,
+        assessment_source: str = "user",
+        data_source: Optional[str] = None) -> dict:
+    """Record the user's readiness judgement.
+
+    The assessment is kept distinct from the system prediction (the prediction
+    shown at the time is preserved separately) and never creates a training
+    label.
+    """
+    if prediction_id is not None and prediction_snapshot is None:
+        pred = repo.get_prediction(prediction_id)
+        if pred is None:
+            raise NotFoundError(
+                f"No prediction with prediction_id={prediction_id}.")
+        prediction_snapshot = {
+            "prediction_id": pred.get("prediction_id"),
+            "method": pred.get("method"),
+            "available": pred.get("available"),
+            "provisional": pred.get("provisional"),
+            "days_remaining": pred.get("days_remaining"),
+            "predicted_readiness_date": pred.get("predicted_readiness_date"),
+            "message": pred.get("message"),
+            "created_at": pred.get("created_at"),
+        }
+    return repo.record_readiness_assessment(
+        plant_id=plant_id, species=species, variety=variety,
+        assessment_date=assessment_date, readiness_status=readiness_status,
+        notes=notes, prediction_id=prediction_id,
+        prediction_snapshot=prediction_snapshot,
+        assessment_source=assessment_source, data_source=data_source)
+
+
+def list_readiness_assessments(repo: BaseRepository, *,
+                               plant_id: Optional[int] = None,
+                               species: Optional[str] = None,
+                               data_source: Optional[str] = None) -> list[dict]:
+    return repo.list_readiness_assessments(
+        plant_id=plant_id, species=species, data_source=data_source)
+
+
+def _summarise_evaluation(rows: list[dict]) -> dict:
+    """Aggregate prediction-vs-actual errors for one group of rows."""
+    n = len(rows)
+    if not n:
+        return {"n_predictions": 0, "n_independent_plants": 0,
+                "mean_abs_error_days": None, "median_abs_error_days": None,
+                "mean_error_days": None, "n_matched_observed_date": 0,
+                "match_rate": None, "n_with_14d_outcome": 0,
+                "survival_rate_14d": None, "n_incomplete_feedback": 0}
+    abs_errs = [r["abs_error_days"] for r in rows]
+    signed = [r["error_days"] for r in rows]
+    plants = {r["plant_id"] for r in rows}
+    matched = sum(1 for r in rows if r["matched"])
+    outcomes = [r for r in rows if r["survived"] is not None]
+    survived = sum(1 for r in outcomes if r["survived"])
+    return {
+        "n_predictions": n,
+        "n_independent_plants": len(plants),
+        "mean_abs_error_days": round(sum(abs_errs) / n, 2),
+        "median_abs_error_days": round(sorted(abs_errs)[n // 2]
+                                       if n % 2 else
+                                       (sorted(abs_errs)[n // 2 - 1]
+                                        + sorted(abs_errs)[n // 2]) / 2, 2),
+        "mean_error_days": round(sum(signed) / n, 2),
+        "n_matched_observed_date": matched,
+        "match_rate": round(matched / n, 3),
+        "n_with_14d_outcome": len(outcomes),
+        "survival_rate_14d": (round(survived / len(outcomes), 3)
+                              if outcomes else None),
+        "n_incomplete_feedback": sum(1 for r in rows
+                                     if r["survived"] is None),
+    }
+
+
+def evaluate_predictions(repo: BaseRepository, *,
+                         species: Optional[str] = None,
+                         variety: Optional[str] = None,
+                         tolerance: Optional[float] = None,
+                         data_source: str = "real") -> dict:
+    """Compare recorded predictions against the actual transplants.
+
+    Two questions are kept apart:
+
+    * *did the prediction match the observed transplant date?* - measured as
+      the absolute error in days (and a within-tolerance match rate);
+    * *was that date optimal?* - this cohort has only successful transplants,
+      so optimality is **not** evaluable from it. Survival after 14 days is
+      reported descriptively only.
+
+    Predictions made after the transplant date are excluded to avoid using
+    future data.
+    """
+    tolerance = (config.EVALUATION_MATCH_TOLERANCE_DAYS
+                 if tolerance is None else float(tolerance))
+
+    feedback = repo.all_feedback(data_source=data_source)
+    transplant_by_plant: dict[int, dict] = {}
+    for row in feedback:
+        if row.get("transplant_occurred", 1) is False:
+            continue
+        tx = row.get("transplant_date")
+        if not tx:
+            continue
+        pid = row["plant_id"]
+        current = transplant_by_plant.get(pid)
+        if current is None or tx < current["transplant_date"]:
+            transplant_by_plant[pid] = row
+
+    predictions = repo.list_prediction_history(
+        species=species, data_source=data_source)
+
+    rows: list[dict] = []
+    skipped_after_transplant = 0
+    for pred in predictions:
+        pid = pred.get("plant_id")
+        if pid is None or not pred.get("available"):
+            continue
+        fb = transplant_by_plant.get(pid)
+        if fb is None:
+            continue
+        if variety and fb.get("variety") and fb.get("variety") != variety:
+            continue
+        tx = fb["transplant_date"]
+        obs_date = pred.get("observation_date")
+        if obs_date and obs_date > tx:
+            skipped_after_transplant += 1
+            continue
+        pred_date = pred.get("predicted_readiness_date")
+        if not pred_date and obs_date and pred.get("days_remaining") is not None:
+            pred_date = (parse_iso_date(obs_date)
+                         + timedelta(days=int(round(
+                             pred["days_remaining"])))).isoformat()
+        if not pred_date:
+            continue
+        # signed error: predicted readiness date minus actual transplant date
+        error_days = days_between(tx, pred_date)
+        survived = fb.get("survived_after_14d")
+        survived = None if survived is None else bool(survived)
+        rows.append({
+            "prediction_id": pred.get("prediction_id"),
+            "plant_id": pid,
+            "species": pred.get("species"),
+            "variety": pred.get("variety"),
+            "method": pred.get("method"),
+            "provisional": bool(pred.get("provisional")),
+            "prediction_scope": pred.get("prediction_scope"),
+            "observation_date": obs_date,
+            "predicted_readiness_date": pred_date,
+            "actual_transplant_date": tx,
+            "error_days": error_days,
+            "abs_error_days": abs(error_days),
+            "matched": abs(error_days) <= tolerance,
+            "survived": survived,
+            "feedback_submitted": fb.get("feedback_submitted_date") is not None,
+        })
+
+    by_method: dict[str, dict] = {}
+    for row in rows:
+        by_method.setdefault(row["method"] or "unknown", []).append(row)
+    by_method_summary = {m: _summarise_evaluation(rs)
+                         for m, rs in by_method.items()}
+
+    by_species: dict[str, list[dict]] = {}
+    for row in rows:
+        by_species.setdefault(row["species"] or "unknown", []).append(row)
+    by_species_summary = [
+        {"species": s, **_summarise_evaluation(rs)}
+        for s, rs in sorted(by_species.items())
+    ]
+
+    overall = _summarise_evaluation(rows)
+    sufficient = (overall["n_independent_plants"] >= config.MIN_INDEPENDENT_PLANTS
+                  and overall["n_predictions"] >= config.MIN_READINESS_EVENTS)
+
+    # A comparison is only offered between methods that each have enough
+    # independent plants; it is NEVER auto-applied.
+    methods_with_evidence = {
+        m: s for m, s in by_method_summary.items()
+        if s["n_independent_plants"] >= config.MIN_PROVISIONAL_PLANTS}
+    better_method = None
+    if len(methods_with_evidence) >= 2:
+        ranked = sorted(
+            methods_with_evidence.items(),
+            key=lambda kv: kv[1]["mean_abs_error_days"])
+        better_method = ranked[0][0]
+    comparison = {
+        "methods_compared": sorted(methods_with_evidence.keys()),
+        "better_method": better_method,
+        "auto_applied": False,
+        "recommendation": (
+            "Not enough independent plants across methods to compare; keep "
+            "collecting feedback."
+            if better_method is None else
+            f"'{better_method}' has the lower mean absolute error on recorded "
+            "transplants. Review before changing anything - this does not "
+            "retrain or promote a model."),
+    }
+
+    return {
+        "species": species,
+        "variety": variety,
+        "tolerance_days": tolerance,
+        "n_predictions_evaluated": overall["n_predictions"],
+        "n_independent_plants": overall["n_independent_plants"],
+        "skipped_after_transplant": skipped_after_transplant,
+        "overall": overall,
+        "by_method": by_method_summary,
+        "by_species": by_species_summary,
+        "comparison": comparison,
+        "sufficient_evidence": sufficient,
+        "min_requirements": {
+            "independent_plants": config.MIN_INDEPENDENT_PLANTS,
+            "predictions_with_outcomes": config.MIN_READINESS_EVENTS,
+            "plants_per_method": config.MIN_PROVISIONAL_PLANTS,
+        },
+        "notes": [
+            "Error is predicted_readiness_date minus actual transplant_date "
+            "in calendar days (negative = predicted earlier than transplant).",
+            "Matching the observed transplant date is not the same as that "
+            "date being optimal: the historical cohort contains only "
+            "successful transplants and cannot show what would have failed.",
+            "Feedback not yet submitted is reported as incomplete, never as "
+            "death or failure.",
+            "Nothing here retrains or replaces a model automatically.",
+        ],
     }
 
 
