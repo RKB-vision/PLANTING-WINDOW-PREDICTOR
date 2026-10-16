@@ -1,0 +1,303 @@
+{
+  "data_source": "synthetic",
+  "artifacts": [
+    {
+      "file": "countdown_DemoBean_Bush_20261016085817_52ea9d.joblib",
+      "metadata": {
+        "training_data_source": "synthetic",
+        "is_synthetic": true,
+        "supported_species": [
+          "Demo Bean"
+        ],
+        "supported_varieties": [
+          "Bush"
+        ],
+        "scope_species": "Demo Bean",
+        "scope_variety": "Bush",
+        "target_definition": "days_remaining = readiness_observed_date - observation_date (elapsed calendar days; only observations recorded at or before the readiness event are used as training rows)",
+        "feature_list": [
+          "age_days",
+          "height_cm",
+          "growth_rate_cm_per_day",
+          "stem_width_cm",
+          "visible_true_leaf_count",
+          "species",
+          "variety"
+        ],
+        "training_date": "2026-10-16T03:28:17.687739+00:00",
+        "validation_method": "GroupKFold by plant_id (n=5), repeated observations of a plant never split across folds",
+        "validation_metrics": {
+          "mae_days": 0.0661,
+          "mae_days_std": 0.0159,
+          "baseline_mean_mae_days": 1.5,
+          "all_candidates": {
+            "mean_baseline": 1.5,
+            "ridge": 0.0661,
+            "random_forest": 0.0784
+          }
+        },
+        "n_independent_plants": 8,
+        "n_labelled_readiness_events": 8,
+        "n_training_rows": 48,
+        "validated": true,
+        "model_name": "ridge",
+        "training_plant_ids": [
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32
+        ],
+        "limitations": "SYNTHETIC DEMO model - trained on simulated data with assumed readiness rules; not a botanical finding."
+      },
+      "active": true
+    },
+    {
+      "file": "countdown_DemoBean_Climbing_20261016085818_4f0335.joblib",
+      "metadata": {
+        "training_data_source": "synthetic",
+        "is_synthetic": true,
+        "supported_species": [
+          "Demo Bean"
+        ],
+        "supported_varieties": [
+          "Climbing"
+        ],
+        "scope_species": "Demo Bean",
+        "scope_variety": "Climbing",
+        "target_definition": "days_remaining = readiness_observed_date - observation_date (elapsed calendar days; only observations recorded at or before the readiness event are used as training rows)",
+        "feature_list": [
+          "age_days",
+          "height_cm",
+          "growth_rate_cm_per_day",
+          "stem_width_cm",
+          "visible_true_leaf_count",
+          "species",
+          "variety"
+        ],
+        "training_date": "2026-10-16T03:28:18.000824+00:00",
+        "validation_method": "GroupKFold by plant_id (n=5), repeated observations of a plant never split across folds",
+        "validation_metrics": {
+          "mae_days": 0.081,
+          "mae_days_std": 0.021,
+          "baseline_mean_mae_days": 1.5,
+          "all_candidates": {
+            "mean_baseline": 1.5,
+            "ridge": 0.081,
+            "random_forest": 0.0872
+          }
+        },
+        "n_independent_plants": 8,
+        "n_labelled_readiness_events": 8,
+        "n_training_rows": 48,
+        "validated": true,
+        "model_name": "ridge",
+        "training_plant_ids": [
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24
+        ],
+        "limitations": "SYNTHETIC DEMO model - trained on simulated data with assumed readiness rules; not a botanical finding."
+      },
+      "active": true
+    },
+    {
+      "file": "countdown_SuperOrange_Early_20261016085818_8fa2f8.joblib",
+      "metadata": {
+        "training_data_source": "synthetic",
+        "is_synthetic": true,
+        "supported_species": [
+          "Super Orange"
+        ],
+        "supported_varieties": [
+          "Early"
+        ],
+        "scope_species": "Super Orange",
+        "scope_variety": "Early",
+        "target_definition": "days_remaining = readiness_observed_date - observation_date (elapsed calendar days; only observations recorded at or before the readiness event are used as training rows)",
+        "feature_list": [
+          "age_days",
+          "height_cm",
+          "growth_rate_cm_per_day",
+          "stem_width_cm",
+          "visible_true_leaf_count",
+          "species",
+          "variety"
+        ],
+        "training_date": "2026-10-16T03:28:18.343195+00:00",
+        "validation_method": "GroupKFold by plant_id (n=5), repeated observations of a plant never split across folds",
+        "validation_metrics": {
+          "mae_days": 0.4588,
+          "mae_days_std": 0.0573,
+          "baseline_mean_mae_days": 4.9283,
+          "all_candidates": {
+            "mean_baseline": 4.9283,
+            "ridge": 0.4588,
+            "random_forest": 0.4727
+          }
+        },
+        "n_independent_plants": 8,
+        "n_labelled_readiness_events": 8,
+        "n_training_rows": 157,
+        "validated": true,
+        "model_name": "ridge",
+        "training_plant_ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8
+        ],
+        "limitations": "SYNTHETIC DEMO model - trained on simulated data with assumed readiness rules; not a botanical finding."
+      },
+      "active": true
+    },
+    {
+      "file": "countdown_SuperOrange_Late_20261016085818_b1d25e.joblib",
+      "metadata": {
+        "training_data_source": "synthetic",
+        "is_synthetic": true,
+        "supported_species": [
+          "Super Orange"
+        ],
+        "supported_varieties": [
+          "Late"
+        ],
+        "scope_species": "Super Orange",
+        "scope_variety": "Late",
+        "target_definition": "days_remaining = readiness_observed_date - observation_date (elapsed calendar days; only observations recorded at or before the readiness event are used as training rows)",
+        "feature_list": [
+          "age_days",
+          "height_cm",
+          "growth_rate_cm_per_day",
+          "stem_width_cm",
+          "visible_true_leaf_count",
+          "species",
+          "variety"
+        ],
+        "training_date": "2026-10-16T03:28:18.713426+00:00",
+        "validation_method": "GroupKFold by plant_id (n=5), repeated observations of a plant never split across folds",
+        "validation_metrics": {
+          "mae_days": 0.4558,
+          "mae_days_std": 0.0486,
+          "baseline_mean_mae_days": 4.9283,
+          "all_candidates": {
+            "mean_baseline": 4.9283,
+            "ridge": 0.4558,
+            "random_forest": 0.4673
+          }
+        },
+        "n_independent_plants": 8,
+        "n_labelled_readiness_events": 8,
+        "n_training_rows": 157,
+        "validated": true,
+        "model_name": "ridge",
+        "training_plant_ids": [
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16
+        ],
+        "limitations": "SYNTHETIC DEMO model - trained on simulated data with assumed readiness rules; not a botanical finding."
+      },
+      "active": true
+    },
+    {
+      "file": "countdown_ALL_ANY_20261016085819_3aa6bd.joblib",
+      "metadata": {
+        "training_data_source": "synthetic",
+        "is_synthetic": true,
+        "supported_species": [
+          "Demo Bean",
+          "Super Orange"
+        ],
+        "supported_varieties": [
+          "Bush",
+          "Climbing",
+          "Early",
+          "Late"
+        ],
+        "scope_species": null,
+        "scope_variety": null,
+        "target_definition": "days_remaining = readiness_observed_date - observation_date (elapsed calendar days; only observations recorded at or before the readiness event are used as training rows)",
+        "feature_list": [
+          "age_days",
+          "height_cm",
+          "growth_rate_cm_per_day",
+          "stem_width_cm",
+          "visible_true_leaf_count",
+          "species",
+          "variety"
+        ],
+        "training_date": "2026-10-16T03:28:19.247607+00:00",
+        "validation_method": "GroupKFold by plant_id (n=5), repeated observations of a plant never split across folds",
+        "validation_metrics": {
+          "mae_days": 0.3551,
+          "mae_days_std": 0.06,
+          "baseline_mean_mae_days": 5.105,
+          "all_candidates": {
+            "mean_baseline": 5.105,
+            "ridge": 0.4516,
+            "random_forest": 0.3551
+          }
+        },
+        "n_independent_plants": 32,
+        "n_labelled_readiness_events": 32,
+        "n_training_rows": 410,
+        "validated": true,
+        "model_name": "random_forest",
+        "training_plant_ids": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32
+        ],
+        "limitations": "SYNTHETIC DEMO model - trained on simulated data with assumed readiness rules; not a botanical finding."
+      },
+      "active": true
+    }
+  ]
+}
