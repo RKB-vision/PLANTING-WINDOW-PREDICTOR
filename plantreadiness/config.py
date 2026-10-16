@@ -20,6 +20,11 @@ MODELS_DIR = BASE_DIR / "models"
 REFERENCE_DIR = MODELS_DIR / "reference"
 DEFAULT_REAL_CSV = BASE_DIR / "super_orange_growth_data.csv"
 
+# Synthetic demonstration runs must never write into the real database or the
+# committed models/ directory, so they get their own scratch locations.
+DEMO_DB_PATH = BASE_DIR / "plant_readiness_demo.db"
+DEMO_MODELS_DIR = BASE_DIR / "models_demo"
+
 # --------------------------------------------------------------------------- #
 # Camera / cloud (ESP32-CAM -> Cloudinary -> OpenCV) refresh
 # --------------------------------------------------------------------------- #

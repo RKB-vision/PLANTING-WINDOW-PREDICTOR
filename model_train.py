@@ -385,10 +385,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=["demo", "real"], required=True,
                         help="demo = synthetic demonstration; "
                              "real = Super Orange CSV import + analysis")
-    parser.add_argument("--db", default=str(config.DEFAULT_DB_PATH),
-                        help="SQLite database path")
-    parser.add_argument("--models-dir", default=str(config.MODELS_DIR),
-                        help="model artefact directory")
+    parser.add_argument("--db", default=None,
+                        help="SQLite database path (default: "
+                             "plant_readiness.db for real mode, "
+                             "plant_readiness_demo.db for demo mode)")
+    parser.add_argument("--models-dir", default=None,
+                        help="model artefact directory (default: models/ for "
+                             "real mode, models_demo/ for demo mode)")
     parser.add_argument("--csv", default=str(config.DEFAULT_REAL_CSV),
                         help="real CSV to import (real mode)")
     parser.add_argument("--seed", type=int, default=42,
@@ -401,8 +404,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    db_path = Path(args.db)
-    models_dir = Path(args.models_dir)
+    # Synthetic runs get their own scratch database and models directory, so a
+    # demo can never write synthetic plants into the real database or churn
+    # the committed models/ artefacts.
+    demo = args.mode == "demo"
+    db_path = Path(args.db) if args.db else (
+        config.DEMO_DB_PATH if demo else config.DEFAULT_DB_PATH)
+    models_dir = Path(args.models_dir) if args.models_dir else (
+        config.DEMO_MODELS_DIR if demo else config.MODELS_DIR)
 
     if args.mode == "demo":
         if args.retrain:

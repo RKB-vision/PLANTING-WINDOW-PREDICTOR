@@ -141,6 +141,12 @@ python demo_workflow.py
 python model_train.py --mode demo --retrain
 ```
 
+Demo mode writes to its **own scratch locations** - `plant_readiness_demo.db`
+and `models_demo/`, both git-ignored - so a synthetic run can never put
+simulated plants into the real database or churn the committed `models/`
+artefacts. Real mode uses `plant_readiness.db` and `models/`. Pass `--db` /
+`--models-dir` to override either.
+
 ### Mode B - real data (Super Orange CSV)
 
 ```bash
@@ -236,6 +242,23 @@ successful-cohort reference baseline under `models/reference/`. It is
 **idempotent** and never invents data: re-running imports nothing new and
 regenerates the same medians. Camera plants are never part of the seed - they
 are always registered explicitly (see *Camera refresh*).
+
+### Removing synthetic test data
+
+Experiments belong in a scratch database (the demo tools use one automatically).
+If synthetic rows do reach a database, they can be removed without touching a
+single real record - synthetic data is always tagged `data_source='synthetic'`:
+
+```bash
+python -m plantreadiness.purge            # dry run: show what would be deleted
+python -m plantreadiness.purge --yes      # delete the synthetic rows
+```
+
+It removes synthetic plants, observations, readiness events, feedback,
+predictions and assessments, and **never** deletes `data_source='real'` rows:
+real history is append-only (see `AGENTS.md`). If an experiment would create
+*real* records, point it at a separate `--db` rather than deleting history
+afterwards.
 
 ## Web app (Next.js + Flask API)
 
