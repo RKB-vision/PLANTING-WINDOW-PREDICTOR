@@ -889,6 +889,9 @@ export default function FeedbackPage() {
               onChange={e => setUploadSpecies(e.target.value)}
               placeholder={selectedSpecies || 'e.g. Sunflower (SuperOrange)'}
             />
+            <p className="muted small" style={{ marginTop: 6 }}>
+              Required. Defaults to the selected species above if left blank.
+            </p>
           </div>
           <div className="field">
             <label className="label" htmlFor="upload-file">CSV file</label>

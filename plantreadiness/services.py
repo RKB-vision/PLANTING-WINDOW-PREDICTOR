@@ -1164,6 +1164,10 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
     report is a preview. Real imports mark every row ``data_source='real'``
     and skip duplicates rather than overwriting history.
     """
+    species = (species or "").strip()
+    if not species:
+        raise ValidationError("species is required.")
+
     plants = repo.list_plants(species=species, data_source="real")
     existing_refs = {p.get("external_ref") for p in plants
                      if p.get("external_ref")}
@@ -1173,6 +1177,7 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
 
     report = {
         "dry_run": dry_run,
+        "species": species,
         "rows_read": preview["rows_total"],
         "plants_new": len(preview["plants_new"]),
         "plants_existing": len(existing_refs),

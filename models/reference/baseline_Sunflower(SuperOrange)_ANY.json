@@ -4,7 +4,7 @@
   "variety": null,
   "data_source": "real",
   "source_label": "Sunflower (SuperOrange) successful cohort",
-  "generated_at": "2026-10-17T01:38:39.410820+00:00",
+  "generated_at": "2026-10-17T04:55:13.357072+00:00",
   "n_plants": 10,
   "n_points": 250,
   "n_plants_contributing_to_medians": 10,
@@ -570,7 +570,7 @@
   ],
   "per_plant": [
     {
-      "plant_id": 78,
+      "plant_id": 1,
       "external_ref": "1",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -578,11 +578,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 79,
+      "plant_id": 2,
       "external_ref": "2",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -590,11 +590,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 80,
+      "plant_id": 3,
       "external_ref": "3",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -602,11 +602,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 81,
+      "plant_id": 4,
       "external_ref": "4",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -614,11 +614,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 82,
+      "plant_id": 5,
       "external_ref": "5",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -626,11 +626,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 83,
+      "plant_id": 6,
       "external_ref": "6",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -638,11 +638,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 84,
+      "plant_id": 7,
       "external_ref": "7",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -650,11 +650,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 85,
+      "plant_id": 8,
       "external_ref": "8",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -662,11 +662,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 86,
+      "plant_id": 9,
       "external_ref": "9",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -674,11 +674,11 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
     {
-      "plant_id": 87,
+      "plant_id": 10,
       "external_ref": "10",
       "n_observations": 25,
       "first_date": "2026-09-02",
@@ -686,7 +686,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
-      "n_growth_rates_derived": 24,
+      "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     }
   ],

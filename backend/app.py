@@ -368,10 +368,11 @@ def import_dataset():
             date_started=date_started, dry_run=False)
         if report.get('issues'):
             return jsonify(report), 400
+        resolved_species = report.get('species') or species
         # Auto-build the reference baseline so predictions work from day 1.
         try:
             baseline = svc.build_reference_baseline(
-                repo, species, models_dir=MODELS_DIR, variety=variety)
+                repo, resolved_species, models_dir=MODELS_DIR, variety=variety)
             report['baseline'] = baseline
         except Exception as exc:  # baseline build is best-effort; import succeeded
             report['baseline_error'] = str(exc)
