@@ -42,7 +42,8 @@ feedback loop.
 | `docs/REPORT.md` | Limitations report: what is demonstrated only with synthetic data. |
 
 The ESP32-CAM / Cloudinary / OpenCV measurement pipeline
-(`plant_measurement.py` -> `plant_daily_measurements.csv`) is extended with a
+(`plant_measurement.py` -> `data/generated/plant_daily_measurements.csv`) is
+extended with a
 bounded, fail-open **camera refresh** (`plantreadiness/camera_refresh.py`) that
 the backend runs before a species prediction. It stays single-pass and
 append-only, and never invents growth.
@@ -54,7 +55,7 @@ first. The backend does this automatically **before a species prediction** with
 a single-pass, fail-open refresh (`plantreadiness/camera_refresh.py`):
 
 ```text
-ESP32-CAM -> Cloudinary -> OpenCV measure -> plant_daily_measurements.csv -> DB
+ESP32-CAM -> Cloudinary -> OpenCV measure -> data/generated/plant_daily_measurements.csv -> DB
 ```
 
 It is a no-op until configured. Register each camera plant first (explicit
@@ -152,7 +153,7 @@ artefacts. Real mode uses `plant_readiness.db` and `models/`. Pass `--db` /
 ```bash
 # imports the CSV, runs quality checks + growth analysis,
 # then honestly reports that no readiness model can be trained yet
-python model_train.py --mode real --csv super_orange_growth_data.csv
+python model_train.py --mode real --csv data/super_orange_growth_data.csv
 ```
 
 ### 14-day feedback workflow
@@ -237,11 +238,30 @@ python -m plantreadiness.seed --json     # machine-readable report
 ```
 
 The seed creates the schema, imports the historical cohort
-(`super_orange_growth_data.csv`, tagged `cohort='reference'`), and rebuilds the
+(`data/super_orange_growth_data.csv`, tagged `cohort='reference'`), and rebuilds the
 successful-cohort reference baseline under `models/reference/`. It is
 **idempotent** and never invents data: re-running imports nothing new and
 regenerates the same medians. Camera plants are never part of the seed - they
 are always registered explicitly (see *Camera refresh*).
+
+### Resetting the database
+
+The seed is *additive*: it never removes data created afterwards (camera
+plants, manual experiments, test fixtures). To wipe the runtime database and
+rebuild it **purely from the committed CSV**, use `./reset`:
+
+```bash
+./reset                      # back up the old DB, then rebuild from the CSV
+./reset --rebuild-baseline   # also force-rebuild the reference baseline
+./reset --no-backup          # skip the safety backup
+./reset --camera             # also clear untracked camera artefacts
+```
+
+It writes a timestamped copy of the previous database
+(`plant_readiness.db.bak-<timestamp>`, git-ignored) before deleting anything, and
+**refuses to run if the CSV is missing** so a wipe can never destroy data that
+cannot be rebuilt. Missing values stay missing and no readiness events are
+invented. Restart the API/UI (`./run.sh`) afterwards so it reopens the database.
 
 ### Removing synthetic test data
 

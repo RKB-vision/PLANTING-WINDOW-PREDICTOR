@@ -137,7 +137,10 @@ BASE_DIR = Path(__file__).resolve().parent
 CAPTURED_IMAGE = BASE_DIR / "plant_captured.jpg"
 RESULT_IMAGE = BASE_DIR / "plant_result.jpg"
 
-CSV_FILE = BASE_DIR / "plant_daily_measurements.csv"
+# Generated run output lives under data/generated/ (git-ignored) so it never
+# clutters the repo root. The writer creates the directory on demand.
+GENERATED_DIR = BASE_DIR / "data" / "generated"
+CSV_FILE = GENERATED_DIR / "plant_daily_measurements.csv"
 
 PROCESSED_IDS_FILE = BASE_DIR / "processed_cloudinary_ids.txt"
 

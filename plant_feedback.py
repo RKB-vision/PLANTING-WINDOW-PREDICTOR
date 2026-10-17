@@ -495,8 +495,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("import-camera", parents=[common],
                        help="import daily measurements from ESP32-CAM/OpenCV CSV")
-    p.add_argument("--csv", default="plant_daily_measurements.csv",
-                   help="path to camera CSV (default: plant_daily_measurements.csv)")
+    p.add_argument("--csv", default=str(config.CAMERA_CSV_PATH),
+                   help="path to camera CSV "
+                        "(default: data/generated/plant_daily_measurements.csv)")
     p.add_argument("--species", default="Super Orange",
                    help="default species if plant must be registered (default: Super Orange)")
     p.add_argument("--variety", help="default variety if plant must be registered")

@@ -10,7 +10,7 @@ from plantreadiness import model as mdl
 from plantreadiness import synthetic
 
 ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = ROOT / "super_orange_growth_data.csv"
+CSV_PATH = ROOT / "data" / "super_orange_growth_data.csv"
 
 
 def _synthetic_frame(n_plants=12, seed=0):

@@ -56,11 +56,12 @@ ESP32-CAM → Cloudinary (cloud images)
 | `plantreadiness/` | Domain + data layer (config, repository, services, reference, imports) |
 | `backend/app.py` | Flask API endpoints |
 | `nextjs/` | Next.js frontend |
-| `vision/` or `plant_measurement.py` | ESP32-CAM → Cloudinary → OpenCV measurement pipeline |
+| `plant_measurement.py` | ESP32-CAM → Cloudinary → OpenCV measurement pipeline |
 | `prediction.py` | Prediction / model-selection entry point |
 | `plant_feedback.py` | CLI for observations, feedback, camera import |
-| `super_orange_growth_data.csv` | Historical successful-plant reference cohort |
-| `docs/ARCHITECTURE.md` | Canonical architecture (read first) |
+| `data/` | Committed inputs (`super_orange_growth_data.csv` = historical successful-plant reference cohort) |
+| `data/generated/` | Generated pipeline output (git-ignored, e.g. `plant_daily_measurements.csv`) |
+| `docs/` | `ARCHITECTURE.md` (canonical, read first), `DEPLOYMENT.md`, `REPORT.md`, `plan.md`, `audit/` |
 | `models/` | Trained models + reference baseline |
 
 ## Conventions

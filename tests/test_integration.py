@@ -13,7 +13,7 @@ from plantreadiness import db as dbm
 from plantreadiness import model as mdl
 
 ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = ROOT / "super_orange_growth_data.csv"
+CSV_PATH = ROOT / "data" / "super_orange_growth_data.csv"
 
 
 class TestRealWorkflow(unittest.TestCase):

@@ -7,7 +7,7 @@ database** (`plant_readiness.db`). There is no cloud database dependency.
 
 | Layer | Technology | Notes |
 |---|---|---|
-| Measurement pipeline | Python + OpenCV | ESP32-CAM images from Cloudinary -> `plant_daily_measurements.csv` |
+| Measurement pipeline | Python + OpenCV | ESP32-CAM images from Cloudinary -> `data/generated/plant_daily_measurements.csv` |
 | Domain / data layer | `plantreadiness/` | Repository (`SQLiteRepository`) + services |
 | API | Flask (`backend/app.py`) | Port `8000` |
 | Front-end | Next.js (`nextjs/`) | Port `3000`, proxies to the Flask API |

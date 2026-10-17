@@ -20,7 +20,10 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DEFAULT_DB_PATH = BASE_DIR / "plant_readiness.db"
 MODELS_DIR = BASE_DIR / "models"
 REFERENCE_DIR = MODELS_DIR / "reference"
-DEFAULT_REAL_CSV = BASE_DIR / "super_orange_growth_data.csv"
+# Committed input data lives under data/ so the repo root stays clean.
+DATA_DIR = BASE_DIR / "data"
+GENERATED_DIR = DATA_DIR / "generated"
+DEFAULT_REAL_CSV = DATA_DIR / "super_orange_growth_data.csv"
 
 # Synthetic demonstration runs must never write into the real database or the
 # committed models/ directory, so they get their own scratch locations.
@@ -31,7 +34,8 @@ DEMO_MODELS_DIR = BASE_DIR / "models_demo"
 # Camera / cloud (ESP32-CAM -> Cloudinary -> OpenCV) refresh
 # --------------------------------------------------------------------------- #
 # Where the vision pipeline appends daily measurements that the refresh imports.
-CAMERA_CSV_PATH = BASE_DIR / "plant_daily_measurements.csv"
+# Generated runtime output: kept out of the repo root and git-ignored.
+CAMERA_CSV_PATH = GENERATED_DIR / "plant_daily_measurements.csv"
 
 # --------------------------------------------------------------------------- #
 # Reference-rod calibration (the ONE authoritative value)

@@ -1,7 +1,7 @@
 """Import daily measurements produced by the ESP32-CAM / OpenCV pipeline.
 
 The hardware pipeline (plant_measurement.py) records daily summaries to
-plant_daily_measurements.csv with the following schema:
+data/generated/plant_daily_measurements.csv with the following schema:
 
     day,plant_id,captures_used,average_height_cm,average_width_cm,
     average_visible_leaves,average_cm_per_pixel,average_confidence,

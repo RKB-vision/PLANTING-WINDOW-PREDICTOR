@@ -10,7 +10,7 @@ The ESP32-CAM / Cloudinary / OpenCV measurement pipeline
 
 ## 1. What the real data can and cannot support
 
-The real dataset (`super_orange_growth_data_with_growth_rate.csv`)
+The real dataset (`data/super_orange_growth_data_with_growth_rate.csv`)
 contains **250 observations of 10 Super Orange plants** over 25 days
 (2083-05-02..2083-05-26), columns `Date, Age_days, Plant_ID, Height_cm,
 Growth_rate_cm_per_day`.

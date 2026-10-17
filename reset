@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# Reset the local runtime database back to the committed CSV reference cohort.
+#
+#   ./reset                      back up the old DB, then rebuild from the CSV
+#   ./reset --no-backup          skip the safety backup
+#   ./reset --rebuild-baseline   force-rebuild the reference baseline too
+#   ./reset --camera             also clear untracked camera artefacts
+#
+# See plantreadiness/reset.py for the details.
+set -euo pipefail
+
+# Always operate from the repository root, regardless of where it is called.
+cd "$(dirname "$0")"
+export PYTHONPATH="$(pwd)"
+
+# Prefer the project virtual-env interpreter when it exists.
+if [ -x ".venv/bin/python" ]; then
+  PYTHON=".venv/bin/python"
+else
+  PYTHON="python3"
+fi
+
+exec "$PYTHON" -m plantreadiness.reset "$@"

@@ -14,7 +14,7 @@ from plantreadiness import db as dbm
 from plantreadiness import seed
 
 ROOT = Path(__file__).resolve().parent.parent
-CSV_PATH = ROOT / "super_orange_growth_data.csv"
+CSV_PATH = ROOT / "data" / "super_orange_growth_data.csv"
 
 
 class TestSeed(unittest.TestCase):

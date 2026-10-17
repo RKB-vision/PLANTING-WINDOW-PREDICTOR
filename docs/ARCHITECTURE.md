@@ -30,13 +30,13 @@ backend, a Next.js frontend, and a database/repository layer.
 - `plant_measurement.py` processes captured plant images using OpenCV.
 - It extracts supported measurements, including plant height and stem width,
   using image segmentation and calibration.
-- Measurements are written to `plant_daily_measurements.csv` or another
+- Measurements are written to `data/generated/plant_daily_measurements.csv` or another
   configured measurement output.
 - Cloudinary is used in the camera-image workflow where configured.
 
 ### Historical data
 
-- `super_orange_growth_data.csv` contains historical growth-monitoring records
+- `data/super_orange_growth_data.csv` contains historical growth-monitoring records
   for 10 Super Orange plants.
 - Its columns are `Date`, `Age`, `Plant_ID`, and `Height_cm`.
 - The records describe plants that subsequently grew successfully and were

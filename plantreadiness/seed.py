@@ -9,7 +9,7 @@ this once to rebuild the shared state from the committed sources:
 The seed is idempotent and honest - it never invents data:
 
 1. creates the schema (``plantreadiness.db.init_db``) and imports the committed
-   historical cohort (``super_orange_growth_data.csv``) with
+   historical cohort (``data/super_orange_growth_data.csv``) with
    ``data_source='real'`` and ``cohort='reference'``;
 2. ensures the successful-cohort reference baseline exists under
    ``models/reference/`` - it is committed, so it is reused as-is unless it is
