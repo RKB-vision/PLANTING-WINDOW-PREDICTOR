@@ -1086,6 +1086,12 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
     height_col = _col("Height_cm")
     age_col = _col("Age_days", "Age")
     growth_col = _col("Growth_rate_cm_per_day")
+    # Optional width / true-leaf columns (camera or hand-measured). Absence is OK.
+    width_col = _col("stem_width_cm", "average_width_cm", "width_cm",
+                     "median_width_cm", "Width_cm")
+    leaves_col = _col("visible_true_leaf_count", "average_visible_leaves",
+                      "true_leaves", "leaves", "median_visible_leaves",
+                      "True_leaves")
 
     missing = []
     if date_col is None:
@@ -1114,21 +1120,33 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
                     continue
             raise
 
+    def _to_int_age(text):
+        text = (text or "").strip().lower()
+        if not text:
+            return None
+        for suffix in (" days", " day", "days", "day"):
+            if text.endswith(suffix):
+                text = text[: -len(suffix)].strip()
+                break
+        if text.endswith("d"):
+            text = text[:-1].strip()
+        return int(float(text)) if text else None
+
     rows: list[dict] = []
     issues: list[dict] = []
     for line_no, raw in enumerate(reader, start=2):
         row = {str(k).strip(): (v.strip() if isinstance(v, str) else v)
                for k, v in raw.items()}
+        # Skip completely blank lines (common trailing newline) silently.
+        if all((v is None or str(v).strip() == "") for v in row.values()):
+            continue
         ref = (row.get(plant_col) or "").strip()
         if not ref:
             issues.append({"line": line_no, "problem": "missing Plant_ID"})
             continue
         try:
             obs_date = _parse_date_val(row.get(date_col))
-        except ValidationError as exc:
-            issues.append({"line": line_no, "problem": str(exc)})
-            continue
-        except ValueError as exc:
+        except (ValidationError, ValueError) as exc:
             issues.append({"line": line_no, "problem": str(exc)})
             continue
         try:
@@ -1148,27 +1166,30 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
                            "problem": "Height_cm must be >= 0"})
             continue
         try:
-            age_txt = (row.get(age_col) or "").strip()
-            if age_txt:
-                txt = age_txt.lower()
-                for suffix in (" days", " day", "days", "day"):
-                    if txt.endswith(suffix):
-                        txt = txt[: -len(suffix)].strip()
-                        break
-                if txt.endswith("d"):
-                    txt = txt[:-1].strip()
-                age = int(float(txt)) if txt else None
-            else:
-                age = None
+            age = _to_int_age(row.get(age_col))
             growth_txt = (row.get(growth_col) or "").strip() if growth_col else ""
             growth = float(growth_txt) if growth_txt else None
+            width_txt = (row.get(width_col) or "").strip() if width_col else ""
+            width = float(width_txt) if width_txt else None
+            leaves_txt = (row.get(leaves_col) or "").strip() if leaves_col else ""
+            leaves = int(float(leaves_txt)) if leaves_txt else None
         except (TypeError, ValueError) as exc:
             issues.append({"line": line_no,
                            "problem": f"bad numeric value: {exc}"})
             continue
+        if width is not None and width < 0:
+            issues.append({"line": line_no,
+                           "problem": "stem width must be >= 0"})
+            continue
+        if leaves is not None and leaves < 0:
+            issues.append({"line": line_no,
+                           "problem": "true leaf count must be >= 0"})
+            continue
         rows.append({"line": line_no, "plant_ref": ref,
                      "date": obs_date.isoformat(), "age_days": age,
-                     "height_cm": height, "growth_rate_cm_per_day": growth})
+                     "height_cm": height, "growth_rate_cm_per_day": growth,
+                     "stem_width_cm": width,
+                     "visible_true_leaf_count": leaves})
     return fieldnames, rows, issues
 
 
@@ -1267,6 +1288,8 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
                 plant_id=pid, observation_date=row["date"],
                 age_days=row["age_days"], height_cm=row["height_cm"],
                 growth_rate_cm_per_day=row["growth_rate_cm_per_day"],
+                stem_width_cm=row.get("stem_width_cm"),
+                visible_true_leaf_count=row.get("visible_true_leaf_count"),
                 data_source="real",
                 calibration_source=config.CALIBRATION_SOURCE_CSV)
             report["observations_inserted"] += 1
