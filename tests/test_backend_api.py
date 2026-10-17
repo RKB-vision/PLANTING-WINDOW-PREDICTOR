@@ -32,10 +32,12 @@ class BackendApiBase(unittest.TestCase):
                 external_ref=str(i))
             self.repo.add_observation(plant_id=pid,
                                       observation_date="2083-05-02",
-                                      age_days=7, height_cm=0.5)
+                                      age_days=7, height_cm=0.5,
+                                      calibration_source="csv_import_no_calibration")
             self.repo.add_observation(plant_id=pid,
                                       observation_date="2083-05-10",
-                                      age_days=15, height_cm=2.0)
+                                      age_days=15, height_cm=2.0,
+                                      calibration_source="csv_import_no_calibration")
         self.plant_id = self.repo.list_plants(
             species="Super Orange")[0]["plant_id"]
 

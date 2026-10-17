@@ -66,7 +66,7 @@ then put the variables in a `.env` at the project root (copy `.env.example` to
 |---|---|
 | `CLOUDINARY_API_KEY` / `CLOUDINARY_API_SECRET` | Server-side Cloudinary admin credentials (never on the ESP32). |
 | `CAMERA_SOURCES` | `Prefix=external_ref` pairs, e.g. `Plant01_=Plant-01`. |
-| `CAMERA_ROD_LENGTH_CM` | Reference-rod length for pixel->cm calibration (default `30`). |
+| `CAMERA_ROD_LENGTH_CM` | Reference-rod length (cm) for pixel->cm calibration. **Measure it**; the configured value stays UNVERIFIED until `python -m plantreadiness.verify_calibration` records it. Default `30` is only a documented fallback, not an assumed-correct value. |
 | `CAMERA_REFRESH_ENABLED` | Optional override; otherwise enabled when credentials + sources exist. |
 | `CAMERA_MIN_REFRESH_INTERVAL_SECONDS` | Throttle between automatic refreshes (default `60`). |
 

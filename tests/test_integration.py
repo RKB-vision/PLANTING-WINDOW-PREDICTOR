@@ -79,7 +79,7 @@ class TestRealWorkflow(unittest.TestCase):
         csv_import.import_csv(dbm.init_db(self.db), CSV_PATH)
         # train a genuine (tiny) synthetic model under the same models dir
         rows = [
-            {"plant_id": i, "species": "Super Orange", "variety": "Early",
+            {"plant_id": i, "species": "Sunflower (SuperOrange)", "variety": "Early",
              "age_days": age, "height_cm": 0.3 + 0.25 * age,
              "growth_rate_cm_per_day": 0.25, "stem_width_cm": None,
              "visible_true_leaf_count": None,
@@ -89,7 +89,7 @@ class TestRealWorkflow(unittest.TestCase):
         ]
         df = mdl.build_training_frame(rows)
         artifact = mdl.train_countdown_model(df, data_source="synthetic",
-                                             species="Super Orange",
+                                             species="Sunflower (SuperOrange)",
                                              variety="Early",
                                              source_label="test")
         mdl.save_artifact(artifact, self.models)
@@ -121,7 +121,7 @@ class TestRealWorkflow(unittest.TestCase):
         conn = dbm.init_db(self.db)
         try:
             class A:
-                species = "Super Orange"
+                species = "Sunflower (SuperOrange)"
                 variety = None
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):

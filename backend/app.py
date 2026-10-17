@@ -6,6 +6,7 @@ import sys
 sys.path.append(str(Path(__file__).resolve().parents[1]))  # repository root
 
 from plantreadiness import db as dbm
+from plantreadiness import calibration as calib_mod
 from plantreadiness.repository import SQLiteRepository
 from plantreadiness import services as svc
 from plantreadiness.db import (DuplicateRecordError, NotFoundError,
@@ -153,12 +154,27 @@ def species_catalog():
             item['readiness_event_counts'] = dbm.readiness_event_counts(
                 conn, species, None, data_source='real')
 
-        # Only species with real observations can produce a prediction from a
-        # cloud cohort; newest data first so the useful default is selected.
-        catalog = [
-            item for item in catalog
-            if item.get('latest_observation_date')
-        ]
+        # Configured species (e.g. Marigold (Apsara Yellow)) may have no
+        # observations yet - they still appear in the dropdown so the user can
+        # select them and see "insufficient evidence" rather than being hidden.
+        # No placeholder plant is created; the entry simply has zero counts.
+        from plantreadiness import config as _cfg
+        present = {item.get('species') for item in catalog}
+        for species in getattr(_cfg, 'CONFIGURED_SPECIES', ()):
+            if species in present:
+                continue
+            catalog.append({
+                'species': species,
+                'variety': '',
+                'plant_count': 0,
+                'observation_count': 0,
+                'latest_observation_date': None,
+                'varieties': [],
+                'available_dates': [],
+                'readiness_event_counts': dbm.readiness_event_counts(
+                    conn, species, None, data_source='real'),
+            })
+
         catalog.sort(
             key=lambda item: (
                 item.get('latest_observation_date') or '',
@@ -257,6 +273,31 @@ def reference_baseline():
                     'hint': 'Request /api/reference?build=1 to build one.',
                 }), 404
         return jsonify(baseline)
+    except Exception as e:
+        return _error_response(e)
+    finally:
+        conn.close()
+
+
+@app.route('/api/calibration', methods=['GET'])
+def calibration_status():
+    """Report the current rod-length verification state and the quarantine."""
+    conn = dbm.connect(DB_PATH)
+    try:
+        repo = SQLiteRepository(conn)
+        from plantreadiness import config as _cfg
+        state = repo.current_calibration_setting()
+        desc = calib_mod.describe(state, _cfg.CAMERA_ROD_LENGTH_CM)
+        # quarantine summary over stored observations
+        rows = [dict(r) for r in conn.execute(
+            "SELECT calibration_source, rod_length_cm, calibration_verified "
+            "FROM observations")]
+        summary = calib_mod.summarise_groups(rows)
+        return jsonify({
+            "calibration": desc,
+            "observations_by_calibration_group": summary,
+            "history": repo.calibration_settings_history(limit=10),
+        })
     except Exception as e:
         return _error_response(e)
     finally:

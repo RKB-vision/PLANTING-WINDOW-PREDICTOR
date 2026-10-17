@@ -77,6 +77,14 @@ CREATE TABLE IF NOT EXISTS observations (
     visible_true_leaf_count INTEGER
                                        CHECK (visible_true_leaf_count IS NULL
                                               OR visible_true_leaf_count >= 0),
+    -- Calibration provenance: which rod length produced this height and
+    -- whether it was verified at the time. NULL means "not known" - historical
+    -- rows added before these columns are revised to 'unknown', never guessed.
+    rod_length_cm        REAL    CHECK (rod_length_cm IS NULL
+                                        OR rod_length_cm > 0),
+    calibration_source   TEXT,
+    calibration_verified INTEGER CHECK (calibration_verified IS NULL
+                                        OR calibration_verified IN (0, 1)),
     data_source          TEXT    NOT NULL CHECK (data_source IN ('real', 'synthetic')),
     recorded_at          TEXT    NOT NULL DEFAULT (datetime('now')),
     -- duplicate protection: one observation per plant per date
@@ -189,8 +197,89 @@ CREATE TABLE IF NOT EXISTS readiness_assessments (
     created_at              TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
+-- One row per ESP32-CAM image. ``observations`` holds one *daily summary* per
+-- plant/date; this table holds the individual captures behind it, so a daily
+-- result can always be audited and recomputed. A capture is identified by its
+-- Cloudinary public id, so processing the same image twice counts once.
+CREATE TABLE IF NOT EXISTS camera_captures (
+    capture_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    plant_id          INTEGER NOT NULL REFERENCES plants(plant_id)
+                                       ON DELETE CASCADE,
+    observation_date  TEXT    NOT NULL,          -- capture_date (YYYY-MM-DD)
+    public_id         TEXT    NOT NULL,          -- Plant01_20261016_095000
+    capture_timestamp TEXT,                      -- from the name; created_at fallback
+    height_cm         REAL    CHECK (height_cm IS NULL OR height_cm >= 0),
+    stem_width_cm     REAL    CHECK (stem_width_cm IS NULL
+                                     OR stem_width_cm >= 0),
+    visible_true_leaf_count INTEGER
+                              CHECK (visible_true_leaf_count IS NULL
+                                     OR visible_true_leaf_count >= 0),
+    cm_per_pixel      REAL    CHECK (cm_per_pixel IS NULL OR cm_per_pixel > 0),
+    confidence        REAL,
+    validity          TEXT    NOT NULL
+                              CHECK (validity IN ('valid', 'failed', 'pending')),
+    problem           TEXT,                      -- NULL when valid
+    -- Effective calibration for this image. The rod length is recorded per
+    -- capture so historical measurements stay traceable to a calibration, and
+    -- the verification state is snapshotted because it can change later.
+    rod_length_cm     REAL    NOT NULL CHECK (rod_length_cm > 0),
+    calibration_source TEXT   NOT NULL,
+    calibration_verified INTEGER NOT NULL
+                              CHECK (calibration_verified IN (0, 1)),
+    data_source       TEXT    NOT NULL
+                              CHECK (data_source IN ('real', 'synthetic')),
+    recorded_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- capture identity is the public id, NOT (plant, date)
+    UNIQUE (public_id)
+);
+
+-- Audit trail for measurement edits (the editable reference sheet) and for
+-- daily sums recomputed from extra captures. Measurements may be revised;
+-- predictions and feedback stay append-only.
+CREATE TABLE IF NOT EXISTS observation_revisions (
+    revision_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    observation_id   INTEGER NOT NULL,
+    plant_id         INTEGER,
+    observation_date TEXT,
+    action           TEXT    NOT NULL,   -- create / update / delete / recompute
+    before_json      TEXT,
+    after_json       TEXT,
+    reason           TEXT,
+    data_source      TEXT,
+    recorded_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Audit trail for a capture whose measurement changed, e.g. after an explicit
+-- reprocess under a verified calibration. The capture row is revised in place
+-- (never duplicated); its history lives here.
+CREATE TABLE IF NOT EXISTS capture_revisions (
+    revision_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    capture_id   INTEGER NOT NULL,
+    public_id    TEXT,
+    action       TEXT    NOT NULL,       -- create / recompute
+    before_json  TEXT,
+    after_json   TEXT,
+    reason       TEXT,
+    recorded_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- Append-only log of rod-length verification events. The *value* comes from
+-- config.CAMERA_ROD_LENGTH_CM; this table records whether (and for which
+-- length) it was actually verified against the physical rod. The newest row
+-- wins, so a config change invalidates an earlier verification.
+CREATE TABLE IF NOT EXISTS calibration_settings (
+    setting_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+    rod_length_cm REAL    NOT NULL CHECK (rod_length_cm > 0),
+    verified      INTEGER NOT NULL CHECK (verified IN (0, 1)),
+    verified_by   TEXT,
+    note          TEXT,
+    recorded_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_observations_plant
     ON observations (plant_id, observation_date);
+CREATE INDEX IF NOT EXISTS idx_camera_captures_plant_date
+    ON camera_captures (plant_id, observation_date);
 CREATE INDEX IF NOT EXISTS idx_feedback_due
     ON feedback_14d (feedback_due_date, feedback_submitted_date);
 CREATE INDEX IF NOT EXISTS idx_plants_species
@@ -272,6 +361,36 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
             "ALTER TABLE observations ADD COLUMN stem_width_cm REAL "
             "CHECK (stem_width_cm IS NULL OR stem_width_cm >= 0)"
         )
+    # Measurement provenance: which calibration produced this height, and
+    # whether that calibration was verified at the time. Existing rows predate
+    # the columns, so they are marked 'unknown' provenance - an honest unknown,
+    # never a guess (their heights are NOT rewritten).
+    if "rod_length_cm" not in obs_cols:
+        conn.execute("ALTER TABLE observations ADD COLUMN rod_length_cm REAL")
+    if "calibration_source" not in obs_cols:
+        conn.execute(
+            "ALTER TABLE observations ADD COLUMN calibration_source TEXT")
+        conn.execute(
+            "UPDATE observations SET calibration_source = ? "
+            "WHERE calibration_source IS NULL",
+            (config.CALIBRATION_SOURCE_UNKNOWN,))
+    if "calibration_verified" not in obs_cols:
+        conn.execute(
+            "ALTER TABLE observations ADD COLUMN calibration_verified INTEGER")
+    # One-time provenance tagging for rows that predate the calibration
+    # columns. A row with no rod length and no recorded source is a
+    # human-recorded dataset row (not a camera capture). Reference-cohort
+    # plants keep their provisional baseline; everything else stays an honest
+    # 'unknown' and is quarantined from the baseline.
+    # Rows with no rod length can never be a camera capture (camera rows
+    # always record the effective rod length), so they are a human-recorded
+    # dataset. Tag them as the CSV/manual source so the provisional baseline
+    # keeps working; camera rows keep their own (verified or unverified) source.
+    conn.execute(
+        "UPDATE observations SET calibration_source = ? "
+        "WHERE calibration_source = 'unknown' "
+        "  AND rod_length_cm IS NULL",
+        (config.CALIBRATION_SOURCE_CSV,))
     # feedback_14d gained transplant-record detail (assessment does not imply
     # a transplant) - add the columns to databases created before them.
     fb_cols = {r["name"] for r in conn.execute("PRAGMA table_info(feedback_14d)")}
@@ -288,6 +407,11 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
         conn.execute(
             "ALTER TABLE feedback_14d ADD COLUMN transplant_notes TEXT"
         )
+    # Created here rather than in SCHEMA_SQL: the column only exists on an
+    # older database after the ALTER TABLE above has run.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_observations_calibration "
+        "ON observations (calibration_source)")
     conn.commit()
     return conn
 
@@ -389,8 +513,16 @@ def add_observation(conn: sqlite3.Connection,
                     canopy_width_cm: Optional[float] = None,
                     stem_width_cm: Optional[float] = None,
                     visible_true_leaf_count: Optional[int] = None,
-                    data_source: Optional[str] = None) -> int:
-    """Append an observation. Duplicate (plant, date) is rejected."""
+                    data_source: Optional[str] = None,
+                    rod_length_cm: Optional[float] = None,
+                    calibration_source: Optional[str] = None,
+                    calibration_verified: Optional[bool] = None) -> int:
+    """Append an observation. Duplicate (plant, date) is rejected.
+
+    ``rod_length_cm`` / ``calibration_source`` / ``calibration_verified`` record
+    the calibration the height came from. They are optional so a caller that
+    genuinely does not know the provenance stores ``NULL`` rather than guessing.
+    """
     plant = get_plant(conn, plant_id)
     obs_date = parse_iso_date(observation_date, "observation_date")
     source = data_source or plant["data_source"]
@@ -426,16 +558,23 @@ def add_observation(conn: sqlite3.Connection,
                 "observation_date is before the plant's date_started."
             )
 
+    if rod_length_cm is not None and float(rod_length_cm) <= 0:
+        raise ValidationError("rod_length_cm must be > 0 when provided.")
+
     try:
         cur = conn.execute(
             """INSERT INTO observations
                (plant_id, observation_date, age_days, height_cm,
                 growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
-                visible_true_leaf_count, data_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                visible_true_leaf_count, data_source, rod_length_cm,
+                calibration_source, calibration_verified)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plant_id, obs_date.isoformat(), age_days, height_cm,
              growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
-             visible_true_leaf_count, source),
+             visible_true_leaf_count, source, rod_length_cm,
+             calibration_source,
+             None if calibration_verified is None
+             else (1 if calibration_verified else 0)),
         )
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -463,6 +602,543 @@ def latest_observation(conn: sqlite3.Connection, plant_id: int) -> Optional[sqli
            ORDER BY observation_date DESC, observation_id DESC LIMIT 1""",
         (plant_id,),
     ).fetchone()
+
+
+# --------------------------------------------------------------------------- #
+# Individual captures (the audit trail behind a daily observation)
+# --------------------------------------------------------------------------- #
+
+
+CAPTURE_VALIDITIES = ("valid", "failed", "pending")
+
+
+def add_capture(conn: sqlite3.Connection, *,
+                plant_id: int,
+                public_id: str,
+                observation_date: str,
+                validity: str,
+                rod_length_cm: float,
+                calibration_source: str = config.CALIBRATION_SOURCE_CAMERA,
+                calibration_verified: bool = False,
+                capture_timestamp: Optional[str] = None,
+                height_cm: Optional[float] = None,
+                stem_width_cm: Optional[float] = None,
+                visible_true_leaf_count: Optional[int] = None,
+                cm_per_pixel: Optional[float] = None,
+                confidence: Optional[float] = None,
+                problem: Optional[str] = None,
+                data_source: str = "real") -> dict:
+    """Record (or revise) one image capture, keyed by ``public_id``.
+
+    Idempotent by design: processing the same image twice never creates a second
+    row and never counts the capture twice. When the stored values differ - the
+    only sanctioned case being an explicit reprocess under a verified
+    calibration - the row is revised in place and the change is written to
+    ``capture_revisions`` so the revision stays traceable.
+
+    Returns ``{"capture_id", "created", "changed", "previous"}``.
+    """
+    plant = get_plant(conn, plant_id)
+    if not public_id or not str(public_id).strip():
+        raise ValidationError("public_id is required for a capture.")
+    public_id = str(public_id).strip()
+    if validity not in CAPTURE_VALIDITIES:
+        raise ValidationError(
+            f"validity must be one of {CAPTURE_VALIDITIES}, got {validity!r}.")
+    if rod_length_cm is None or float(rod_length_cm) <= 0:
+        raise ValidationError("rod_length_cm must be > 0 for a capture.")
+    obs_date = parse_iso_date(observation_date, "observation_date").isoformat()
+    if data_source not in config.VALID_SOURCES:
+        raise ValidationError(f"Invalid data_source '{data_source}'.")
+    if data_source != plant["data_source"]:
+        raise ValidationError(
+            f"Capture data_source '{data_source}' does not match plant "
+            f"data_source '{plant['data_source']}'.")
+
+    values = {
+        "observation_date": obs_date,
+        "capture_timestamp": capture_timestamp,
+        "height_cm": height_cm,
+        "stem_width_cm": stem_width_cm,
+        "visible_true_leaf_count": visible_true_leaf_count,
+        "cm_per_pixel": cm_per_pixel,
+        "confidence": confidence,
+        "validity": validity,
+        "problem": problem,
+        "rod_length_cm": float(rod_length_cm),
+        "calibration_source": calibration_source,
+        "calibration_verified": 1 if calibration_verified else 0,
+    }
+
+    existing = conn.execute(
+        "SELECT * FROM camera_captures WHERE public_id = ?", (public_id,)
+    ).fetchone()
+
+    if existing is None:
+        cur = conn.execute(
+            """INSERT INTO camera_captures
+               (plant_id, observation_date, public_id, capture_timestamp,
+                height_cm, stem_width_cm, visible_true_leaf_count, cm_per_pixel,
+                confidence, validity, problem, rod_length_cm, calibration_source,
+                calibration_verified, data_source)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (plant_id, obs_date, public_id, capture_timestamp, height_cm,
+             stem_width_cm, visible_true_leaf_count, cm_per_pixel, confidence,
+             validity, problem, float(rod_length_cm), calibration_source,
+             values["calibration_verified"], data_source),
+        )
+        capture_id = int(cur.lastrowid)
+        record_capture_revision(
+            conn, capture_id=capture_id, public_id=public_id, action="create",
+            before=None, after=values, reason=None)
+        conn.commit()
+        return {"capture_id": capture_id, "created": True, "changed": True,
+                "previous": None}
+
+    previous = dict(existing)
+    comparable = {k: previous.get(k) for k in values}
+    # Normalise the stored 0/1 back to int for comparison.
+    comparable["calibration_verified"] = int(
+        comparable.get("calibration_verified") or 0)
+    if comparable == values:
+        return {"capture_id": int(existing["capture_id"]), "created": False,
+                "changed": False, "previous": previous}
+
+    conn.execute(
+        """UPDATE camera_captures
+           SET plant_id = ?, observation_date = ?, capture_timestamp = ?,
+               height_cm = ?, stem_width_cm = ?, visible_true_leaf_count = ?,
+               cm_per_pixel = ?, confidence = ?, validity = ?, problem = ?,
+               rod_length_cm = ?, calibration_source = ?, calibration_verified = ?,
+               data_source = ?
+           WHERE public_id = ?""",
+        (plant_id, obs_date, capture_timestamp, height_cm, stem_width_cm,
+         visible_true_leaf_count, cm_per_pixel, confidence, validity, problem,
+         float(rod_length_cm), calibration_source, values["calibration_verified"],
+         data_source, public_id),
+    )
+    record_capture_revision(
+        conn, capture_id=int(existing["capture_id"]), public_id=public_id,
+        action="recompute", before=previous, after=values, reason=None)
+    conn.commit()
+    return {"capture_id": int(existing["capture_id"]), "created": False,
+            "changed": True, "previous": previous}
+
+
+def list_captures(conn: sqlite3.Connection,
+                  plant_id: int,
+                  observation_date: Optional[str] = None,
+                  data_source: Optional[str] = None) -> list[dict]:
+    """Captures for a plant, optionally restricted to one observation date."""
+    sql = "SELECT * FROM camera_captures WHERE plant_id = ?"
+    args: list = [plant_id]
+    if observation_date:
+        sql += " AND observation_date = ?"
+        args.append(parse_iso_date(observation_date,
+                                   "observation_date").isoformat())
+    if data_source:
+        sql += " AND data_source = ?"
+        args.append(data_source)
+    sql += " ORDER BY capture_timestamp, public_id, capture_id"
+    return [dict(r) for r in conn.execute(sql, args)]
+
+
+def captures_on_date(conn: sqlite3.Connection,
+                     plant_id: int,
+                     observation_date: str) -> list[dict]:
+    """Valid captures recorded for one plant on one calendar date."""
+    return list_captures(conn, plant_id, observation_date)
+
+
+def count_captures(conn: sqlite3.Connection,
+                   data_source: Optional[str] = None) -> int:
+    if data_source:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM camera_captures WHERE data_source = ?",
+            (data_source,)).fetchone()[0])
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM camera_captures").fetchone()[0])
+
+
+# --------------------------------------------------------------------------- #
+# Revision logs (measurements may be revised; predictions never are)
+# --------------------------------------------------------------------------- #
+
+
+def record_observation_revision(conn: sqlite3.Connection, *,
+                                observation_id: int,
+                                action: str,
+                                before: Optional[dict] = None,
+                                after: Optional[dict] = None,
+                                reason: Optional[str] = None,
+                                plant_id: Optional[int] = None,
+                                observation_date: Optional[str] = None,
+                                data_source: Optional[str] = None) -> int:
+    cur = conn.execute(
+        """INSERT INTO observation_revisions
+           (observation_id, plant_id, observation_date, action, before_json,
+            after_json, reason, data_source)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (observation_id, plant_id, observation_date, action,
+         _json_dump(before), _json_dump(after), reason, data_source),
+    )
+    return int(cur.lastrowid)
+
+
+def observation_revisions(conn: sqlite3.Connection,
+                          observation_id: Optional[int] = None,
+                          limit: Optional[int] = None) -> list[dict]:
+    sql = "SELECT * FROM observation_revisions WHERE 1=1"
+    args: list = []
+    if observation_id is not None:
+        sql += " AND observation_id = ?"
+        args.append(observation_id)
+    sql += " ORDER BY revision_id"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    out = []
+    for row in conn.execute(sql, args):
+        item = dict(row)
+        item["before"] = _json_load(item.pop("before_json", None))
+        item["after"] = _json_load(item.pop("after_json", None))
+        out.append(item)
+    return out
+
+
+def record_capture_revision(conn: sqlite3.Connection, *,
+                            capture_id: int,
+                            action: str,
+                            public_id: Optional[str] = None,
+                            before: Optional[dict] = None,
+                            after: Optional[dict] = None,
+                            reason: Optional[str] = None) -> int:
+    cur = conn.execute(
+        """INSERT INTO capture_revisions
+           (capture_id, public_id, action, before_json, after_json, reason)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (capture_id, public_id, action, _json_dump(before), _json_dump(after),
+         reason),
+    )
+    return int(cur.lastrowid)
+
+
+def capture_revisions(conn: sqlite3.Connection,
+                      capture_id: Optional[int] = None,
+                      limit: Optional[int] = None) -> list[dict]:
+    sql = "SELECT * FROM capture_revisions WHERE 1=1"
+    args: list = []
+    if capture_id is not None:
+        sql += " AND capture_id = ?"
+        args.append(capture_id)
+    sql += " ORDER BY revision_id"
+    if limit:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    out = []
+    for row in conn.execute(sql, args):
+        item = dict(row)
+        item["before"] = _json_load(item.pop("before_json", None))
+        item["after"] = _json_load(item.pop("after_json", None))
+        out.append(item)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Rod-length verification settings
+# --------------------------------------------------------------------------- #
+
+
+def record_calibration_setting(conn: sqlite3.Connection, *,
+                               rod_length_cm: float,
+                               verified: bool,
+                               verified_by: Optional[str] = None,
+                               note: Optional[str] = None) -> dict:
+    """Append a rod-length verification event (the newest row wins)."""
+    if rod_length_cm is None or float(rod_length_cm) <= 0:
+        raise ValidationError("rod_length_cm must be > 0.")
+    cur = conn.execute(
+        """INSERT INTO calibration_settings
+           (rod_length_cm, verified, verified_by, note)
+           VALUES (?, ?, ?, ?)""",
+        (float(rod_length_cm), 1 if verified else 0, verified_by, note),
+    )
+    conn.commit()
+    setting_id = int(cur.lastrowid)
+    return dict(conn.execute(
+        "SELECT * FROM calibration_settings WHERE setting_id = ?",
+        (setting_id,)).fetchone())
+
+
+def current_calibration_setting(conn: sqlite3.Connection) -> Optional[dict]:
+    """The newest recorded verification event, or ``None`` if never verified."""
+    row = conn.execute(
+        """SELECT * FROM calibration_settings
+           ORDER BY setting_id DESC LIMIT 1""").fetchone()
+    if row is None:
+        return None
+    item = dict(row)
+    item["verified"] = bool(item["verified"])
+    return item
+
+
+def calibration_settings_history(conn: sqlite3.Connection,
+                                 limit: Optional[int] = None) -> list[dict]:
+    sql = "SELECT * FROM calibration_settings ORDER BY setting_id DESC"
+    args: list = []
+    if limit:
+        sql += " LIMIT ?"
+        args.append(int(limit))
+    out = []
+    for row in conn.execute(sql, args):
+        item = dict(row)
+        item["verified"] = bool(item["verified"])
+        out.append(item)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Daily observation upsert (recompute) + audited edits
+# --------------------------------------------------------------------------- #
+
+
+_EDITABLE_OBSERVATION_FIELDS = (
+    "age_days",
+    "height_cm",
+    "growth_rate_cm_per_day",
+    "canopy_width_cm",
+    "stem_width_cm",
+    "visible_true_leaf_count",
+)
+
+
+def _validate_observation_numbers(*, age_days=None, height_cm=None,
+                                  canopy_width_cm=None, stem_width_cm=None,
+                                  visible_true_leaf_count=None,
+                                  rod_length_cm=None) -> None:
+    if age_days is not None and int(age_days) < 0:
+        raise ValidationError("age_days must be >= 0.")
+    if height_cm is not None and float(height_cm) < 0:
+        raise ValidationError("height_cm must be >= 0.")
+    if canopy_width_cm is not None and float(canopy_width_cm) < 0:
+        raise ValidationError("canopy_width_cm must be >= 0.")
+    if stem_width_cm is not None and float(stem_width_cm) < 0:
+        raise ValidationError("stem_width_cm must be >= 0.")
+    if visible_true_leaf_count is not None and int(visible_true_leaf_count) < 0:
+        raise ValidationError("visible_true_leaf_count must be >= 0.")
+    if rod_length_cm is not None and float(rod_length_cm) <= 0:
+        raise ValidationError("rod_length_cm must be > 0.")
+
+
+def upsert_daily_observation(conn: sqlite3.Connection, *,
+                             plant_id: int,
+                             observation_date: str,
+                             age_days: Optional[int] = None,
+                             height_cm: Optional[float] = None,
+                             growth_rate_cm_per_day: Optional[float] = None,
+                             canopy_width_cm: Optional[float] = None,
+                             stem_width_cm: Optional[float] = None,
+                             visible_true_leaf_count: Optional[int] = None,
+                             rod_length_cm: Optional[float] = None,
+                             calibration_source: Optional[str] = None,
+                             calibration_verified: Optional[bool] = None,
+                             data_source: Optional[str] = None,
+                             reason: Optional[str] = None) -> dict:
+    """Insert *or recompute* the single daily observation for (plant, date).
+
+    The camera path uses this: when another valid capture for the same plant and
+    date arrives, the daily median is recomputed onto the same row rather than
+    the new capture being discarded or a second row being created. The caller
+    supplies the full desired state; fields left ``None`` are stored as missing
+    (never invented).
+
+    Returns ``{"observation_id", "action", "previous", "record"}`` where action
+    is ``inserted`` / ``updated`` / ``unchanged``.
+    """
+    plant = get_plant(conn, plant_id)
+    obs_date = parse_iso_date(observation_date, "observation_date")
+    source = data_source or plant["data_source"]
+    if source not in config.VALID_SOURCES:
+        raise ValidationError(f"Invalid data_source '{source}'.")
+    if source != plant["data_source"]:
+        raise ValidationError(
+            f"Observation data_source '{source}' does not match plant "
+            f"data_source '{plant['data_source']}'.")
+
+    _validate_observation_numbers(
+        age_days=age_days, height_cm=height_cm,
+        canopy_width_cm=canopy_width_cm, stem_width_cm=stem_width_cm,
+        visible_true_leaf_count=visible_true_leaf_count,
+        rod_length_cm=rod_length_cm)
+    if growth_rate_cm_per_day is not None:
+        growth_rate_cm_per_day = float(growth_rate_cm_per_day)
+
+    # Derive age only from a real planting date; never from height.
+    if age_days is None and plant["date_started"]:
+        derived = days_between(plant["date_started"], obs_date)
+        if derived < 0:
+            raise ValidationError(
+                "observation_date is before the plant's date_started.")
+        age_days = derived
+
+    desired = {
+        "age_days": age_days,
+        "height_cm": height_cm,
+        "growth_rate_cm_per_day": growth_rate_cm_per_day,
+        "canopy_width_cm": canopy_width_cm,
+        "stem_width_cm": stem_width_cm,
+        "visible_true_leaf_count": visible_true_leaf_count,
+        "rod_length_cm": rod_length_cm,
+        "calibration_source": calibration_source,
+        "calibration_verified": (None if calibration_verified is None
+                                 else (1 if calibration_verified else 0)),
+    }
+
+    existing = conn.execute(
+        """SELECT * FROM observations WHERE plant_id = ? AND observation_date = ?
+        """, (plant_id, obs_date.isoformat())).fetchone()
+
+    if existing is None:
+        cur = conn.execute(
+            """INSERT INTO observations
+               (plant_id, observation_date, age_days, height_cm,
+                growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
+                visible_true_leaf_count, data_source, rod_length_cm,
+                calibration_source, calibration_verified)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (plant_id, obs_date.isoformat(), age_days, height_cm,
+             growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
+             visible_true_leaf_count, source, rod_length_cm,
+             calibration_source, desired["calibration_verified"]),
+        )
+        observation_id = int(cur.lastrowid)
+        record_observation_revision(
+            conn, observation_id=observation_id, action="create",
+            before=None, after=desired, reason=reason, plant_id=plant_id,
+            observation_date=obs_date.isoformat(), data_source=source)
+        conn.commit()
+        return {"observation_id": observation_id, "action": "inserted",
+                "previous": None,
+                "record": dict(conn.execute(
+                    "SELECT * FROM observations WHERE observation_id = ?",
+                    (observation_id,)).fetchone())}
+
+    previous = dict(existing)
+    comparable = {key: previous.get(key) for key in desired}
+    if comparable == desired:
+        return {"observation_id": int(existing["observation_id"]),
+                "action": "unchanged", "previous": previous,
+                "record": previous}
+
+    conn.execute(
+        """UPDATE observations
+           SET age_days = ?, height_cm = ?, growth_rate_cm_per_day = ?,
+               canopy_width_cm = ?, stem_width_cm = ?, visible_true_leaf_count = ?,
+               rod_length_cm = ?, calibration_source = ?, calibration_verified = ?
+           WHERE observation_id = ?""",
+        (age_days, height_cm, growth_rate_cm_per_day, canopy_width_cm,
+         stem_width_cm, visible_true_leaf_count, rod_length_cm,
+         calibration_source, desired["calibration_verified"],
+         int(existing["observation_id"])),
+    )
+    record_observation_revision(
+        conn, observation_id=int(existing["observation_id"]), action="recompute",
+        before=previous, after=desired, reason=reason, plant_id=plant_id,
+        observation_date=obs_date.isoformat(), data_source=source)
+    conn.commit()
+    return {"observation_id": int(existing["observation_id"]),
+            "action": "updated", "previous": previous,
+            "record": dict(conn.execute(
+                "SELECT * FROM observations WHERE observation_id = ?",
+                (int(existing["observation_id"]),)).fetchone())}
+
+
+def update_observation(conn: sqlite3.Connection,
+                       observation_id: int,
+                       updates: dict,
+                       *,
+                       reason: Optional[str] = None) -> dict:
+    """Apply an audited correction to a daily observation.
+
+    Only measurement fields may change; plant identity and observation date are
+    fixed. The previous values are preserved in ``observation_revisions``.
+    """
+    row = conn.execute(
+        "SELECT * FROM observations WHERE observation_id = ?",
+        (observation_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"No observation with observation_id={observation_id}.")
+    previous = dict(row)
+
+    unknown = [k for k in updates if k not in _EDITABLE_OBSERVATION_FIELDS]
+    if unknown:
+        raise ValidationError(
+            f"Cannot edit {unknown}; editable fields are "
+            f"{list(_EDITABLE_OBSERVATION_FIELDS)}.")
+
+    merged = {key: updates.get(key, previous.get(key))
+              for key in _EDITABLE_OBSERVATION_FIELDS}
+    _validate_observation_numbers(
+        age_days=merged["age_days"], height_cm=merged["height_cm"],
+        canopy_width_cm=merged["canopy_width_cm"],
+        stem_width_cm=merged["stem_width_cm"],
+        visible_true_leaf_count=merged["visible_true_leaf_count"])
+    if merged["growth_rate_cm_per_day"] is not None:
+        merged["growth_rate_cm_per_day"] = float(merged["growth_rate_cm_per_day"])
+
+    if merged == {k: previous.get(k) for k in _EDITABLE_OBSERVATION_FIELDS}:
+        return {"observation_id": observation_id, "action": "unchanged",
+                "previous": previous, "record": previous}
+
+    conn.execute(
+        """UPDATE observations
+           SET age_days = ?, height_cm = ?, growth_rate_cm_per_day = ?,
+               canopy_width_cm = ?, stem_width_cm = ?, visible_true_leaf_count = ?
+           WHERE observation_id = ?""",
+        (merged["age_days"], merged["height_cm"],
+         merged["growth_rate_cm_per_day"], merged["canopy_width_cm"],
+         merged["stem_width_cm"], merged["visible_true_leaf_count"],
+         observation_id),
+    )
+    after = {k: merged[k] for k in _EDITABLE_OBSERVATION_FIELDS}
+    record_observation_revision(
+        conn, observation_id=observation_id, action="update", before=previous,
+        after=after, reason=reason, plant_id=previous.get("plant_id"),
+        observation_date=previous.get("observation_date"),
+        data_source=previous.get("data_source"))
+    conn.commit()
+    return {"observation_id": observation_id, "action": "updated",
+            "previous": previous,
+            "record": dict(conn.execute(
+                "SELECT * FROM observations WHERE observation_id = ?",
+                (observation_id,)).fetchone())}
+
+
+def delete_observation(conn: sqlite3.Connection,
+                       observation_id: int,
+                       *,
+                       reason: Optional[str] = None) -> dict:
+    """Delete a daily observation, preserving its values in the audit trail.
+
+    Only daily summary rows are deleted. Raw ``camera_captures`` rows are the
+    audit trail and are never removed here.
+    """
+    row = conn.execute(
+        "SELECT * FROM observations WHERE observation_id = ?",
+        (observation_id,)).fetchone()
+    if row is None:
+        raise NotFoundError(f"No observation with observation_id={observation_id}.")
+    previous = dict(row)
+    conn.execute("DELETE FROM observations WHERE observation_id = ?",
+                 (observation_id,))
+    record_observation_revision(
+        conn, observation_id=observation_id, action="delete", before=previous,
+        after=None, reason=reason, plant_id=previous.get("plant_id"),
+        observation_date=previous.get("observation_date"),
+        data_source=previous.get("data_source"))
+    conn.commit()
+    return {"observation_id": observation_id, "action": "deleted",
+            "previous": previous}
 
 
 # --------------------------------------------------------------------------- #

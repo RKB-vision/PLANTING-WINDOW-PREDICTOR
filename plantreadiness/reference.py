@@ -30,6 +30,7 @@ reproducible and separable from the synthetic demonstration data.
 from __future__ import annotations
 
 import json
+import math
 import statistics
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -350,13 +351,23 @@ def build_reference_from_repo(repo, species: str,
 
     transplant_dates = {t["plant_id"]: t["transplant_date"]
                         for t in repo.all_feedback()}
+    from . import calibration as _cal
+
     payload = []
     for plant in plants:
+        usable = []
+        for obs in repo.get_observations(plant["plant_id"]):
+            group = _cal.calibration_group(
+                calibration_source=obs.get("calibration_source"),
+                rod_length_cm=obs.get("rod_length_cm"),
+                calibration_verified=obs.get("calibration_verified"))
+            if _cal.is_baseline_usable(group):
+                usable.append(obs)
         payload.append({
             "plant_id": plant["plant_id"],
             "external_ref": plant.get("external_ref"),
             "recorded_transplant_date": transplant_dates.get(plant["plant_id"]),
-            "observations": repo.get_observations(plant["plant_id"]),
+            "observations": usable,
         })
     return build_reference_baseline(
         payload, species, variety=variety, data_source=data_source)
@@ -418,11 +429,22 @@ def _nearest_group(groups: list[dict], key: str, value: float,
 def provisional_estimate(baseline: dict, observation: dict) -> dict:
     """Estimate days-until-transplant from the successful-cohort baseline.
 
-    Prefers an age-based reference group, falls back to a height-based one.
-    Returns ``available=False`` when no reference group is close enough or
-    too few independent plants contribute. The estimate is always labelled
-    provisional because the cohort is all-successful and descriptive.
+    Age, height and growth rate are all used as inputs together:
+
+    * ``age_days`` selects the reference group (a reliable planting date does
+      NOT disable the other inputs);
+    * ``height_cm`` selects the group when no age is available, and stays a
+      recorded input even when age is available;
+    * ``growth_rate_cm_per_day`` adjusts the estimate via
+      ``D_adjusted = D_base * clamp(G_cohort / G_plant, 0.5, 2.0)``.
+
+    The growth-rate adjustment is a provisional heuristic (a hypothesis to
+    test against outcomes), never an established fact. Returns
+    ``available=False`` when no reference group is close enough or too few
+    independent plants contribute. The estimate is always labelled provisional.
     """
+    import math
+
     if not baseline:
         return {"available": False,
                 "method": config.METHOD_REFERENCE_BASELINE,
@@ -433,19 +455,30 @@ def provisional_estimate(baseline: dict, observation: dict) -> dict:
     age = observation.get("age_days")
     height = observation.get("height_cm")
     obs_date = observation.get("observation_date")
+    plant_rate = observation.get("growth_rate_cm_per_day")
+
+    by_age = baseline.get("by_age_days", [])
 
     group = None
     basis = None
     if age is not None:
-        group = _nearest_group(baseline.get("by_age_days", []), "age_days",
-                               age, config.PROVISIONAL_AGE_TOLERANCE_DAYS)
-        basis = f"age_days={age}" if group else None
+        group = _nearest_group(by_age, "age_days", age,
+                               config.PROVISIONAL_AGE_TOLERANCE_DAYS)
+        if group is not None:
+            basis = "age_days=%s" % age
+            if (height is not None
+                    and group.get("median_height_cm") is not None
+                    and abs(float(group["median_height_cm"]) - float(height))
+                    > config.PROVISIONAL_HEIGHT_TOLERANCE_CM):
+                alt = _nearest_group(by_age, "median_height_cm", height,
+                                     config.PROVISIONAL_HEIGHT_TOLERANCE_CM)
+                if alt is not None and alt is not group:
+                    group = alt
+                    basis = "height_cm=%s" % height
     if group is None and height is not None:
-        group = _nearest_group(baseline.get("by_age_days", []),
-                               "median_height_cm", height,
+        group = _nearest_group(by_age, "median_height_cm", height,
                                config.PROVISIONAL_HEIGHT_TOLERANCE_CM)
-        # height matching is by the group's median height at that age
-        basis = f"height_cm={height}" if group else None
+        basis = ("height_cm=%s" % height) if group else None
 
     if group is None or group.get("median_days_until_transplant") is None:
         return {
@@ -461,27 +494,53 @@ def provisional_estimate(baseline: dict, observation: dict) -> dict:
             "available": False,
             "method": config.METHOD_REFERENCE_BASELINE,
             "provisional": True,
-            "message": (f"Only {group.get('n_plants')} independent plants "
-                        "contribute to this reference group; too few for a "
-                        "provisional estimate."),
+            "message": ("Only %s independent plants contribute to this "
+                        "reference group; too few for a provisional estimate."
+                        % group.get("n_plants")),
             "limitations": baseline.get("limitations", []),
         }
 
-    days = float(group["median_days_until_transplant"])
+    base_days = float(group["median_days_until_transplant"])
     uncertainty = group.get("iqr_days_until_transplant")
+    cohort_rate = group.get("median_growth_rate_cm_per_day")
+
+    # Growth-rate adjustment (provisional heuristic, hypothesis to test).
+    adjustment_applied = False
+    adjustment_reason = None
+    factor = 1.0
+    try:
+        cr = None if cohort_rate is None else float(cohort_rate)
+        pr = None if plant_rate is None else float(plant_rate)
+    except (TypeError, ValueError):
+        cr, pr = None, None
+
+    if cr is None or pr is None:
+        adjustment_reason = ("skipped: " +
+                             ("cohort growth rate unavailable" if cr is None
+                              else "plant growth rate unavailable"))
+    elif cr <= 0 or pr <= 0 or not math.isfinite(cr) or not math.isfinite(pr):
+        adjustment_reason = "skipped: non-positive or non-finite growth rate"
+    else:
+        raw_factor = cr / pr
+        lo = config.GROWTH_RATE_ADJUSTMENT_MIN_FACTOR
+        hi = config.GROWTH_RATE_ADJUSTMENT_MAX_FACTOR
+        factor = min(hi, max(lo, raw_factor))
+        adjustment_applied = True
+        adjustment_reason = "applied"
+
+    adjusted_days = base_days * factor if adjustment_applied else base_days
+
     predicted_date = None
     if obs_date:
         try:
             predicted_date = (
                 dbm.parse_iso_date(obs_date, "observation_date")
-                + timedelta(days=int(round(days)))
+                + timedelta(days=int(round(adjusted_days)))
             ).isoformat()
         except dbm.ValidationError:
             predicted_date = None
 
-    # A single measurement (or a missing most-recent rate) means there is no
-    # growth history to reason from - say so instead of implying one exists.
-    insufficient_history = observation.get("growth_rate_cm_per_day") is None
+    insufficient_history = plant_rate is None
     history_note = None
     if insufficient_history:
         history_note = (
@@ -494,7 +553,8 @@ def provisional_estimate(baseline: dict, observation: dict) -> dict:
         "method": config.METHOD_REFERENCE_BASELINE,
         "provisional": True,
         "synthetic": False,
-        "days_remaining": round(days, 1),
+        "days_remaining": round(adjusted_days, 1),
+        "days_remaining_raw": round(base_days, 1),
         "days_remaining_uncertainty_days": _round(uncertainty, 1),
         "predicted_readiness_date": predicted_date,
         "reference_basis": basis,
@@ -508,8 +568,13 @@ def provisional_estimate(baseline: dict, observation: dict) -> dict:
         "limitations": baseline.get("limitations", []),
         "baseline_version": baseline.get("baseline_version"),
         "hours": None,
+        "cohort_growth_rate_cm_per_day": _round(cohort_rate, 4),
+        "plant_growth_rate_cm_per_day": _round(plant_rate, 4),
+        "growth_rate_adjustment_factor":
+            _round(factor, 4) if adjustment_applied else None,
+        "growth_rate_adjustment_applied": adjustment_applied,
+        "growth_rate_adjustment_reason": adjustment_reason,
     }
-
 
 def baseline_summary(baseline: dict) -> dict:
     """Trimmed view for the API/UI (drops the per-point dump)."""

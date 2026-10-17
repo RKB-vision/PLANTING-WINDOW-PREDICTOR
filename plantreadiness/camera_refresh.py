@@ -296,8 +296,7 @@ def _default_puller(
     """Measure new Cloudinary images with the OpenCV pipeline (lazy import)."""
     from plant_measurement import (  # noqa: WPS433 (lazy, heavy cv2 import)
         build_measurement_args,
-        collect_new_captures_once,
-        format_daily_record,
+        collect_new_capture_records_once,
     )
 
     args = build_measurement_args(
@@ -306,35 +305,45 @@ def _default_puller(
         rod_hue_tolerance=config.CAMERA_ROD_HUE_TOLERANCE,
     )
 
-    results = collect_new_captures_once(
+    records = collect_new_capture_records_once(
         captures,
         args,
         prefix=source.prefix,
     )
 
-    return _rows_from_results(
-        results,
-        source.external_ref,
-        format_daily_record,
-    )
+    return _rows_from_records(records, source.external_ref)
 
 
-def _rows_from_results(
-    results: list[Any],
+def _rows_from_records(
+    records: list[Any],
     plant_ref: str,
-    formatter: Callable[[str, str, list[Any]], dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Group measured captures by capture date and format one row per day."""
-    if not results:
+    """One median-based daily row per capture date.
+
+    Grouping is by the date parsed from the image name, so four images of the
+    same plant on the same day produce exactly one row. Failed captures are
+    carried through in the row's audit columns and counted, never dropped.
+    """
+    if not records:
         return []
 
-    grouped: dict[str, list[Any]] = {}
-    for result in results:
-        stamp = str(getattr(result, "timestamp", "") or "")
-        day = stamp.split("T")[0].split(" ")[0].strip() or "unknown"
-        grouped.setdefault(day, []).append(result)
+    from plant_measurement import (  # noqa: WPS433 (lazy, heavy cv2 import)
+        group_records_by_date,
+        median_daily_record,
+    )
 
     rows: list[dict[str, Any]] = []
-    for day in sorted(grouped):
-        rows.append(formatter(day, plant_ref, grouped[day]))
+    for capture_date, group in sorted(
+        group_records_by_date(records).items(),
+        key=lambda item: item[0] or "",
+    ):
+        rows.append(
+            median_daily_record(
+                capture_date or "unknown",
+                plant_ref,
+                capture_date,
+                group,
+                rod_length_cm=config.CAMERA_ROD_LENGTH_CM,
+            )
+        )
     return rows

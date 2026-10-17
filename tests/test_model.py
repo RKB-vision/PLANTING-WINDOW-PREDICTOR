@@ -143,7 +143,7 @@ class TestCsvImport(unittest.TestCase):
         if not CSV_PATH.exists():
             self.skipTest("real CSV not present")
         report = csv_import.import_csv(self.conn, CSV_PATH,
-                                       species="Super Orange")
+                                       species="Sunflower (SuperOrange)")
         self.assertEqual(report["observations_inserted"], 250)
         self.assertEqual(report["plants_imported"], 10)
         self.assertEqual(report["issues"], [])
@@ -187,7 +187,7 @@ class TestCsvImport(unittest.TestCase):
             self.skipTest("real CSV not present")
         csv_import.import_csv(self.conn, CSV_PATH)
         analysis = csv_import.analyse_real_data(self.conn,
-                                                species="Super Orange")
+                                                species="Sunflower (SuperOrange)")
         self.assertEqual(analysis["n_plants"], 10)
         self.assertEqual(analysis["n_observations"], 250)
         self.assertEqual(analysis["n_plants_with_readiness_event"], 0)

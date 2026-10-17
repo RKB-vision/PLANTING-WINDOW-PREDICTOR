@@ -72,7 +72,30 @@ class BaseRepository:
                         canopy_width_cm: Optional[float] = None,
                         stem_width_cm: Optional[float] = None,
                         visible_true_leaf_count: Optional[int] = None,
-                        data_source: Optional[str] = None) -> int:
+                        data_source: Optional[str] = None,
+                        rod_length_cm: Optional[float] = None,
+                        calibration_source: Optional[str] = None,
+                        calibration_verified: Optional[bool] = None) -> int:
+        """Append a daily observation (duplicate plant+date is rejected)."""
+        raise NotImplementedError
+
+    def upsert_daily_observation(self, **fields) -> dict:
+        """Insert or recompute the single daily observation for (plant, date)."""
+        raise NotImplementedError
+
+    def update_observation(self, observation_id: int, updates: dict,
+                           reason: Optional[str] = None) -> dict:
+        """Apply an audited correction to a daily observation."""
+        raise NotImplementedError
+
+    def delete_observation(self, observation_id: int,
+                           reason: Optional[str] = None) -> dict:
+        """Delete a daily observation, preserving it in the audit trail."""
+        raise NotImplementedError
+
+    def observation_revisions(self, observation_id: Optional[int] = None,
+                              limit: Optional[int] = None) -> list[dict]:
+        """Audit trail of measurement edits."""
         raise NotImplementedError
 
     def get_observations(self, plant_id: int) -> list[dict]:
@@ -82,6 +105,39 @@ class BaseRepository:
         raise NotImplementedError
 
     def count_observations(self, data_source: Optional[str] = None) -> int:
+        raise NotImplementedError
+
+    # -- individual camera captures ----------------------------------------- #
+    def add_capture(self, **fields) -> dict:
+        """Record (or revise) one image capture, keyed by Cloudinary public id."""
+        raise NotImplementedError
+
+    def list_captures(self, plant_id: int,
+                      observation_date: Optional[str] = None,
+                      data_source: Optional[str] = None) -> list[dict]:
+        raise NotImplementedError
+
+    def captures_on_date(self, plant_id: int,
+                         observation_date: str) -> list[dict]:
+        raise NotImplementedError
+
+    def count_captures(self, data_source: Optional[str] = None) -> int:
+        raise NotImplementedError
+
+    def capture_revisions(self, capture_id: Optional[int] = None,
+                          limit: Optional[int] = None) -> list[dict]:
+        raise NotImplementedError
+
+    # -- rod-length verification -------------------------------------------- #
+    def current_calibration_setting(self) -> Optional[dict]:
+        """Newest recorded rod-length verification event (None if never)."""
+        raise NotImplementedError
+
+    def record_calibration_setting(self, **fields) -> dict:
+        raise NotImplementedError
+
+    def calibration_settings_history(self,
+                                     limit: Optional[int] = None) -> list[dict]:
         raise NotImplementedError
 
     # -- readiness events --------------------------------------------------- #
@@ -308,7 +364,9 @@ class SQLiteRepository(BaseRepository):
                         height_cm=None, growth_rate_cm_per_day=None,
                         canopy_width_cm=None, stem_width_cm=None,
                         visible_true_leaf_count=None,
-                        data_source=None) -> int:
+                        data_source=None,
+                        rod_length_cm=None, calibration_source=None,
+                        calibration_verified=None) -> int:
         return dbm.add_observation(
             self.conn, plant_id=plant_id,
             observation_date=observation_date, age_days=age_days,
@@ -317,7 +375,51 @@ class SQLiteRepository(BaseRepository):
             canopy_width_cm=canopy_width_cm,
             stem_width_cm=stem_width_cm,
             visible_true_leaf_count=visible_true_leaf_count,
-            data_source=data_source)
+            data_source=data_source, rod_length_cm=rod_length_cm,
+            calibration_source=calibration_source,
+            calibration_verified=calibration_verified)
+
+    def upsert_daily_observation(self, **fields) -> dict:
+        return dbm.upsert_daily_observation(self.conn, **fields)
+
+    def update_observation(self, observation_id, updates, reason=None) -> dict:
+        return dbm.update_observation(self.conn, observation_id, updates,
+                                      reason=reason)
+
+    def delete_observation(self, observation_id, reason=None) -> dict:
+        return dbm.delete_observation(self.conn, observation_id, reason=reason)
+
+    def observation_revisions(self, observation_id=None, limit=None) -> list[dict]:
+        return dbm.observation_revisions(self.conn, observation_id, limit)
+
+    # -- individual camera captures ----------------------------------------- #
+    def add_capture(self, **fields) -> dict:
+        return dbm.add_capture(self.conn, **fields)
+
+    def list_captures(self, plant_id, observation_date=None,
+                      data_source=None) -> list[dict]:
+        return dbm.list_captures(self.conn, plant_id,
+                                 observation_date=observation_date,
+                                 data_source=data_source)
+
+    def captures_on_date(self, plant_id, observation_date) -> list[dict]:
+        return dbm.captures_on_date(self.conn, plant_id, observation_date)
+
+    def count_captures(self, data_source=None) -> int:
+        return dbm.count_captures(self.conn, data_source)
+
+    def capture_revisions(self, capture_id=None, limit=None) -> list[dict]:
+        return dbm.capture_revisions(self.conn, capture_id, limit)
+
+    # -- rod-length verification -------------------------------------------- #
+    def current_calibration_setting(self):
+        return dbm.current_calibration_setting(self.conn)
+
+    def record_calibration_setting(self, **fields) -> dict:
+        return dbm.record_calibration_setting(self.conn, **fields)
+
+    def calibration_settings_history(self, limit=None) -> list[dict]:
+        return dbm.calibration_settings_history(self.conn, limit)
 
     def get_observations(self, plant_id) -> list[dict]:
         return [dict(r) for r in dbm.get_observations(self.conn, plant_id)]

@@ -53,6 +53,8 @@ import base64
 import csv
 import json
 import os
+import re
+import statistics
 import sys
 import time
 import urllib.error
@@ -74,6 +76,30 @@ try:  # pragma: no cover - convenience when run from the project root
     _load_dotenv()
 except Exception:  # pragma: no cover - keep the standalone script working
     pass
+
+# Shared configuration (the ONE rod-length value, capture-name grammar, ...).
+# Imported best-effort so the script still runs standalone; the fallbacks below
+# are the documented defaults, not a second source of truth.
+try:  # pragma: no cover - exercised by the package tests
+    from plantreadiness import config as _config
+except Exception:  # pragma: no cover
+    _config = None
+
+
+def _config_value(name: str, fallback):
+    return getattr(_config, name, fallback) if _config else fallback
+
+
+# Effective rod length used when the CLI flag is omitted.
+CONFIGURED_ROD_LENGTH_CM = _config_value("CAMERA_ROD_LENGTH_CM", 30.0)
+
+# Four-capture aggregation policy. ``EXPECTED_CAPTURES_PER_DAY`` is used only
+# to mark an under-populated day `incomplete`; it is never used to fabricate a
+# missing capture.
+EXPECTED_CAPTURES_PER_DAY = _config_value("EXPECTED_CAPTURES_PER_DAY", 4)
+MIN_CAPTURES_FOR_CONFIDENCE = _config_value("MIN_CAPTURES_FOR_CONFIDENCE", 3)
+CAPTURE_MIN_CONFIDENCE = _config_value("CAPTURE_MIN_CONFIDENCE", 0.0)
+CAPTURE_NAME_RE = _config_value("CAPTURE_NAME_RE", None)
 
 
 # ============================================================
@@ -169,6 +195,233 @@ class CaptureResult:
     leaf_count: int
     cm_per_pixel: float
     confidence: float
+    # Identify the individual capture. ``public_id`` is the Cloudinary name the
+    # ESP32 produced (Plant01_20261016_095000); ``capture_date``/``capture_time``
+    # are parsed from it. A result with no public_id (offline single-image run)
+    # simply cannot be deduplicated or re-downloaded later.
+    public_id: str | None = None
+    capture_date: str | None = None
+    capture_time: str | None = None
+    # Whether the calibration behind this measurement was verified. Decided by
+    # the importer (which knows the recorded verification state), not here.
+    rod_length_cm: float | None = None
+
+
+@dataclass(frozen=True)
+class CaptureRecord:
+    """One image's outcome - valid *or* failed - i.e. the audit unit.
+
+    A failed capture is recorded rather than silently dropped, so a day with
+    one good image out of four is visibly different from a day with four.
+    """
+
+    public_id: str | None
+    capture_date: str | None
+    capture_timestamp: str | None
+    validity: str = "valid"          # 'valid' | 'failed'
+    problem: str | None = None
+    height_cm: float | None = None
+    width_cm: float | None = None
+    leaf_count: int | None = None
+    cm_per_pixel: float | None = None
+    confidence: float | None = None
+    rod_length_cm: float | None = None
+
+    @property
+    def is_valid(self) -> bool:
+        return self.validity == "valid"
+
+
+# ============================================================
+# CAPTURE IDENTITY, VALIDATION AND DAILY AGGREGATION
+# ============================================================
+
+# The agreed Cloudinary naming scheme: Plant01_20261016_095000
+CAPTURE_NAME_PATTERN = re.compile(
+    r"^(?P<ref>[A-Za-z]+\d+)_(?P<date>\d{8})_(?P<time>\d{6})$"
+)
+
+
+def parse_capture_name(public_id: str | None) -> dict[str, str] | None:
+    """Parse ``Plant01_20261016_095000`` into plant reference, date and time.
+
+    Returns ``None`` when the name does not follow the agreed format. The
+    caller must then fall back to another timestamp source - a date is never
+    invented from nothing.
+    """
+
+    if not public_id:
+        return None
+
+    pattern = CAPTURE_NAME_RE or CAPTURE_NAME_PATTERN
+
+    match = pattern.match(str(public_id).strip())
+
+    if not match:
+        return None
+
+    raw_date = match.group("date")
+    raw_time = match.group("time")
+
+    date_iso = f"{raw_date[0:4]}-{raw_date[4:6]}-{raw_date[6:8]}"
+    time_iso = f"{raw_time[0:2]}:{raw_time[2:4]}:{raw_time[4:6]}"
+
+    try:
+        datetime.strptime(
+            f"{date_iso} {time_iso}", "%Y-%m-%d %H:%M:%S"
+        )
+    except ValueError:
+        # e.g. 20261345_256199 - a syntactically valid but impossible stamp.
+        return None
+
+    return {
+        "plant_ref": match.group("ref"),
+        "capture_date": date_iso,
+        "capture_time": time_iso,
+        "timestamp": f"{date_iso}T{time_iso}",
+    }
+
+
+def validate_capture(result: CaptureResult) -> tuple[bool, str | None]:
+    """Decide whether a capture's measurement is usable.
+
+    Uses only signals the pipeline already produces: a detected reference rod
+    (a positive, finite cm/pixel scale), a measurable plant height and a
+    reported segmentation confidence. No new quality bar is invented, and a
+    failed capture is reported rather than imputed.
+    """
+
+    problems: list[str] = []
+
+    scale = result.cm_per_pixel
+    if scale is None or not np.isfinite(scale) or scale <= 0:
+        problems.append("reference rod not detected (no valid cm/pixel scale)")
+
+    height = result.height_cm
+    if height is None or not np.isfinite(height) or height <= 0:
+        problems.append("plant height not measurable")
+
+    width = result.width_cm
+    if width is not None and np.isfinite(width) and width < 0:
+        problems.append("negative stem width")
+
+    confidence = result.confidence
+    if (
+        confidence is None
+        or not np.isfinite(confidence)
+        or confidence <= CAPTURE_MIN_CONFIDENCE
+    ):
+        problems.append("no segmentation confidence reported")
+
+    return (not problems), ("; ".join(problems) if problems else None)
+
+
+def capture_record_from_result(result: CaptureResult) -> CaptureRecord:
+    """Turn a measurement into an auditable capture record."""
+
+    valid, problem = validate_capture(result)
+
+    return CaptureRecord(
+        public_id=result.public_id,
+        capture_date=result.capture_date,
+        capture_timestamp=result.timestamp,
+        validity="valid" if valid else "failed",
+        problem=problem,
+        height_cm=result.height_cm,
+        width_cm=result.width_cm,
+        leaf_count=result.leaf_count,
+        cm_per_pixel=result.cm_per_pixel,
+        confidence=result.confidence,
+        rod_length_cm=result.rod_length_cm,
+    )
+
+
+def failed_capture_record(
+    public_id: str | None,
+    problem: str,
+    capture_date: str | None = None,
+    capture_timestamp: str | None = None,
+    rod_length_cm: float | None = None,
+) -> CaptureRecord:
+    """A capture that could not be measured at all (download/vision failure)."""
+
+    return CaptureRecord(
+        public_id=public_id,
+        capture_date=capture_date,
+        capture_timestamp=capture_timestamp,
+        validity="failed",
+        problem=problem,
+        rod_length_cm=rod_length_cm,
+    )
+
+
+def _median_or_none(values) -> float | None:
+    numbers = [float(v) for v in values if v is not None]
+    if not numbers:
+        return None
+    return float(statistics.median(numbers))
+
+
+def _mean_or_none(values) -> float | None:
+    numbers = [float(v) for v in values if v is not None]
+    if not numbers:
+        return None
+    return float(statistics.fmean(numbers))
+
+
+def _fmt(value, digits: int = 4) -> str:
+    return "" if value is None else f"{float(value):.{digits}f}"
+
+
+def record_to_dict(record: CaptureRecord) -> dict[str, Any]:
+    """JSON-serialisable view of one capture (the audit payload)."""
+    return {
+        "public_id": record.public_id,
+        "capture_date": record.capture_date,
+        "capture_timestamp": record.capture_timestamp,
+        "validity": record.validity,
+        "problem": record.problem,
+        "height_cm": record.height_cm,
+        "width_cm": record.width_cm,
+        "leaf_count": record.leaf_count,
+        "cm_per_pixel": record.cm_per_pixel,
+        "confidence": record.confidence,
+        "rod_length_cm": record.rod_length_cm,
+    }
+
+
+def resolve_capture_date(records: list[CaptureRecord]) -> str | None:
+    """The calendar date a group of captures belongs to.
+
+    Prefers the date parsed from the image name, then the capture timestamp.
+    Returns ``None`` when neither exists - the caller decides what to do with
+    an unplaceable capture rather than silently dating it today.
+    """
+    for record in records:
+        if record.capture_date:
+            return record.capture_date
+    for record in records:
+        if record.capture_timestamp:
+            day = str(record.capture_timestamp).split("T")[0].split(" ")[0].strip()
+            if day:
+                return day
+    return None
+
+
+def group_records_by_date(
+    records: list[CaptureRecord],
+) -> dict[str | None, list[CaptureRecord]]:
+    """Group capture records by the calendar date they belong to.
+
+    Falls back to the capture timestamp when the image name did not yield a
+    date, so captures are grouped by when they were actually taken rather than
+    by when they happened to be processed.
+    """
+    grouped: dict[str | None, list[CaptureRecord]] = {}
+    for record in records:
+        key = record.capture_date or resolve_capture_date([record])
+        grouped.setdefault(key, []).append(record)
+    return grouped
 
 
 # ============================================================
@@ -1530,6 +1783,8 @@ def process_image(
     args: argparse.Namespace,
     capture_number: int,
     timestamp: str | None = None,
+    public_id: str | None = None,
+    capture_date: str | None = None,
 ) -> CaptureResult:
 
     reference = detect_reference_rod(
@@ -1642,6 +1897,10 @@ def process_image(
         f"{plant.confidence:.3f}"
     )
 
+    parsed = parse_capture_name(public_id)
+    if capture_date is None and parsed is not None:
+        capture_date = parsed["capture_date"]
+
     return CaptureResult(
         timestamp=timestamp,
         height_cm=height_cm,
@@ -1649,6 +1908,10 @@ def process_image(
         leaf_count=plant.leaf_count,
         cm_per_pixel=cm_per_pixel,
         confidence=plant.confidence,
+        public_id=public_id,
+        capture_date=capture_date,
+        capture_time=(parsed or {}).get("capture_time"),
+        rod_length_cm=float(args.rod_length_cm),
     )
 
 
@@ -1656,7 +1919,12 @@ def process_image(
 # CSV
 # ============================================================
 
+# The first ten columns keep their original order and meaning so existing
+# readers (and the row already committed in plant_daily_measurements.csv) stay
+# valid. Everything after them is appended: the median-based daily aggregate
+# plus the capture accounting that makes an incomplete day visible.
 DAILY_RECORD_FIELDS = [
+    # legacy mean-based summary (unchanged) -------------------------------
     "day",
     "plant_id",
     "captures_used",
@@ -1667,6 +1935,21 @@ DAILY_RECORD_FIELDS = [
     "average_confidence",
     "first_capture_timestamp",
     "last_capture_timestamp",
+    # median-based daily aggregate (one row per plant per calendar date) ---
+    "capture_date",
+    "rod_length_cm",
+    "expected_captures",
+    "processed_captures",
+    "valid_captures",
+    "failed_captures",
+    "incomplete",
+    "low_confidence",
+    "median_height_cm",
+    "median_width_cm",
+    "median_visible_leaves",
+    "capture_ids",
+    "captures_json",
+    "problems",
 ]
 
 
@@ -1755,18 +2038,187 @@ def format_daily_record(
     }
 
 
+def median_daily_record(
+    day_label: str,
+    plant_ref: str,
+    capture_date: str | None,
+    records: list[CaptureRecord],
+    rod_length_cm: float | None = None,
+    expected_captures: int | None = None,
+) -> dict[str, Any]:
+    """Build the single daily CSV row for one plant and calendar date.
+
+    Medians are taken over the **valid** captures only: four images of one
+    plant on one day produce one row, and a single image is never presented as
+    a four-image aggregate. Failed captures are counted and reported, never
+    imputed.
+    """
+
+    if not records:
+        raise ValueError("Cannot format an empty daily record")
+
+    valid = [record for record in records if record.is_valid]
+    failed = [record for record in records if not record.is_valid]
+
+    # Legacy mean columns: keep the original semantics (a mean over the
+    # measurements available for the day) so existing consumers keep working.
+    average_height = _mean_or_none(record.height_cm for record in valid)
+    average_width = _mean_or_none(record.width_cm for record in valid)
+    average_leaves = _mean_or_none(record.leaf_count for record in valid)
+    average_scale = _mean_or_none(record.cm_per_pixel for record in valid)
+    average_confidence = _mean_or_none(record.confidence for record in valid)
+
+    # Median columns: the representative daily value.
+    median_height = _median_or_none(record.height_cm for record in valid)
+    median_width = _median_or_none(record.width_cm for record in valid)
+    median_leaves = _median_or_none(record.leaf_count for record in valid)
+
+    expected = (
+        EXPECTED_CAPTURES_PER_DAY
+        if expected_captures is None
+        else int(expected_captures)
+    )
+
+    stamps = sorted(
+        str(record.capture_timestamp)
+        for record in records
+        if record.capture_timestamp
+    )
+
+    return {
+        "day": day_label,
+        "plant_id": plant_ref,
+        # captures_used keeps its legacy meaning: images that produced a usable
+        # measurement. valid_captures below carries the same number explicitly.
+        "captures_used": len(valid),
+        "average_height_cm": _fmt(average_height, 4),
+        "average_width_cm": _fmt(average_width, 4),
+        "average_visible_leaves": _fmt(average_leaves, 4),
+        "average_cm_per_pixel": _fmt(average_scale, 6),
+        "average_confidence": _fmt(average_confidence, 4),
+        "first_capture_timestamp": stamps[0] if stamps else "",
+        "last_capture_timestamp": stamps[-1] if stamps else "",
+        "capture_date": capture_date or "",
+        "rod_length_cm": _fmt(rod_length_cm, 4),
+        "expected_captures": expected,
+        "processed_captures": len(records),
+        "valid_captures": len(valid),
+        "failed_captures": len(failed),
+        "incomplete": 1 if len(valid) < expected else 0,
+        "low_confidence": 1 if len(valid) < MIN_CAPTURES_FOR_CONFIDENCE else 0,
+        "median_height_cm": _fmt(median_height, 4),
+        "median_width_cm": _fmt(median_width, 4),
+        "median_visible_leaves": _fmt(median_leaves, 4),
+        "capture_ids": "|".join(
+            record.public_id for record in records if record.public_id
+        ),
+        "captures_json": json.dumps(
+            [record_to_dict(record) for record in records], default=str
+        ),
+        "problems": "|".join(
+            f"{record.public_id or '?'}: {record.problem}"
+            for record in failed
+            if record.problem
+        ),
+    }
+
+
+def _read_daily_rows(path: Path) -> tuple[list[dict[str, Any]], list[str]]:
+    if not path.exists():
+        return [], list(DAILY_RECORD_FIELDS)
+    with path.open("r", newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = list(reader.fieldnames or DAILY_RECORD_FIELDS)
+        return [dict(row) for row in reader], fieldnames
+
+
+def _write_daily_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(
+            handle,
+            fieldnames=DAILY_RECORD_FIELDS,
+            extrasaction="ignore",
+            restval="",
+        )
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def upsert_daily_row(
+    path: Path,
+    row: dict[str, Any],
+    key: tuple[str, ...] = ("plant_id", "capture_date"),
+) -> str:
+    """Insert or replace the daily row identified by ``key``.
+
+    A day that already has a record is *updated* rather than appended to, so
+    running the collector twice on the same day cannot turn four images into
+    two days of growth. A row without a usable ``capture_date`` is appended
+    instead of matched, so an unplaceable capture can never overwrite a dated
+    historical row.
+    """
+
+    rows, _ = _read_daily_rows(path)
+
+    def matches(existing: dict[str, Any]) -> bool:
+        return all(
+            str(existing.get(field, "")).strip()
+            == str(row.get(field, "")).strip()
+            for field in key
+        )
+
+    can_match = all(str(row.get(field, "")).strip() for field in key)
+
+    if can_match:
+        for index, existing in enumerate(rows):
+            if matches(existing):
+                rows[index] = {**existing, **row}
+                _write_daily_rows(path, rows)
+                return "updated"
+
+    rows.append(row)
+    _write_daily_rows(path, rows)
+    return "inserted"
+
+
 def write_daily_record(
     day_label: str,
     plant_id: str,
     results: list[CaptureResult],
     csv_file: Path | None = None,
-) -> None:
-    """Append one daily row to the measurement CSV (never overwrites)."""
+    capture_date: str | None = None,
+    records: list[CaptureRecord] | None = None,
+    rod_length_cm: float | None = None,
+    expected_captures: int | None = None,
+) -> dict[str, Any]:
+    """Write (or recompute) the single daily row for a plant and date.
 
-    row = format_daily_record(
+    Replaces the previous blind append: a later capture on the same day updates
+    that day's row instead of adding a second one.
+    """
+
+    if records is None:
+        records = [capture_record_from_result(result) for result in results]
+
+    if capture_date is None:
+        capture_date = resolve_capture_date(records)
+
+    if rod_length_cm is None:
+        rod_length_cm = next(
+            (record.rod_length_cm for record in records
+             if record.rod_length_cm is not None),
+            None,
+        )
+
+    row = median_daily_record(
         day_label,
         plant_id,
-        results,
+        capture_date,
+        records,
+        rod_length_cm=rod_length_cm,
+        expected_captures=expected_captures,
     )
 
     path = (
@@ -1775,28 +2227,14 @@ def write_daily_record(
         else Path(csv_file)
     )
 
-    file_exists = path.exists()
-
-    with path.open(
-        "a",
-        newline="",
-        encoding="utf-8",
-    ) as file_handle:
-
-        writer = csv.DictWriter(
-            file_handle,
-            fieldnames=DAILY_RECORD_FIELDS,
-        )
-
-        if not file_exists:
-            writer.writeheader()
-
-        writer.writerow(row)
+    action = upsert_daily_row(path, row)
 
     print(
-        f"\nSaved daily record to: "
+        f"\n{action.capitalize()} daily record in: "
         f"{path}"
     )
+
+    return {"action": action, "row": row, "path": path}
 
 
 def cloudinary_capture_timestamp(
@@ -1817,15 +2255,22 @@ def cloudinary_capture_timestamp(
     return str(created).rstrip("Z")
 
 
-def collect_new_captures_once(
+def collect_new_capture_records_once(
     required_count: int,
     args: argparse.Namespace,
     prefix: str | None = None,
-) -> list[CaptureResult]:
+) -> list[CaptureRecord]:
     """Download and measure up to ``required_count`` new Cloudinary images.
 
-    This is a single pass and never polls, so it is safe to call from a
-    request handler. Cloudinary capture timestamps are preserved.
+    Returns an auditable record for **every** image attempted - including the
+    ones that failed - so a day with one good image out of four is visibly
+    different from a day with four. The capture date is parsed from the image
+    name (``Plant01_20261016_095000``), falling back to Cloudinary's
+    ``created_at``.
+
+    This is a single pass and never polls, so it is safe to call from a request
+    handler. A failed image is *not* marked processed, so a transient failure
+    can be retried later; a successful retry revises the same capture row.
     """
 
     new_images = find_new_cloudinary_images(
@@ -1833,17 +2278,29 @@ def collect_new_captures_once(
         prefix=prefix,
     )
 
-    results: list[CaptureResult] = []
+    records: list[CaptureRecord] = []
 
     for resource in new_images:
 
-        if len(results) >= required_count:
+        if len(records) >= required_count:
             break
 
         public_id = resource.get("public_id")
 
         if not public_id:
             continue
+
+        parsed = parse_capture_name(public_id)
+        cloud_timestamp = cloudinary_capture_timestamp(resource)
+        capture_timestamp = (
+            (parsed or {}).get("timestamp") or cloud_timestamp
+        )
+        capture_date = (parsed or {}).get("capture_date")
+        if capture_date is None and cloud_timestamp:
+            capture_date = (
+                str(cloud_timestamp).split("T")[0].split(" ")[0].strip()
+                or None
+            )
 
         local_path = BASE_DIR / f"{public_id}.jpg"
 
@@ -1857,13 +2314,13 @@ def collect_new_captures_once(
             result = process_image(
                 image,
                 args,
-                capture_number=len(results) + 1,
-                timestamp=cloudinary_capture_timestamp(
-                    resource
-                ),
+                capture_number=len(records) + 1,
+                timestamp=capture_timestamp,
+                public_id=public_id,
+                capture_date=capture_date,
             )
 
-            results.append(result)
+            records.append(capture_record_from_result(result))
 
             mark_processed(public_id)
 
@@ -1874,7 +2331,59 @@ def collect_new_captures_once(
                 file=sys.stderr,
             )
 
+            records.append(
+                failed_capture_record(
+                    public_id,
+                    str(error),
+                    capture_date=capture_date,
+                    capture_timestamp=capture_timestamp,
+                    rod_length_cm=float(args.rod_length_cm),
+                )
+            )
+
             continue
+
+    return records
+
+
+def collect_new_captures_once(
+    required_count: int,
+    args: argparse.Namespace,
+    prefix: str | None = None,
+) -> list[CaptureResult]:
+    """Backward-compatible view of the collector: valid measurements only.
+
+    Callers that need the failed captures too (to report an incomplete day)
+    should use :func:`collect_new_capture_records_once`.
+    """
+
+    records = collect_new_capture_records_once(
+        required_count,
+        args,
+        prefix=prefix,
+    )
+
+    results: list[CaptureResult] = []
+
+    for record in records:
+
+        if not record.is_valid:
+            continue
+
+        results.append(
+            CaptureResult(
+                timestamp=record.capture_timestamp or "",
+                height_cm=record.height_cm,
+                width_cm=record.width_cm,
+                leaf_count=record.leaf_count,
+                cm_per_pixel=record.cm_per_pixel,
+                confidence=record.confidence,
+                public_id=record.public_id,
+                capture_date=record.capture_date,
+                capture_time=None,
+                rod_length_cm=record.rod_length_cm,
+            )
+        )
 
     return results
 
@@ -1907,7 +2416,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--rod-length-cm",
         type=float,
-        required=True,
+        default=None,
+        help=(
+            "Physical reference-rod length in centimetres. Defaults to the "
+            "configured CAMERA_ROD_LENGTH_CM, so the CLI cannot silently "
+            "disagree with the backend."
+        ),
     )
 
     parser.add_argument(
@@ -1974,6 +2488,23 @@ def main() -> int:
 
     args = parse_args()
 
+    # One authoritative rod length: the CLI flag wins when given, otherwise the
+    # configured CAMERA_ROD_LENGTH_CM is used. It is validated before any image
+    # is processed so a bad calibration can never silently skew a measurement.
+    if args.rod_length_cm is None:
+        args.rod_length_cm = float(CONFIGURED_ROD_LENGTH_CM)
+
+    if (
+        args.rod_length_cm is None
+        or args.rod_length_cm <= 0
+        or not np.isfinite(args.rod_length_cm)
+    ):
+        print(
+            "ERROR: --rod-length-cm must be a positive number of centimetres",
+            file=sys.stderr,
+        )
+        return 1
+
     if args.captures <= 0:
         print(
             "ERROR: --captures must be at least 1",
@@ -1990,8 +2521,8 @@ def main() -> int:
 
     try:
 
-        daily_results: list[
-            CaptureResult
+        capture_records: list[
+            CaptureRecord
         ] = []
 
         # ----------------------------------------------------
@@ -2015,8 +2546,8 @@ def main() -> int:
                 capture_number=1,
             )
 
-            daily_results.append(
-                result
+            capture_records.append(
+                capture_record_from_result(result)
             )
 
         # ----------------------------------------------------
@@ -2043,12 +2574,12 @@ def main() -> int:
             )
 
             while len(
-                daily_results
+                capture_records
             ) < args.captures:
 
                 remaining = (
                     args.captures
-                    - len(daily_results)
+                    - len(capture_records)
                 )
 
                 print(
@@ -2056,13 +2587,14 @@ def main() -> int:
                     f"more image(s)."
                 )
 
-                new_images = (
-                    find_new_cloudinary_images(
-                        remaining
+                new_records = (
+                    collect_new_capture_records_once(
+                        remaining,
+                        args,
                     )
                 )
 
-                if not new_images:
+                if not new_records:
 
                     print(
                         "No new Cloudinary "
@@ -2081,80 +2613,40 @@ def main() -> int:
 
                     continue
 
-                for resource in new_images:
-
-                    if len(
-                        daily_results
-                    ) >= args.captures:
-                        break
-
-                    public_id = resource[
-                        "public_id"
-                    ]
-
-                    print(
-                        "\n--------------------------------"
-                    )
-
-                    print(
-                        f"Processing Cloudinary image:"
-                    )
-
-                    print(
-                        f"  {public_id}"
-                    )
-
-                    local_path = (
-                        BASE_DIR
-                        / (
-                            f"{public_id}.jpg"
-                        )
-                    )
-
-                    try:
-                        image = download_cloudinary_image(
-                            resource,
-                            local_path,
-                        )
-
-                        capture_number = (
-                            len(daily_results) + 1
-                        )
-
-                        result = process_image(
-                            image,
-                            args,
-                            capture_number=capture_number,
-                        )
-
-                        daily_results.append(
-                            result
-                        )
-
-                        mark_processed(
-                            public_id
-                        )
-
-                    except Exception as error:
-                        print(
-                            f"Failed to process {public_id}: "
-                            f"{error}",
-                            file=sys.stderr,
-                        )
-                        continue
+                capture_records.extend(
+                    new_records
+                )
 
         # ----------------------------------------------------
-        # RECORD RESULTS
+        # RECORD RESULTS - one row per plant per calendar date
         # ----------------------------------------------------
 
-        if daily_results:
+        if capture_records:
+
             day_label = f"Day-{args.day:02d}"
 
-            write_daily_record(
-                day_label,
-                args.plant_id,
-                daily_results,
+            grouped = group_records_by_date(
+                capture_records
             )
+
+            for capture_date, group in sorted(
+                grouped.items(),
+                key=lambda item: item[0] or "",
+            ):
+
+                print(
+                    f"\nDaily date: "
+                    f"{capture_date or 'unplaceable'}"
+                )
+
+                write_daily_record(
+                    day_label=day_label,
+                    plant_id=args.plant_id,
+                    results=[],
+                    capture_date=capture_date,
+                    records=group,
+                    rod_length_cm=args.rod_length_cm,
+                )
 
     except Exception as error:
         print(

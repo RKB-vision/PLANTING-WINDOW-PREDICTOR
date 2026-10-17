@@ -32,9 +32,12 @@ from __future__ import annotations
 
 import csv
 import io
+import json
+import statistics
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from . import calibration
 from . import config
 from . import db as dbm
 from .repository import BaseRepository, DuplicateRecordError, ValidationError
@@ -44,6 +47,28 @@ CAMERA_REQUIRED_COLUMNS = (
     "average_height_cm",
     "first_capture_timestamp",
 )
+
+# Columns the four-capture aggregation adds. Each is optional so a CSV produced
+# by the older pipeline (or a hand-written row) still imports.
+CAMERA_OPTIONAL_COLUMNS = (
+    "capture_date",
+    "rod_length_cm",
+    "expected_captures",
+    "processed_captures",
+    "valid_captures",
+    "failed_captures",
+    "incomplete",
+    "low_confidence",
+    "median_height_cm",
+    "median_width_cm",
+    "median_visible_leaves",
+    "capture_ids",
+    "captures_json",
+    "problems",
+)
+
+VALID_CAPTURE = "valid"
+FAILED_CAPTURE = "failed"
 
 
 def _to_float(value: Any) -> Optional[float]:
@@ -59,11 +84,81 @@ def _to_leaf_count(value: Any) -> Optional[int]:
     return max(0, int(round(f)))
 
 
+def _first_present(row: dict[str, Any], *names: str) -> Any:
+    """First column that is present and non-empty (median* preferred over mean)."""
+    for name in names:
+        value = row.get(name)
+        if value is not None and str(value).strip() != "":
+            return value
+    return None
+
+
+def _to_int(value: Any) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    return int(float(value))
+
+
+def _safe_float(value: Any) -> Optional[float]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> Optional[int]:
+    if value is None or str(value).strip() == "":
+        return None
+    try:
+        return max(0, int(round(float(value))))
+    except (TypeError, ValueError):
+        return None
+
+
+def _median(values) -> Optional[float]:
+    numbers = [float(v) for v in values if v is not None]
+    if not numbers:
+        return None
+    return float(statistics.median(numbers))
+
+
+def _parse_captures_json(raw: Any) -> list[dict[str, Any]]:
+    """Decode the per-capture audit column (empty/invalid -> no captures)."""
+    if raw is None or str(raw).strip() == "":
+        return []
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, dict)]
+
+
+def _previous_observation(repo: BaseRepository, plant_id: int,
+                          obs_date: str) -> Optional[dict]:
+    """Latest stored daily observation strictly *before* ``obs_date``.
+
+    Using the previous *daily* record (not the previous image) is what keeps
+    four images of one day from being treated as four days of growth.
+    """
+    previous: Optional[dict] = None
+    for row in repo.get_observations(plant_id):
+        day = str(row.get("observation_date") or "")
+        if not day or day >= obs_date:
+            continue
+        if previous is None or day > str(previous.get("observation_date")):
+            previous = row
+    return previous
+
+
 def import_camera_measurements(
     repo: BaseRepository,
     source: Union[str, Path, io.StringIO, io.TextIOBase],
     *,
-    default_species: str = "Super Orange",
+    default_species: Optional[str] = None,
     default_variety: Optional[str] = None,
     auto_register: bool = True,
     data_source: str = "real",
@@ -96,7 +191,14 @@ def import_camera_measurements(
     report: dict[str, Any] = {
         "rows_read": 0,
         "observations_inserted": 0,
+        "observations_updated": 0,
         "observations_skipped_duplicate": 0,
+        "captures_recorded": 0,
+        "captures_unchanged": 0,
+        "failed_captures": 0,
+        "daily_records_recomputed": 0,
+        "incomplete_days": 0,
+        "low_confidence_records": 0,
         "plants_registered": 0,
         "unmatched_plants": [],
         "issues": [],
@@ -145,34 +247,55 @@ def import_camera_measurements(
                 )
                 continue
 
-            # Extract date from first_capture_timestamp or last_capture_timestamp
-            ts = (
-                row.get("first_capture_timestamp")
-                or row.get("last_capture_timestamp")
-                or ""
-            ).strip()
-            if not ts:
-                report["issues"].append(
-                    {"line": line_no, "problem": "Missing capture timestamp."}
-                )
-                continue
+            # Which day this row summarises. Prefer an explicit capture_date;
+            # otherwise fall back to the capture timestamp, as before.
+            raw_capture_date = (row.get("capture_date") or "").strip()
+            if raw_capture_date:
+                try:
+                    obs_date = dbm.parse_iso_date(raw_capture_date, "capture_date")
+                except Exception as exc:
+                    report["issues"].append(
+                        {"line": line_no,
+                         "problem": f"Invalid capture_date '{raw_capture_date}': {exc}"}
+                    )
+                    continue
+            else:
+                ts = (
+                    row.get("first_capture_timestamp")
+                    or row.get("last_capture_timestamp")
+                    or ""
+                ).strip()
+                if not ts:
+                    report["issues"].append(
+                        {"line": line_no, "problem": "Missing capture timestamp."}
+                    )
+                    continue
+                # ISO '2026-10-08T11:26:08' or a plain '2026-10-08'
+                date_str = ts.split("T")[0].split(" ")[0].strip()
+                try:
+                    obs_date = dbm.parse_iso_date(date_str, "capture timestamp")
+                except Exception as exc:
+                    report["issues"].append(
+                        {"line": line_no,
+                         "problem": f"Invalid timestamp '{ts}': {exc}"}
+                    )
+                    continue
 
-            # Handle ISO string like '2026-10-08T11:26:08' or '2026-10-08'
-            date_str = ts.split("T")[0].split(" ")[0].strip()
-            try:
-                obs_date = dbm.parse_iso_date(date_str, "capture timestamp")
-            except Exception as exc:
-                report["issues"].append(
-                    {"line": line_no, "problem": f"Invalid timestamp '{ts}': {exc}"}
-                )
-                continue
+            obs_date_iso = obs_date.isoformat()
 
-            # Parse height
+            # Prefer the median aggregate when the row carries one; fall back to
+            # the legacy mean columns so older CSVs keep importing.
+            height_label = (
+                "median_height_cm"
+                if str(row.get("median_height_cm") or "").strip()
+                else "average_height_cm"
+            )
             try:
-                height = _to_float(row.get("average_height_cm"))
+                height = _to_float(
+                    _first_present(row, "median_height_cm", "average_height_cm"))
             except (TypeError, ValueError) as exc:
                 report["issues"].append(
-                    {"line": line_no, "problem": f"Bad average_height_cm: {exc}"}
+                    {"line": line_no, "problem": f"Bad {height_label}: {exc}"}
                 )
                 continue
 
@@ -180,7 +303,8 @@ def import_camera_measurements(
                 report["issues"].append(
                     {
                         "line": line_no,
-                        "problem": "Missing average_height_cm; row skipped (no fabricated data).",
+                        "problem": f"Missing {height_label}; row skipped "
+                                   "(no fabricated data).",
                     }
                 )
                 continue
@@ -194,21 +318,39 @@ def import_camera_measurements(
                 )
                 continue
 
-            # Parse leaves if present
+            # Optional measurements. Only used when actually present.
             try:
-                leaves = _to_leaf_count(row.get("average_visible_leaves"))
+                leaves = _to_leaf_count(
+                    _first_present(row, "median_visible_leaves",
+                                   "average_visible_leaves"))
             except (TypeError, ValueError):
                 leaves = None
 
-            # Parse STEM width if present. This is deliberately stored as
-            # stem_width_cm, never canopy_width_cm.
+            # STEM width, deliberately stored as stem_width_cm - never canopy.
             try:
-                stem_width = _to_float(row.get("average_width_cm"))
+                stem_width = _to_float(
+                    _first_present(row, "median_width_cm", "average_width_cm"))
             except (TypeError, ValueError) as exc:
                 report["issues"].append(
-                    {"line": line_no, "problem": f"Bad average_width_cm: {exc}"}
+                    {"line": line_no, "problem": f"Bad stem width: {exc}"}
                 )
                 continue
+
+            # Effective calibration for this row. Recorded, never guessed: a
+            # missing value falls back to the configured rod length because the
+            # pipeline that produced the CSV used exactly that.
+            try:
+                row_rod_length = _to_float(row.get("rod_length_cm"))
+            except (TypeError, ValueError):
+                row_rod_length = None
+            if row_rod_length is None:
+                row_rod_length = float(config.CAMERA_ROD_LENGTH_CM)
+
+            captures = _parse_captures_json(row.get("captures_json"))
+            if _to_int(row.get("incomplete")):
+                report["incomplete_days"] += 1
+            if _to_int(row.get("low_confidence")):
+                report["low_confidence_records"] += 1
 
             # Resolve plant in database
             target_plant = ref_to_plant.get(raw_id.lower())
@@ -218,7 +360,7 @@ def import_camera_measurements(
             if target_plant is None:
                 if auto_register:
                     new_id = repo.register_plant(
-                        species=default_species,
+                        species=default_species or config.DEFAULT_SPECIES,
                         variety=default_variety,
                         external_ref=raw_id,
                         data_source=data_source,
@@ -244,49 +386,139 @@ def import_camera_measurements(
 
             plant_id = int(target_plant["plant_id"])
 
-            # Derive age_days and growth_rate if possible
+            # ------------------------------------------------------------------
+            # 1. Persist each individual capture (idempotent by public_id).
+            #    Re-processing the same image never counts it twice.
+            # ------------------------------------------------------------------
+            state = repo.current_calibration_setting()
+            rod_verified = calibration.verification_applies(state, row_rod_length)
+            captures_recorded = 0
+            failed_captures = 0
+
+            for capture in captures:
+                public_id = capture.get("public_id")
+                if not public_id:
+                    continue
+                capture_rod = _safe_float(capture.get("rod_length_cm"))
+                if capture_rod is None:
+                    capture_rod = row_rod_length
+                validity = str(capture.get("validity") or VALID_CAPTURE)
+                if validity not in dbm.CAPTURE_VALIDITIES:
+                    validity = VALID_CAPTURE
+                try:
+                    outcome = repo.add_capture(
+                        plant_id=plant_id,
+                        public_id=str(public_id),
+                        observation_date=obs_date_iso,
+                        validity=validity,
+                        rod_length_cm=capture_rod,
+                        calibration_source=config.CALIBRATION_SOURCE_CAMERA,
+                        calibration_verified=rod_verified,
+                        capture_timestamp=capture.get("capture_timestamp"),
+                        height_cm=_safe_float(capture.get("height_cm")),
+                        stem_width_cm=_safe_float(capture.get("width_cm")),
+                        visible_true_leaf_count=_safe_int(capture.get("leaf_count")),
+                        cm_per_pixel=_safe_float(capture.get("cm_per_pixel")),
+                        confidence=_safe_float(capture.get("confidence")),
+                        problem=capture.get("problem"),
+                        data_source=data_source,
+                    )
+                except (ValidationError, DuplicateRecordError) as exc:
+                    report["issues"].append(
+                        {"line": line_no,
+                         "problem": f"Capture {public_id}: {exc}"}
+                    )
+                    continue
+                if outcome.get("created"):
+                    report["captures_recorded"] += 1
+                    captures_recorded += 1
+                else:
+                    report["captures_unchanged"] += 1
+                if validity == FAILED_CAPTURE:
+                    failed_captures += 1
+
+            report["failed_captures"] += failed_captures
+
+            # ------------------------------------------------------------------
+            # 2. The daily value. When individual captures are stored for this
+            #    date, the median is recomputed from ALL of them (previous
+            #    captures included) so a later capture the same day improves the
+            #    day's record instead of being discarded. Otherwise the row's
+            #    own aggregate is used.
+            # ------------------------------------------------------------------
+            stored_valid = [
+                capture for capture in repo.captures_on_date(plant_id, obs_date_iso)
+                if capture.get("validity") == VALID_CAPTURE
+            ]
+
+            if stored_valid:
+                height = _median(c.get("height_cm") for c in stored_valid)
+                stem_width = _median(c.get("stem_width_cm") for c in stored_valid)
+                leaves = _median(c.get("visible_true_leaf_count")
+                                 for c in stored_valid)
+                if height is None:
+                    report["issues"].append(
+                        {"line": line_no,
+                         "problem": "No stored capture on this date has a usable "
+                                    "height; the day is recorded without one."}
+                    )
+                    continue
+                valid_captures = len(stored_valid)
+                report["daily_records_recomputed"] += 1
+            else:
+                valid_captures = _to_int(row.get("valid_captures"))
+
+            # ------------------------------------------------------------------
+            # 3. Age (only from a real planting date) and growth rate (only from
+            #    a previous DAILY record, using real elapsed days).
+            # ------------------------------------------------------------------
             age_days = None
             if target_plant.get("date_started"):
                 try:
                     delta = dbm.days_between(
-                        target_plant["date_started"], obs_date.isoformat()
-                    )
+                        target_plant["date_started"], obs_date_iso)
                     if delta >= 0:
                         age_days = delta
                 except Exception:
                     pass
 
             growth_rate = None
-            try:
-                latest = repo.latest_observation(plant_id)
-                if (
-                    latest
-                    and latest.get("height_cm") is not None
-                    and latest.get("observation_date")
-                ):
-                    span = dbm.days_between(
-                        latest["observation_date"], obs_date.isoformat()
-                    )
-                    if span > 0:
-                        delta_h = float(height) - float(latest["height_cm"])
-                        growth_rate = round(delta_h / span, 4)
-            except Exception:
-                pass
+            previous = _previous_observation(repo, plant_id, obs_date_iso)
+            if (previous and previous.get("height_cm") is not None
+                    and previous.get("observation_date")):
+                span = dbm.days_between(
+                    previous["observation_date"], obs_date_iso)
+                if span > 0:
+                    growth_rate = round(
+                        (float(height) - float(previous["height_cm"])) / span, 4)
 
-            # Insert observation
+            # ------------------------------------------------------------------
+            # 4. Insert or recompute the single daily observation.
+            # ------------------------------------------------------------------
             try:
-                repo.add_observation(
+                result = repo.upsert_daily_observation(
                     plant_id=plant_id,
-                    observation_date=obs_date.isoformat(),
-                    height_cm=height,
+                    observation_date=obs_date_iso,
                     age_days=age_days,
+                    height_cm=height,
                     growth_rate_cm_per_day=growth_rate,
                     canopy_width_cm=None,  # stem width is NOT canopy width
                     stem_width_cm=stem_width,
-                    visible_true_leaf_count=leaves,
+                    visible_true_leaf_count=(
+                        None if leaves is None else int(round(leaves))),
+                    rod_length_cm=row_rod_length,
+                    calibration_source=config.CALIBRATION_SOURCE_CAMERA,
+                    calibration_verified=rod_verified,
                     data_source=data_source,
+                    reason="camera import",
                 )
-                report["observations_inserted"] += 1
+                action = result.get("action")
+                if action == "inserted":
+                    report["observations_inserted"] += 1
+                elif action == "updated":
+                    report["observations_updated"] += 1
+                else:
+                    report["observations_skipped_duplicate"] += 1
             except DuplicateRecordError:
                 report["observations_skipped_duplicate"] += 1
             except ValidationError as exc:

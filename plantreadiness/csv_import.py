@@ -30,6 +30,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Optional
 
+from . import config
 from . import db as dbm
 
 REQUIRED_COLUMNS = ("Date", "Age_days", "Plant_ID", "Height_cm")
@@ -143,7 +144,8 @@ def _to_int(value: Optional[str]) -> Optional[int]:
 REFERENCE_COHORT = "reference"
 
 
-def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
+def import_csv(conn, csv_path: str | Path,
+               species: str = config.DEFAULT_SPECIES,
                variety: Optional[str] = None,
                date_started: Optional[str] = None,
                cohort: str = REFERENCE_COHORT) -> dict:
@@ -254,6 +256,7 @@ def import_csv(conn, csv_path: str | Path, species: str = "Super Orange",
                     height_cm=height,
                     growth_rate_cm_per_day=growth,
                     data_source="real",
+                    calibration_source=config.CALIBRATION_SOURCE_CSV,
                 )
                 report["observations_inserted"] += 1
             except dbm.DuplicateRecordError:
