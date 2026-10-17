@@ -1070,29 +1070,70 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
     reader = csv.DictReader(io.StringIO(csv_text))
     if reader.fieldnames is None:
         raise ValidationError("CSV has no header row.")
+    # Normalise header names (strip whitespace) and row keys/values, mirroring
+    # plantreadiness.csv_import so the shipped CSV (headers like " Age") works.
+    reader.fieldnames = [str(n).strip() for n in reader.fieldnames]
     fieldnames = list(reader.fieldnames)
-    missing = [c for c in ("Date", "Age_days", "Plant_ID", "Height_cm")
-               if c not in fieldnames]
+
+    def _col(*names):
+        for n in names:
+            if n in fieldnames:
+                return n
+        return None
+
+    date_col = _col("Date")
+    plant_col = _col("Plant_ID")
+    height_col = _col("Height_cm")
+    age_col = _col("Age_days", "Age")
+    growth_col = _col("Growth_rate_cm_per_day")
+
+    missing = []
+    if date_col is None:
+        missing.append("Date")
+    if plant_col is None:
+        missing.append("Plant_ID")
+    if height_col is None:
+        missing.append("Height_cm")
+    if age_col is None:
+        missing.append("Age_days")
     if missing:
         raise ValidationError(
             f"CSV is missing required columns: {missing}. "
             f"Found: {fieldnames}")
 
+    def _parse_date_val(value):
+        text = (value or "").strip()
+        try:
+            return parse_iso_date(text, "Date")
+        except ValidationError:
+            from datetime import datetime as _dt
+            for fmt in ("%d-%m-%Y", "%d/%m/%Y"):
+                try:
+                    return _dt.strptime(text, fmt).date()
+                except ValueError:
+                    continue
+            raise
+
     rows: list[dict] = []
     issues: list[dict] = []
-    for line_no, row in enumerate(reader, start=2):
-        ref = (row.get("Plant_ID") or "").strip()
+    for line_no, raw in enumerate(reader, start=2):
+        row = {str(k).strip(): (v.strip() if isinstance(v, str) else v)
+               for k, v in raw.items()}
+        ref = (row.get(plant_col) or "").strip()
         if not ref:
             issues.append({"line": line_no, "problem": "missing Plant_ID"})
             continue
         try:
-            obs_date = parse_iso_date((row.get("Date") or "").strip(), "Date")
+            obs_date = _parse_date_val(row.get(date_col))
         except ValidationError as exc:
             issues.append({"line": line_no, "problem": str(exc)})
             continue
+        except ValueError as exc:
+            issues.append({"line": line_no, "problem": str(exc)})
+            continue
         try:
-            height = float(row["Height_cm"]) if (
-                row.get("Height_cm") or "").strip() else None
+            height_txt = (row.get(height_col) or "").strip()
+            height = float(height_txt) if height_txt else None
         except (TypeError, ValueError) as exc:
             issues.append({"line": line_no,
                            "problem": f"bad numeric value: {exc}"})
@@ -1107,11 +1148,20 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
                            "problem": "Height_cm must be >= 0"})
             continue
         try:
-            age = int(float(row["Age_days"])) if (
-                row.get("Age_days") or "").strip() else None
-            growth = (float(row["Growth_rate_cm_per_day"])
-                      if (row.get("Growth_rate_cm_per_day") or "").strip()
-                      else None)
+            age_txt = (row.get(age_col) or "").strip()
+            if age_txt:
+                txt = age_txt.lower()
+                for suffix in (" days", " day", "days", "day"):
+                    if txt.endswith(suffix):
+                        txt = txt[: -len(suffix)].strip()
+                        break
+                if txt.endswith("d"):
+                    txt = txt[:-1].strip()
+                age = int(float(txt)) if txt else None
+            else:
+                age = None
+            growth_txt = (row.get(growth_col) or "").strip() if growth_col else ""
+            growth = float(growth_txt) if growth_txt else None
         except (TypeError, ValueError) as exc:
             issues.append({"line": line_no,
                            "problem": f"bad numeric value: {exc}"})

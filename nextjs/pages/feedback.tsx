@@ -271,8 +271,10 @@ export default function FeedbackPage() {
       })
       const data = resp.data
       setUploadResult(
-        `Imported ${data.observations_inserted} observations for ` +
-        `${data.plants_new?.length ?? 0} new plant(s). Baseline ` +
+        `Imported ${data.observations_inserted} new observation(s) ` +
+        `(${data.observations_skipped_duplicate ?? 0} already present) ` +
+        `across ${(data.preview?.plants_in_file ?? []).length} plant(s) ` +
+        `in the file. Baseline ` +
         (data.baseline ? 'built.' : 'not built.')
       )
       if (sp === selectedSpecies) {
