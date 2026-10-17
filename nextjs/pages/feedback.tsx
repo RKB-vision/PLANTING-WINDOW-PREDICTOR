@@ -891,6 +891,25 @@ export default function FeedbackPage() {
             />
           </div>
           <div className="field">
+            <label className="label" htmlFor="upload-file">CSV file</label>
+            <input
+              id="upload-file"
+              className="input"
+              type="file"
+              accept=".csv,text/csv,text/plain"
+              onChange={e => {
+                const f = e.target.files && e.target.files[0]
+                if (!f) return
+                const reader = new FileReader()
+                reader.onload = () => setUploadCsv(String(reader.result || ''))
+                reader.readAsText(f)
+              }}
+            />
+            <p className="muted small" style={{ marginTop: 6 }}>
+              Or paste the CSV below.
+            </p>
+          </div>
+          <div className="field">
             <label className="label" htmlFor="upload-csv">CSV contents</label>
             <textarea
               id="upload-csv"
