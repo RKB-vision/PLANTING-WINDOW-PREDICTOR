@@ -121,6 +121,12 @@ export default function FeedbackPage() {
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<TabKey>('feedback')
 
+  // dataset upload (Feedback -> Reference tab)
+  const [uploadCsv, setUploadCsv] = useState('')
+  const [uploadSpecies, setUploadSpecies] = useState('')
+  const [uploadBusy, setUploadBusy] = useState(false)
+  const [uploadResult, setUploadResult] = useState<string | null>(null)
+
   // assessment form
   const [assessPlant, setAssessPlant] = useState('')
   const [assessDate, setAssessDate] = useState('')
@@ -242,6 +248,50 @@ export default function FeedbackPage() {
       setMessage('Reference baseline built from stored measurements.')
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Failed to build baseline.')
+    }
+  }
+
+  const submitUpload = async () => {
+    setError(null)
+    setUploadResult(null)
+    if (!uploadCsv.trim()) {
+      setError('Paste a CSV (with at least Date, Age/ Age_days, Plant_ID, Height_cm).')
+      return
+    }
+    const sp = (uploadSpecies || selectedSpecies).trim()
+    if (!sp) {
+      setError('Species is required.')
+      return
+    }
+    setUploadBusy(true)
+    try {
+      const resp = await axios.post('/api/import', {
+        csv_text: uploadCsv,
+        species: sp,
+      })
+      const data = resp.data
+      setUploadResult(
+        `Imported ${data.observations_inserted} observations for ` +
+        `${data.plants_new?.length ?? 0} new plant(s). Baseline ` +
+        (data.baseline ? 'built.' : 'not built.')
+      )
+      if (sp === selectedSpecies) {
+        loadBaseline(sp)
+      }
+      // refresh species list
+      loadPlants()
+    } catch (e: any) {
+      setError(e?.response?.data?.error || 'Upload failed.')
+      const issues = e?.response?.data?.issues
+      if (Array.isArray(issues) && issues.length) {
+        setError(
+          (e?.response?.data?.error || 'Upload failed.') +
+          ' Issues: ' +
+          issues.map((i: any) => `line ${i.line}: ${i.problem}`).join('; ')
+        )
+      }
+    } finally {
+      setUploadBusy(false)
     }
   }
 
@@ -733,7 +783,8 @@ export default function FeedbackPage() {
       )}
 
       {tab === 'reference' && (
-        <section className="card">
+        <>
+          <section className="card">
           <div className="row-between" style={{ marginBottom: 4 }}>
             <h2 className="card-title">Successful-cohort reference</h2>
             {baseline && (
@@ -820,6 +871,52 @@ export default function FeedbackPage() {
             <p className="muted">Loading reference…</p>
           )}
         </section>
+
+        <section className="card" style={{ marginTop: 16 }}>
+          <h2 className="card-title">Add dataset (CSV)</h2>
+          <p className="card-hint">
+            Upload a measurement CSV (Date, Age/Age_days, Plant_ID, Height_cm;
+            growth rate and widths are optional) to bootstrap a reference
+            baseline and start predicting from day 1. The whole file must
+            validate before anything is written.
+          </p>
+          <div className="field">
+            <label className="label" htmlFor="upload-species">Species</label>
+            <input
+              id="upload-species"
+              className="input"
+              value={uploadSpecies}
+              onChange={e => setUploadSpecies(e.target.value)}
+              placeholder={selectedSpecies || 'e.g. Sunflower (SuperOrange)'}
+            />
+          </div>
+          <div className="field">
+            <label className="label" htmlFor="upload-csv">CSV contents</label>
+            <textarea
+              id="upload-csv"
+              className="textarea"
+              rows={8}
+              value={uploadCsv}
+              onChange={e => setUploadCsv(e.target.value)}
+              placeholder={'Date,Age_days,Plant_ID,Height_cm\n2083-05-02,2,P1,1.0'}
+            />
+          </div>
+          <div className="btn-row" style={{ marginTop: 14 }}>
+            <button
+              className="btn"
+              onClick={submitUpload}
+              disabled={uploadBusy}
+            >
+              {uploadBusy ? 'Uploading…' : 'Upload dataset'}
+            </button>
+          </div>
+          {uploadResult && (
+            <div className="alert alert-success" style={{ marginTop: 12 }}>
+              {uploadResult}
+            </div>
+          )}
+        </section>
+      </>
       )}
 
       {tab === 'evaluation' && (
