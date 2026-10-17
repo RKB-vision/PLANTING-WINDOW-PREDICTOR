@@ -240,7 +240,7 @@ export default function FeedbackPage() {
   const buildBaseline = async () => {
     setError(null)
     try {
-      const resp = await axios.post('/api/reference/build', {
+      const resp = await axios.post('/api/reference', {
         species: selectedSpecies,
       })
       setBaseline(resp.data)
