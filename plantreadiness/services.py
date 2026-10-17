@@ -1131,6 +1131,15 @@ def preview_csv_import(csv_text: str, *, existing_plants: Iterable[str] = ()
     new_refs = [r for r in refs if r not in existing]
     known_rows = [r for r in rows if r["plant_ref"] in existing]
     new_rows = [r for r in rows if r["plant_ref"] not in existing]
+    # All-or-nothing: a duplicate (Plant_ID, Date) inside the file is a hard
+    # rejection for the upload path (the importer still skips such rows).
+    seen_keys = set()
+    for r in rows:
+        key = (r["plant_ref"], r["date"])
+        if key in seen_keys:
+            issues.append({"line": r["line"],
+                           "problem": "duplicate (Plant_ID, Date) within file"})
+        seen_keys.add(key)
     return {
         "valid": not issues,
         "fieldnames": fieldnames,
@@ -1160,6 +1169,8 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
                      if p.get("external_ref")}
     preview = preview_csv_import(csv_text, existing_plants=existing_refs)
 
+    _, rows, _ = _parse_csv_text(csv_text)
+
     report = {
         "dry_run": dry_run,
         "rows_read": preview["rows_total"],
@@ -1169,8 +1180,14 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
         "observations_skipped_duplicate": 0,
         "issues": preview["issues"],
         "preview": preview,
+        "rejected": False,
     }
     if dry_run:
+        return report
+
+    # All-or-nothing: refuse to write if any row is invalid.
+    if preview["issues"]:
+        report["rejected"] = True
         return report
 
     ref_to_id: dict[str, int] = {p["external_ref"]: p["plant_id"]
@@ -1178,9 +1195,9 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
     for ref in preview["plants_new"]:
         ref_to_id[ref] = repo.register_plant(
             species=species, variety=variety, date_started=date_started,
-            data_source="real", external_ref=ref)
+            data_source="real", external_ref=ref,
+            cohort="manual_upload")
 
-    _, rows, _ = _parse_csv_text(csv_text)
     existing_dates = {(r["plant_id"], r["observation_date"])
                       for r in _existing_observations(repo, ref_to_id.values())}
     for row in rows:
@@ -1195,12 +1212,14 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
                 plant_id=pid, observation_date=row["date"],
                 age_days=row["age_days"], height_cm=row["height_cm"],
                 growth_rate_cm_per_day=row["growth_rate_cm_per_day"],
-                data_source="real")
+                data_source="real",
+                calibration_source=config.CALIBRATION_SOURCE_CSV)
             report["observations_inserted"] += 1
             existing_dates.add((pid, row["date"]))
         except DuplicateRecordError:
             report["observations_skipped_duplicate"] += 1
         except ValidationError as exc:
+            # Should not happen after validation, but if it does, record it.
             report["issues"].append({"line": row["line"], "problem": str(exc)})
     return report
 

@@ -141,10 +141,6 @@ def test_deferral_is_not_counted_as_transplant(tmp_path):
     assert result["n_predictions_evaluated"] == 0
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "AUD-03: services.run_csv_import stores rows with calibration_source=NULL, "
-    "so uploaded manual data is quarantined (group=unknown) and can never feed "
-    "a provisional baseline."))
 def test_uploaded_manual_data_is_baseline_usable(tmp_path):
     repo, conn = _repo(tmp_path)
     csv_text = "Date,Age_days,Plant_ID,Height_cm\n" + "\n".join(
@@ -158,9 +154,6 @@ def test_uploaded_manual_data_is_baseline_usable(tmp_path):
     assert groups["usable_rows"] == len(rows)
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "AUD-04: run_csv_import commits the good rows even when other rows are "
-    "invalid; the manual upload is not all-or-nothing."))
 def test_manual_upload_is_all_or_nothing(tmp_path):
     repo, conn = _repo(tmp_path)
     csv_text = ("Date,Age_days,Plant_ID,Height_cm\n"

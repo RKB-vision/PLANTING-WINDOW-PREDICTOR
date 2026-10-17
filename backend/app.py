@@ -325,6 +325,63 @@ def build_reference():
         conn.close()
 
 
+@app.route('/api/import', methods=['POST'])
+def import_dataset():
+    """Import a measurement CSV and (on success) build the reference baseline.
+
+    Accepts either a multipart upload (field ``file``) or a JSON body with
+    ``csv_text``/``csv``. Required: ``species``. Optional: ``variety``,
+    ``date_started``. The whole file must validate before anything is written
+    (all-or-nothing); on success the reference baseline is rebuilt so
+    predictions work from the first day.
+    """
+    # Resolve CSV text from either transport.
+    csv_text = None
+    species = ''
+    variety = None
+    date_started = None
+    if request.files and 'file' in request.files:
+        f = request.files['file']
+        try:
+            csv_text = f.read().decode('utf-8-sig')
+        except UnicodeDecodeError:
+            return jsonify({'error': 'file is not valid UTF-8 text'}), 400
+        species = (request.form.get('species') or '').strip()
+        variety = _clean_variety(request.form.get('variety'))
+        date_started = request.form.get('date_started')
+    else:
+        data = request.get_json(silent=True) or {}
+        csv_text = data.get('csv_text') or data.get('csv')
+        species = str(data.get('species', '')).strip()
+        variety = _clean_variety(data.get('variety'))
+        date_started = data.get('date_started')
+    if not csv_text or not str(csv_text).strip():
+        return jsonify({'error': 'csv text is required (field "file" or "csv_text")'}), 400
+    if not species:
+        return jsonify({'error': 'species is required'}), 400
+
+    conn = dbm.connect(DB_PATH)
+    try:
+        repo = SQLiteRepository(conn)
+        report = svc.run_csv_import(
+            repo, str(csv_text), species=species, variety=variety,
+            date_started=date_started, dry_run=False)
+        if report.get('issues'):
+            return jsonify(report), 400
+        # Auto-build the reference baseline so predictions work from day 1.
+        try:
+            baseline = svc.build_reference_baseline(
+                repo, species, models_dir=MODELS_DIR, variety=variety)
+            report['baseline'] = baseline
+        except Exception as exc:  # baseline build is best-effort; import succeeded
+            report['baseline_error'] = str(exc)
+        return jsonify(report)
+    except Exception as e:
+        return _error_response(e)
+    finally:
+        conn.close()
+
+
 @app.route('/api/assessments', methods=['GET', 'POST'])
 def readiness_assessments():
     """Read or record the user's readiness judgement."""

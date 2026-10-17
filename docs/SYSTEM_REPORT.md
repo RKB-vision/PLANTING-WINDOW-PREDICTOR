@@ -110,6 +110,9 @@ Endpoints (selected):
 - `GET /api/species` — species catalog (with observation counts, available dates, readiness-event counts)
 - `POST /api/predict/species` — species-level prediction
 - `POST /api/camera/refresh` — trigger camera refresh
+- `POST /api/import` — upload a measurement CSV (JSON `csv_text` or multipart
+  `file`), all-or-nothing; auto-builds the reference baseline so predictions
+  work from day 1
 - `GET /api/reference` — reference baseline summary
 - `GET /api/calibration` — calibration status
 
