@@ -228,14 +228,18 @@ def import_camera_measurements(
                 f"Found: {list(reader.fieldnames)}"
             )
 
-        # Cache existing plants by external_ref
+        # Cache existing plants by external_ref (normalised so that harmless
+        # spelling variations such as Plant01 / Plant-01 / Plant_01 resolve to
+        # the same plant). A normalised key that maps to more than one plant is
+        # recorded as ambiguous and never silently collapsed.
         existing_plants = repo.list_plants()
-        ref_to_plant: dict[str, dict] = {}
+        ref_to_plants: dict[str, list[dict]] = {}
         id_to_plant: dict[int, dict] = {}
         for p in existing_plants:
             if p.get("external_ref"):
-                ref_to_plant[str(p["external_ref"]).strip().lower()] = p
-            ref_to_plant[str(p["plant_id"])] = p
+                key = config.normalize_plant_ref(p["external_ref"])
+                ref_to_plants.setdefault(key, []).append(p)
+            ref_to_plants.setdefault(str(p["plant_id"]), []).append(p)
             id_to_plant[int(p["plant_id"])] = p
 
         for line_no, row in enumerate(reader, start=2):
@@ -352,10 +356,31 @@ def import_camera_measurements(
             if _to_int(row.get("low_confidence")):
                 report["low_confidence_records"] += 1
 
-            # Resolve plant in database
-            target_plant = ref_to_plant.get(raw_id.lower())
-            if target_plant is None and raw_id.isdigit():
-                target_plant = id_to_plant.get(int(raw_id))
+            # Resolve plant in database (normalised key; ambiguous mappings are
+            # quarantined, never silently collapsed).
+            norm_id = config.normalize_plant_ref(raw_id)
+            candidates = ref_to_plants.get(norm_id, [])
+            if not candidates and raw_id.isdigit():
+                candidates = [id_to_plant.get(int(raw_id))] if id_to_plant.get(int(raw_id)) else []
+
+            if len(candidates) > 1:
+                if raw_id not in report["unmatched_plants"]:
+                    report["unmatched_plants"].append(raw_id)
+                report["issues"].append(
+                    {
+                        "line": line_no,
+                        "problem": (
+                            f"Ambiguous plant reference '{raw_id}': "
+                            f"multiple registered plants normalize to "
+                            f"'{norm_id}' (ids "
+                            f"{[p.get('plant_id') for p in candidates]}). "
+                            "Quarantined; resolve the mapping manually."
+                        ),
+                    }
+                )
+                continue
+
+            target_plant = candidates[0] if candidates else None
 
             if target_plant is None:
                 if auto_register:
@@ -367,7 +392,7 @@ def import_camera_measurements(
                     )
                     target_plant = repo.get_plant(new_id)
                     if target_plant:
-                        ref_to_plant[raw_id.lower()] = target_plant
+                        ref_to_plants.setdefault(norm_id, []).append(target_plant)
                         id_to_plant[new_id] = target_plant
                         report["plants_registered"] += 1
                 else:

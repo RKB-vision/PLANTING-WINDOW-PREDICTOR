@@ -17,6 +17,20 @@ load_dotenv()
 # Paths
 # --------------------------------------------------------------------------- #
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def normalize_plant_ref(value) -> str:
+    """Canonical key for an external plant reference.
+
+    Case-, whitespace- and punctuation-insensitive so that harmless variations
+    such as ``Plant01``, ``plant01``, ``Plant-01`` and ``Plant_01`` all
+    resolve to the same key. Numeric zero-padding is preserved, so
+    ``Plant01`` and ``Plant1`` stay distinct. Species/variety are never
+    inferred from this value.
+    """
+    if value is None:
+        return ""
+    return "".join(ch for ch in str(value).strip().lower() if ch.isalnum())
 DEFAULT_DB_PATH = BASE_DIR / "plant_readiness.db"
 MODELS_DIR = BASE_DIR / "models"
 REFERENCE_DIR = MODELS_DIR / "reference"

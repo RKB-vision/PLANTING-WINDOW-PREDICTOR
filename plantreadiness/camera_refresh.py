@@ -175,8 +175,8 @@ def refresh_camera_observations(
             "message": None,
         }
 
-        plant = plants.get(external_ref.strip().lower())
-        if plant is None:
+        candidates = plants.get(config.normalize_plant_ref(external_ref), [])
+        if not candidates:
             entry["status"] = "unregistered"
             entry["message"] = (
                 f"No registered plant with external_ref '{external_ref}'. "
@@ -184,6 +184,18 @@ def refresh_camera_observations(
             )
             report["sources"].append(entry)
             continue
+
+        if len(candidates) > 1:
+            entry["status"] = "ambiguous"
+            entry["message"] = (
+                f"Ambiguous external_ref '{external_ref}': multiple registered "
+                f"plants normalize to the same key "
+                f"({[p.get('plant_id') for p in candidates]}). Quarantined."
+            )
+            report["sources"].append(entry)
+            continue
+
+        plant = candidates[0]
 
         if species and (plant.get("species") or "") != species:
             entry["status"] = "other_species"
@@ -238,13 +250,19 @@ def refresh_camera_observations(
     return report
 
 
-def _index_plants(repo: BaseRepository) -> dict[str, dict]:
-    """Look up registered plants by their (lower-cased) external reference."""
-    index: dict[str, dict] = {}
+def _index_plants(repo: BaseRepository) -> dict[str, list]:
+    """Look up registered plants by their normalised external reference.
+
+    A normalised key may map to more than one plant when two registered
+    external refs collide (e.g. ``Plant01`` and ``Plant-01``). Callers must
+    treat a multi-element value as ambiguous and quarantine the capture.
+    """
+    index: dict[str, list] = {}
     for plant in repo.list_plants():
         ref = plant.get("external_ref")
         if ref:
-            index[str(ref).strip().lower()] = plant
+            key = config.normalize_plant_ref(ref)
+            index.setdefault(key, []).append(plant)
     return index
 
 
