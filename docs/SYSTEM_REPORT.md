@@ -234,9 +234,11 @@ creates tables if absent.
    `calibration_source='csv_import_no_calibration'`).
 4. Ensure the successful-cohort reference baseline exists.
 5. Refuses to run if the CSV is missing (no wipe without a rebuild source).
+6. Clears `processed_cloudinary_ids.txt` so camera refresh can import captures
+   again after the runtime database has been rebuilt.
 
-Flags: `--no-backup`, `--rebuild-baseline`, `--camera` (also clears
-untracked camera artefacts), `--json`. Default is DB-only.
+Flags: `--no-backup`, `--rebuild-baseline`, `--camera` (also clears downloaded
+camera images and the `captures/` cache), `--json`.
 
 ---
 

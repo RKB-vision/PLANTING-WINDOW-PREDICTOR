@@ -14,6 +14,8 @@ baseline the repository ships with:
    :func:`plantreadiness.seed.seed_database` - ``data_source='real'``,
    ``cohort='reference'``, ``calibration_source='csv_import_no_calibration'``,
 4. ensure the successful-cohort reference baseline exists.
+5. clear the Cloudinary processed-ID ledger so a later refresh can backfill
+   camera observations after the database rebuild.
 
 The CSV is the single source of truth. If it is missing the reset aborts
 *before* touching the database, so a wipe can never destroy data that cannot be
@@ -87,7 +89,7 @@ def _clear_camera_artifacts(base_dir: Path) -> list[str]:
     ``plant_daily_measurements.csv``) are deliberately left alone.
     """
     removed: list[str] = []
-    patterns = ["processed_cloudinary_ids.txt", "plant_captured.jpg", "Plant*.jpg"]
+    patterns = ["plant_captured.jpg", "Plant*.jpg"]
     for pattern in patterns:
         for path in base_dir.glob(pattern):
             if path.is_file():
@@ -98,6 +100,15 @@ def _clear_camera_artifacts(base_dir: Path) -> list[str]:
         shutil.rmtree(captures)
         removed.append("captures/")
     return removed
+
+
+def _clear_processed_cloudinary_ids(base_dir: Path) -> bool:
+    """Clear the capture ledger after a DB reset so missing rows can be reimported."""
+    ledger = base_dir / "processed_cloudinary_ids.txt"
+    if not ledger.exists():
+        return False
+    ledger.unlink()
+    return True
 
 
 def _counts(db_path: Path) -> dict:
@@ -131,7 +142,8 @@ def _counts(db_path: Path) -> dict:
 def reset_database(*, db_path=None, csv_path=None, models_dir=None,
                    species: Optional[str] = None, backup: bool = True,
                    backup_dir=None, rebuild_baseline: bool = False,
-                   camera: bool = False, verbose: bool = True) -> dict:
+                   camera: bool = False, verbose: bool = True,
+                   base_dir=None) -> dict:
     """Wipe the runtime database and rebuild it from the committed CSV.
 
     Returns a JSON-serialisable report. Raises ``FileNotFoundError`` if the CSV
@@ -142,6 +154,7 @@ def reset_database(*, db_path=None, csv_path=None, models_dir=None,
     models_dir = Path(models_dir) if models_dir else config.MODELS_DIR
     backup_dir = (Path(backup_dir) if backup_dir
                   else config.GENERATED_DIR / "backups")
+    base_dir = Path(base_dir) if base_dir else config.BASE_DIR
 
     if not csv_path.exists():
         raise FileNotFoundError(
@@ -160,11 +173,15 @@ def reset_database(*, db_path=None, csv_path=None, models_dir=None,
         db_path=db_path, csv_path=csv_path, models_dir=models_dir,
         species=species, force=rebuild_baseline, verbose=False)
 
+    # The DB was rebuilt from the reference CSV, so camera IDs marked processed
+    # before the reset must be eligible for import again.
+    processed_ids_cleared = _clear_processed_cloudinary_ids(base_dir)
+
     after = _counts(db_path)
 
     camera_removed: list[str] = []
     if camera:
-        camera_removed = _clear_camera_artifacts(config.BASE_DIR)
+        camera_removed = _clear_camera_artifacts(base_dir)
 
     report = {
         "db_path": str(db_path),
@@ -176,6 +193,7 @@ def reset_database(*, db_path=None, csv_path=None, models_dir=None,
         "after": after,
         "import": seed_report.get("import"),
         "baseline": seed_report.get("baseline"),
+        "processed_cloudinary_ids_cleared": processed_ids_cleared,
         "camera_artifacts_removed": camera_removed,
     }
 
@@ -226,6 +244,8 @@ def _print_report(report: dict) -> None:
     print(f"  plants       : {after.get('plants')}")
     print(f"  observations : {after.get('observations')}")
     print(f"  captures     : {after.get('captures')}")
+    print("\nCloudinary processed-ID ledger: "
+          f"{'cleared' if report['processed_cloudinary_ids_cleared'] else 'not present'}")
 
     if report["camera_artifacts_removed"]:
         print("\ncamera artefacts removed:")
@@ -250,8 +270,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--rebuild-baseline", action="store_true",
                         help="rebuild the reference baseline even if present")
     parser.add_argument("--camera", action="store_true",
-                        help="also clear untracked camera/Cloudinary artefacts "
-                             "(processed ids, downloaded images, captures/)")
+                        help="also clear downloaded camera images and captures/")
     parser.add_argument("--json", action="store_true",
                         help="print the report as JSON instead of text")
     args = parser.parse_args(argv)

@@ -34,10 +34,13 @@ class TestReset(unittest.TestCase):
         self.tmp.cleanup()
 
     def _reset(self, **kwargs):
+        base_dir = Path(self.tmp.name) / "project"
+        base_dir.mkdir(exist_ok=True)
         kwargs.setdefault("db_path", self.db)
         kwargs.setdefault("csv_path", CSV_PATH)
         kwargs.setdefault("models_dir", self.models)
         kwargs.setdefault("backup_dir", self.backups)
+        kwargs.setdefault("base_dir", base_dir)
         kwargs.setdefault("verbose", False)
         return reset.reset_database(**kwargs)
 
@@ -141,6 +144,19 @@ class TestReset(unittest.TestCase):
                          CSV_OBSERVATIONS)
         self.assertEqual(self._counts()["plants"], CSV_PLANTS)
 
+    def test_reset_clears_processed_cloudinary_ids(self):
+        if not CSV_PATH.exists():
+            self.skipTest("real CSV not present")
+        camera_dir = Path(self.tmp.name) / "project"
+        camera_dir.mkdir()
+        ledger = camera_dir / "processed_cloudinary_ids.txt"
+        ledger.write_text("Plant02_20261020_100000\n", encoding="utf-8")
+
+        report = self._reset(base_dir=camera_dir)
+
+        self.assertTrue(report["processed_cloudinary_ids_cleared"])
+        self.assertFalse(ledger.exists())
+
     def test_reset_refuses_when_csv_missing_and_keeps_the_database(self):
         if not CSV_PATH.exists():
             self.skipTest("real CSV not present")
@@ -169,13 +185,13 @@ class TestReset(unittest.TestCase):
         removed = reset._clear_camera_artifacts(base)
 
         self.assertEqual((base / "keepme.txt").read_text(), "keep")
-        self.assertFalse((base / "processed_cloudinary_ids.txt").exists())
+        self.assertTrue((base / "processed_cloudinary_ids.txt").exists())
         self.assertFalse((base / "Plant01_20261016_105000.jpg").exists())
         self.assertTrue((base / "plant_result.jpg").exists())
         self.assertTrue((base / "plant_result_1.jpg").exists())
         self.assertFalse((base / "plant_captured.jpg").exists())
         self.assertFalse((base / "captures").exists())
-        self.assertIn("processed_cloudinary_ids.txt", removed)
+        self.assertNotIn("processed_cloudinary_ids.txt", removed)
         self.assertIn("captures/", removed)
 
 
