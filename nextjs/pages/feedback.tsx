@@ -837,30 +837,26 @@ export default function FeedbackPage() {
                     {baseline.transplant_reference.rule}
                   </p>
                 )}
-                <div className="table-wrap">
-                  <table className="table">
-                    <thead>
-                      <tr>
-                        <th>Age (d)</th>
-                        <th className="num">Plants</th>
-                        <th className="num">Median height (cm)</th>
-                        <th className="num">Median days to transplant</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {baseline.by_age_days.map(g => (
-                        <tr key={g.age_days}>
-                          <td>{g.age_days}</td>
-                          <td className="num">{g.n_plants}</td>
-                          <td className="num">{fmt(g.median_height_cm)}</td>
-                          <td className="num">
-                            {fmt(g.median_days_until_transplant)}
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                <p className="muted small" style={{ margin: '8px 0' }}>
+                  {baseline.by_age_days.length} age groups · median days to
+                  transplant ranges{' '}
+                  {fmt(
+                    Math.min(
+                      ...baseline.by_age_days.map(g =>
+                        g.median_days_until_transplant ?? 0
+                      )
+                    )
+                  )}{' '}
+                  –{' '}
+                  {fmt(
+                    Math.max(
+                      ...baseline.by_age_days.map(g =>
+                        g.median_days_until_transplant ?? 0
+                      )
+                    )
+                  )}{' '}
+                  days
+                </p>
                 <div className="subhead">Limitations</div>
                 <ul className="list" style={{ marginTop: 0 }}>
                   {baseline.limitations.map((l, i) => (
