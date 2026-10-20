@@ -81,14 +81,13 @@ def _remove_database_files(db_path: Path) -> list[str]:
 def _clear_camera_artifacts(base_dir: Path) -> list[str]:
     """Remove untracked ESP32-CAM / Cloudinary runtime artefacts.
 
-    Only git-ignored, regenerable files are touched: the processed-id ledger,
-    downloaded raw/result images and the capture cache directory. Generated
-    runtime files
-    (e.g. ``plant_daily_measurements.csv``) are deliberately left alone.
+    Only git-ignored, regenerable capture inputs/caches are touched. Annotated
+    plant result images are retained so reviewed measurement output survives a
+    camera cleanup. Generated runtime files (e.g.
+    ``plant_daily_measurements.csv``) are deliberately left alone.
     """
     removed: list[str] = []
-    patterns = ["processed_cloudinary_ids.txt", "plant_result*.jpg",
-                "plant_captured.jpg", "Plant*.jpg"]
+    patterns = ["processed_cloudinary_ids.txt", "plant_captured.jpg", "Plant*.jpg"]
     for pattern in patterns:
         for path in base_dir.glob(pattern):
             if path.is_file():

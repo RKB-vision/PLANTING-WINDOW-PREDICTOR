@@ -1,6 +1,7 @@
 # Computer-vision measurement pipeline (ESP32-CAM -> Cloudinary -> OpenCV)
 numpy
 opencv-python
+rembg[cpu]
 
 # Data / model layer
 pandas

@@ -68,6 +68,9 @@ from typing import Any, cast
 
 import cv2
 import numpy as np
+from rembg import new_session, remove as remove_background
+
+_REMBG_SESSION = None
 
 # Load local secrets (.env) before reading the Cloudinary credentials below, so
 # the standalone CLI works without exporting variables by hand.
@@ -861,46 +864,48 @@ def detect_reference_rod(
 # PLANT SEGMENTATION
 # ============================================================
 
-def plant_mask(
-    image: np.ndarray,
-) -> np.ndarray:
-    """Create a green plant mask."""
-
-    hsv = cv2.cvtColor(
-        image,
-        cv2.COLOR_BGR2HSV,
-    )
-
-    mask = cv2.inRange(
-        hsv,
-        np.array(
-            [25, 35, 25],
-            dtype=np.uint8,
-        ),
-        np.array(
-            [95, 255, 255],
-            dtype=np.uint8,
-        ),
-    )
-
+def plant_mask(image: np.ndarray, reference: Rectangle | None = None) -> np.ndarray:
+    """Create a plant mask from lightweight rembg foreground and green pixels."""
+    global _REMBG_SESSION
+    if _REMBG_SESSION is None:
+        _REMBG_SESSION = new_session("u2netp", providers=["CPUExecutionProvider"])
+    raw_mask = np.asarray(remove_background(
+        image, only_mask=True, session=_REMBG_SESSION
+    ))
+    if raw_mask.ndim == 3:
+        raw_mask = cv2.cvtColor(raw_mask, cv2.COLOR_BGR2GRAY)
+    # Low-alpha halos can connect the foreground to blurry background foliage.
+    mask = np.where(raw_mask >= 128, 255, 0).astype(np.uint8)
     mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_OPEN,
-        np.ones(
-            (5, 5),
-            np.uint8,
-        ),
+        mask, cv2.MORPH_CLOSE,
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)),
     )
-
-    mask = cv2.morphologyEx(
-        mask,
-        cv2.MORPH_CLOSE,
-        np.ones(
-            (25, 25),
-            np.uint8,
-        ),
-    )
-
+    if reference is not None:
+        hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+        rod = cv2.inRange(
+            hsv, np.array([0, 80, 40], np.uint8),
+            np.array([12, 255, 255], np.uint8),
+        ) | cv2.inRange(
+            hsv, np.array([168, 80, 40], np.uint8),
+            np.array([179, 255, 255], np.uint8),
+        )
+        rod_roi = np.zeros_like(rod)
+        rod_roi[:, max(0, reference.x - 3):min(
+            image.shape[1], reference.right + 3
+        )] = 255
+        rod = cv2.dilate(
+            cv2.bitwise_and(rod, rod_roi), np.ones((3, 3), np.uint8)
+        )
+        mask[rod > 0] = 0
+        green = cv2.inRange(
+            hsv, np.array([20, 20, 15], np.uint8),
+            np.array([105, 255, 255], np.uint8),
+        )
+        mask = cv2.bitwise_and(mask, green)
+        mask = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (3, 15)),
+        )
     return mask
 
 
@@ -1192,9 +1197,18 @@ def detect_plant(
     reference: Rectangle,
 ) -> PlantMeasurement:
 
-    mask = remove_reference(
-        plant_mask(image),
-        reference,
+    mask = plant_mask(image, reference)
+
+    # Keep the camera's full canopy near the red rod and exclude distant
+    # background foliage before contour extraction.
+    rod_center_x = reference.x + reference.width // 2
+    roi_left = max(0, rod_center_x - 1100)
+    roi_right = min(mask.shape[1], rod_center_x + 1101)
+    mask[:, :roi_left] = 0
+    mask[:, roi_right:] = 0
+    mask = cv2.morphologyEx(
+        mask, cv2.MORPH_OPEN,
+        cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3)),
     )
 
     ys, xs = np.where(
@@ -1208,17 +1222,23 @@ def detect_plant(
             "the plant is green and well lit."
         )
 
-    leaf_count, cleaned = (
-        split_leaf_instances(mask)
+    contours, _ = cv2.findContours(
+        mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
+    if not contours:
+        raise RuntimeError("Plant foreground could not be isolated")
 
-    cleaned = isolate_main_plant(
-        cleaned
-    )
+    def contour_score(contour: np.ndarray) -> float:
+        area = cv2.contourArea(contour)
+        moments = cv2.moments(contour)
+        center_x = (moments["m10"] / moments["m00"] if moments["m00"]
+                    else rod_center_x)
+        return area / (abs(center_x - rod_center_x) + 1.0)
 
-    leaf_count, cleaned = (
-        split_leaf_instances(cleaned)
-    )
+    contour = max(contours, key=contour_score)
+    cleaned = np.zeros_like(mask)
+    cv2.drawContours(cleaned, [contour], -1, 255, cv2.FILLED)
+    leaf_count, _ = split_leaf_instances(cleaned)
 
     ys, xs = np.where(
         cleaned > 0
@@ -1268,6 +1288,10 @@ def detect_plant(
         cleaned,
         bounds,
     )
+    bounds = Rectangle(
+        bounds.x, bounds.y, bounds.width,
+        max(1, height_base_y - bounds.y + 1),
+    )
 
     return PlantMeasurement(
         cleaned,
@@ -1286,167 +1310,63 @@ def detect_height_axis(
     leaf_mask: np.ndarray,
     leaf_bounds: Rectangle,
 ) -> tuple[int, int, int, int]:
-    """Find the leaf top and a continuous narrow stem/soil base axis."""
-
-    height, width = leaf_mask.shape
-    ys, xs = np.where(leaf_mask > 0)
-    top_y = int(ys.min())
-    canopy_bottom = int(ys.max())
-    canopy_center_x = int(round(float(xs.mean())))
-
-    axis_half_width = max(
-        8,
-        min(
-            24,
-            leaf_bounds.width // 8,
-        ),
+    """Find the upper plant landmark and stem base/width in a narrow axis."""
+    contours, _ = cv2.findContours(
+        leaf_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
     )
-    x0 = max(0, canopy_center_x - axis_half_width)
-    x1 = min(width, canopy_center_x + axis_half_width + 1)
+    if not contours:
+        raise RuntimeError("Plant contour is empty")
+    points = max(contours, key=cv2.contourArea).reshape(-1, 2)
+    top_y = int(points[:, 1].min())
+    contour_bottom_y = int(points[:, 1].max())
+    box_height = max(1, leaf_bounds.height)
 
-    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    # The stem center is estimated from mask persistence in its lower region.
+    band_top = min(contour_bottom_y, top_y + int(round(box_height * 0.55)))
+    band_bottom = max(band_top + 1, top_y + int(round(box_height * 0.85)))
+    support = np.count_nonzero(leaf_mask[band_top:band_bottom] > 0, axis=0)
+    max_support = int(support.max())
+    supported_x = np.flatnonzero(support >= max(1, max_support * 0.8))
+    center_x = (int(round(float(np.median(supported_x)))) if supported_x.size
+                else int(np.median(points[:, 0])))
 
-    # Brown/grey stem pixels are accepted only inside the narrow axis
-    # beneath the detected leaves; soil elsewhere is never considered.
-    brown_or_gray = (
-        (
-            (hsv[:, :, 0] <= 25)
-            & (hsv[:, :, 1] >= 20)
-            & (hsv[:, :, 2] >= 25)
-        )
-        | (
-            (hsv[:, :, 1] <= 85)
-            & (hsv[:, :, 2] >= 45)
-        )
-    )
-    local_edges = cv2.Canny(gray, 35, 110)
-    local_edges = cv2.dilate(
-        local_edges,
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (3, 9),
-        ),
-    ) > 0
+    def base_at(x: int) -> int:
+        left, right = max(0, x - 15), min(leaf_mask.shape[1], x + 16)
+        yy, _ = np.where(leaf_mask[:, left:right] > 0)
+        return int(yy.max()) if yy.size else contour_bottom_y
 
-    axis_mask = brown_or_gray | local_edges
-    axis_mask[:, :x0] = False
-    axis_mask[:, x1:] = False
+    base_y = base_at(center_x)
+    clearance = max(1, int(round(box_height * 0.10)))
+    width_y = max(top_y, base_y - clearance)
+    kernel_size = max(3, int(round(box_height * 0.015)) | 1)
 
-    # Start immediately below the leaf cluster and allow small gaps. This
-    # makes the stem axis depend on continuity, not soil color alone.
-    start_y = min(
-        height - 1,
-        canopy_bottom + 1,
-    )
-    max_gap = max(
-        8,
-        int(round(height * 0.025)),
-    )
-    gap = 0
-    last_y = start_y
+    def closed_row(y: int) -> np.ndarray:
+        return cv2.morphologyEx(
+            leaf_mask[y:y + 1], cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_size, 1)),
+        )[0] > 0
 
-    for y in range(start_y, height):
-        row_has_signal = bool(
-            np.count_nonzero(axis_mask[y, x0:x1])
-        )
-        if row_has_signal:
-            last_y = y
-            gap = 0
-        else:
-            gap += 1
-            if gap > max_gap:
-                break
+    row = closed_row(width_y)
+    pixels = np.flatnonzero(row)
+    spans = [span for span in np.split(pixels, np.where(np.diff(pixels) > 1)[0] + 1)
+             if span.size]
+    if spans:
+        nearest = min(spans, key=lambda span: abs(float(span.mean()) - center_x))
+        if abs(float(nearest.mean()) - center_x) <= 60:
+            center_x = int(round(float(nearest.mean())))
+            base_y = base_at(center_x)
+            width_y = max(top_y, base_y - clearance)
+            row = closed_row(width_y)
 
-    # Estimate the soil surface from the strongest sustained horizontal
-    # appearance change inside the plant's own x-range. This prevents the
-    # brown soil below the stem from being treated as more stem.
-    x_left = max(
-        0,
-        leaf_bounds.x,
-    )
-    x_right = min(
-        width,
-        leaf_bounds.right,
-    )
-    row_signal = gray[:, x_left:x_right].mean(axis=1)
-    smoothed = np.convolve(
-        row_signal,
-        np.ones(31, dtype=np.float32) / 31.0,
-        mode="same",
-    )
-    change = np.abs(np.diff(smoothed))
-    search_start = min(
-        height - 2,
-        canopy_bottom + max_gap,
-    )
-    search_stop = max(
-        search_start + 1,
-        int(round(height * 0.90)),
-    )
-    soil_surface_y = search_start + int(
-        np.argmax(
-            change[search_start:search_stop]
-        )
-    )
-
-    base_y = min(
-        last_y,
-        soil_surface_y,
-    )
-
-    stem_widths: list[int] = []
-    stem_mask = brown_or_gray.astype(np.uint8)
-    stem_mask = cv2.morphologyEx(
-        stem_mask,
-        cv2.MORPH_OPEN,
-        cv2.getStructuringElement(
-            cv2.MORPH_RECT,
-            (3, 7),
-        ),
-    )
-
-    stem_start = min(
-        base_y,
-        canopy_bottom + max_gap,
-    )
-    stem_stop = max(
-        stem_start + 1,
-        base_y - max_gap,
-    )
-
-    for y in range(stem_start, stem_stop):
-        row = stem_mask[y, x0:x1] > 0
-        center_index = canopy_center_x - x0
-        if not row.any() or not row[center_index]:
-            continue
-
-        left = center_index
-        while left > 0 and row[left - 1]:
-            left -= 1
-
-        right = center_index
-        while right + 1 < row.size and row[right + 1]:
-            right += 1
-
-        stem_widths.append(right - left + 1)
-
-    stem_width_pixels = int(
-        round(
-            float(
-                np.median(stem_widths)
-                if stem_widths
-                else max(1, axis_half_width * 2)
-            )
-        )
-    )
-
-    return (
-        top_y,
-        base_y,
-        canopy_center_x,
-        stem_width_pixels,
-    )
+    if center_x >= row.size or not row[center_x]:
+        return top_y, base_y, center_x, 0
+    left = center_x
+    while left > 0 and row[left - 1]:
+        left -= 1
+    right = center_x
+    while right + 1 < row.size and row[right + 1]:
+        right += 1
+    return top_y, base_y, center_x, right - left + 1
 
 
 # ============================================================
@@ -1653,30 +1573,20 @@ def draw_results(
         2,
         cv2.LINE_AA,
     )
-    stem_half_width = max(
-        1,
-        plant.stem_width_pixels // 2,
+    stem_clearance = max(1, int(round(plant.bounds.height * 0.10)))
+    stem_width_y = max(
+        plant.height_top_y, plant.height_base_y - stem_clearance
     )
-    stem_width_y = min(
-        plant.height_base_y,
-        max(
-            plant.height_top_y,
-            plant.height_base_y
-            - max(
-                10,
-                (plant.height_base_y - plant.height_top_y)
-                // 3,
-            ),
-        ),
-    )
+    stem_width_left = plant.height_x - (plant.stem_width_pixels - 1) // 2
+    stem_width_right = stem_width_left + max(0, plant.stem_width_pixels - 1)
     cv2.line(
         output,
         (
-            plant.height_x - stem_half_width,
+            stem_width_left,
             stem_width_y,
         ),
         (
-            plant.height_x + stem_half_width,
+            stem_width_right,
             stem_width_y,
         ),
         (255, 0, 255),
