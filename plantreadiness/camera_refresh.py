@@ -260,7 +260,8 @@ def _index_plants(repo: BaseRepository) -> dict[str, list]:
     index: dict[str, list] = {}
     for plant in repo.list_plants():
         # Historical reference plants are never camera targets.
-        if str(plant.get("cohort") or "").strip().lower() == "reference":
+        _cohort = str(plant.get("cohort") or "").strip().lower()
+        if _cohort in ("reference", "manual_upload"):
             continue
         ref = plant.get("external_ref")
         if ref:

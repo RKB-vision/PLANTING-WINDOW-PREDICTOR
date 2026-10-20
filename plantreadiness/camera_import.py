@@ -238,7 +238,8 @@ def import_camera_measurements(
         for p in existing_plants:
             # Historical reference plants are never camera targets: a live plant
             # must be registered separately even if it shares an external_ref.
-            if str(p.get("cohort") or "").strip().lower() == "reference":
+            _cohort = str(p.get("cohort") or "").strip().lower()
+            if _cohort in ("reference", "manual_upload"):
                 continue
             if p.get("external_ref"):
                 key = config.normalize_plant_ref(p["external_ref"])
