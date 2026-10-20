@@ -376,87 +376,25 @@ export default function Home() {
               <p className="small">{result.history_note}</p>
             )}
 
-            {result.level && (
-              <p className="small">Model level: {result.level}</p>
+
+
+            {cohort && (
+              <p className="small">
+                Cohort: {formatValue(cohort.median_height_cm)} cm height ·{' '}
+                {formatValue(cohort.median_age_days)} days ·{' '}
+                {formatValue(cohort.median_growth_rate_cm_per_day)} cm/day ·{' '}
+                {formatValue(cohort.plants_represented)} plants
+              </p>
             )}
 
-            {result.mae_days !== null && result.mae_days !== undefined && (
-              <p className="small">Validation MAE: ±{result.mae_days} days</p>
-            )}
 
-            <div className="subhead">Representative cohort</div>
-            <div className="grid">
-              <Stat
-                label="Observation date"
-                value={formatValue(result.observation_date)}
-              />
-              <Stat
-                label="Plants represented"
-                value={formatValue(cohort?.plants_represented)}
-              />
-              <Stat
-                label="Median height"
-                value={
-                  cohort?.median_height_cm !== null &&
-                  cohort?.median_height_cm !== undefined
-                    ? `${cohort.median_height_cm} cm`
-                    : '—'
-                }
-              />
-              <Stat
-                label="Median age"
-                value={
-                  cohort?.median_age_days !== null &&
-                  cohort?.median_age_days !== undefined
-                    ? `${cohort.median_age_days} days`
-                    : '—'
-                }
-              />
-              <Stat
-                label="Median growth rate"
-                value={
-                  cohort?.median_growth_rate_cm_per_day !== null &&
-                  cohort?.median_growth_rate_cm_per_day !== undefined
-                    ? `${cohort.median_growth_rate_cm_per_day} cm/day`
-                    : '—'
-                }
-              />
-              <Stat
-                label="Median stem width"
-                value={
-                  cohort?.median_stem_width_cm !== null &&
-                  cohort?.median_stem_width_cm !== undefined
-                    ? `${cohort.median_stem_width_cm} cm`
-                    : '—'
-                }
-              />
-              <Stat
-                label="Height range"
-                value={
-                  cohort?.min_height_cm !== null &&
-                  cohort?.max_height_cm !== null &&
-                  cohort?.min_height_cm !== undefined &&
-                  cohort?.max_height_cm !== undefined
-                    ? `${cohort.min_height_cm}–${cohort.max_height_cm} cm`
-                    : '—'
-                }
-              />
-              <Stat
-                label="Median leaf count"
-                value={formatValue(cohort?.median_visible_true_leaf_count)}
-              />
-            </div>
 
-            <div className="subhead">Real evidence</div>
-            <p className="muted small" style={{ margin: 0 }}>
+            <p className="muted small" style={{ margin: '8px 0 0' }}>
               {formatValue(result.readiness_event_counts?.independent_plants)}{' '}
               independent plants ·{' '}
               {formatValue(result.readiness_event_counts?.readiness_events)}{' '}
               readiness events
             </p>
-
-            <div className="subhead">Raw response</div>
-            <pre className="json">{JSON.stringify(result, null, 2)}</pre>
           </details>
         </section>
       )}
