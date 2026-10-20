@@ -272,5 +272,48 @@ class TestSpeciesCohortIsolation(PlantIdResolutionBase):
         self.assertAlmostEqual(snap2["rows"][0]["height_cm"], 5.0, places=3)
 
 
+class TestLiveVsHistoricalSeparation(PlantIdResolutionBase):
+    def test_historical_and_live_plant01_are_distinct(self):
+        hist = self._register("Sunflower (SuperOrange)", "SuperOrange", "Plant01",
+                              cohort="reference")
+        live = self._register("Sunflower (SuperOrange)", "SuperOrange", "Plant01")
+        self.assertNotEqual(hist, live)
+        self.assertEqual(self.repo.get_plant(hist)["cohort"], "reference")
+        self.assertNotEqual(self.repo.get_plant(live)["cohort"], "reference")
+
+    def test_camera_resolves_to_live_not_historical(self):
+        hist = self._register("Sunflower (SuperOrange)", "SuperOrange", "Plant01",
+                              cohort="reference")
+        live = self._register("Sunflower (SuperOrange)", "SuperOrange", "Plant01")
+        report = svc.refresh_camera_observations(
+            self.repo,
+            sources=[("Plant01_", "Plant01")],
+            puller=lambda s, c: [_row(ref="Plant01")],
+            min_interval=0,
+        )
+        self.assertEqual(report["sources"][0]["status"], "imported")
+        self.assertEqual(len(self.repo.get_observations(hist)), 0)
+        self.assertEqual(len(self.repo.get_observations(live)), 1)
+
+    def test_idempotent_reimport_same_csv(self):
+        # Simulate importing the same CSV twice -> same plants, no duplicates.
+        conn = self.repo.conn
+        import plantreadiness.csv_import as ci
+        import tempfile, os
+        csv_path = os.path.join(self.tmp.name, "t.csv")
+        with open(csv_path, "w") as f:
+            f.write("Date,Age,Plant_ID,Height_cm\n")
+            f.write("2083-05-02,2,Plant01,1.0\n")
+            f.write("2083-05-03,3,Plant01,1.5\n")
+        r1 = ci.import_csv(conn, csv_path, species="Sunflower (SuperOrange)",
+                           variety="SuperOrange", cohort="reference")
+        r2 = ci.import_csv(conn, csv_path, species="Sunflower (SuperOrange)",
+                           variety="SuperOrange", cohort="reference")
+        self.assertEqual(r1["plants_imported"], 1)
+        self.assertEqual(r2["plants_imported"], 0)
+        self.assertEqual(r2["plants_existing"], 1)
+        self.assertEqual(r2["observations_skipped_duplicate"], 2)
+
+
 if __name__ == "__main__":
     unittest.main()

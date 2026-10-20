@@ -221,8 +221,8 @@ def import_csv(conn, csv_path: str | Path,
                 existing = conn.execute(
                     """SELECT plant_id FROM plants
                        WHERE external_ref = ? AND data_source = 'real'
-                         AND species = ?""",
-                    (raw_ref, species),
+                         AND species = ? AND COALESCE(cohort, '') = COALESCE(?, '')""",
+                    (raw_ref, species, cohort),
                 ).fetchone()
                 if existing:
                     plant_ids[raw_ref] = int(existing["plant_id"])

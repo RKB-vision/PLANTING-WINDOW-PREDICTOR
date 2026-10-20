@@ -346,6 +346,77 @@ def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     return conn
 
 
+def _migrate_plants_unique_constraint(conn: sqlite3.Connection) -> None:
+    """Ensure plant identity is unique on (data_source, species, variety,
+    external_ref, cohort), treating NULL cohort/variety as a sentinel.
+
+    Older databases had ``UNIQUE (data_source, species, variety, external_ref)``,
+    which made a historical reference plant and a live plant with the same
+    external ref collapse into one row. This migration recreates the table and
+    replaces the constraint with a COALESCE-based unique index. Idempotent.
+    """
+    row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='plants'"
+    ).fetchone()
+    if row is None:
+        return
+    sql = row["sql"] if isinstance(row, (sqlite3.Row,)) else row[0]
+    sql_text = str(sql or "")
+    if "ux_plants_identity" in sql_text:
+        # Already migrated (index recorded in table sql is not guaranteed, so
+        # also check the index list below).
+        pass
+    indexes = {r[0] for r in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='plants'"
+    ).fetchall()}
+    if "ux_plants_identity" in indexes:
+        return
+
+    # Drop the old table-level unique constraint by recreating the table.
+    # Foreign keys are disabled for the duration so the drop does not fail on
+    # existing observation rows; they are re-enabled and checked afterwards.
+    conn.execute("PRAGMA foreign_keys = OFF")
+    try:
+        conn.execute(
+            """CREATE TABLE plants_new (
+                plant_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+                species         TEXT    NOT NULL,
+                variety         TEXT,
+                date_started    TEXT,
+                data_source     TEXT    NOT NULL
+                    CHECK (data_source IN ('real', 'synthetic')),
+                growing_conditions TEXT,
+                external_ref    TEXT,
+                cohort          TEXT,
+                created_at      TEXT    NOT NULL
+                    DEFAULT (datetime('now'))
+            )"""
+        )
+        conn.execute(
+            """INSERT INTO plants_new
+               (plant_id, species, variety, date_started, data_source,
+                growing_conditions, external_ref, cohort, created_at)
+               SELECT plant_id, species, variety, date_started, data_source,
+                      growing_conditions, external_ref, cohort, created_at
+               FROM plants"""
+        )
+        conn.execute("DROP TABLE plants")
+        conn.execute("ALTER TABLE plants_new RENAME TO plants")
+        conn.execute(
+            "CREATE UNIQUE INDEX ux_plants_identity ON plants "
+            "(data_source, species, COALESCE(variety, ''), external_ref, "
+            "COALESCE(cohort, ''))"
+        )
+        problems = conn.execute("PRAGMA foreign_key_check").fetchall()
+        if problems:
+            raise RuntimeError(f"foreign_key_check failed: {problems}")
+    except Exception:
+        conn.rollback()
+        conn.execute("PRAGMA foreign_keys = ON")
+        raise
+    conn.execute("PRAGMA foreign_keys = ON")
+
+
 def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Create tables if missing and return an open connection."""
     conn = connect(db_path)
@@ -412,6 +483,14 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_observations_calibration "
         "ON observations (calibration_source)")
+
+    # Forward migration: scope plant identity by cohort as well, so that a
+    # historical reference plant and a live plant sharing the same external_ref
+    # (e.g. both 'Plant01') do not collapse into one row. SQLite UNIQUE
+    # constraints treat NULLs as distinct, so the constraint is enforced via a
+    # COALESCE-based unique index instead of a table-level constraint.
+    _migrate_plants_unique_constraint(conn)
+
     conn.commit()
     return conn
 
@@ -442,12 +521,15 @@ def register_plant(conn: sqlite3.Connection,
     variety_norm = variety.strip() if variety else None
 
     # NULL-aware duplicate check: SQLite UNIQUE constraints treat NULLs as
-    # distinct, so detect duplicates explicitly before inserting.
+    # distinct, so detect duplicates explicitly before inserting. Cohort is
+    # part of identity so a historical reference plant and a live plant sharing
+    # the same external_ref do not collapse into one row.
     existing = conn.execute(
         """SELECT plant_id FROM plants
            WHERE species = ? AND data_source = ?
-             AND variety IS ? AND external_ref IS ?""",
-        (species, data_source, variety_norm, external_ref),
+             AND variety IS ? AND external_ref IS ?
+             AND COALESCE(cohort, '') = COALESCE(?, '')""",
+        (species, data_source, variety_norm, external_ref, cohort),
     ).fetchone()
     if existing is not None:
         raise DuplicateRecordError(
