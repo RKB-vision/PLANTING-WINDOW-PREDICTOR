@@ -114,8 +114,8 @@ PYTHON_BACKEND_URL=http://localhost:8000 ./run.sh
 If you want to run the API and UI separately:
 
 ```bash
-# terminal 1
-PYTHONPATH=$(pwd) FLASK_APP=backend/app.py flask run --port 8000
+# terminal 1 (use the project environment that has rembg + its CPU runtime)
+PYTHONPATH=$(pwd) FLASK_APP=backend/app.py .venv/bin/python -m flask run --port 8000
 
 # terminal 2
 cd nextjs
