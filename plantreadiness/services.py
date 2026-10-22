@@ -1092,6 +1092,10 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
     leaves_col = _col("visible_true_leaf_count", "average_visible_leaves",
                       "true_leaves", "leaves", "median_visible_leaves",
                       "True_leaves")
+    # Optional readiness/transplant label column. When present, a readiness
+    # event is recorded per plant (ground truth for supervised training).
+    readiness_col = _col("readiness_observed_date", "transplant_date",
+                         "ready_date", "readiness_date", "readiness_date_observed")
 
     missing = []
     if date_col is None:
@@ -1185,11 +1189,23 @@ def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
             issues.append({"line": line_no,
                            "problem": "true leaf count must be >= 0"})
             continue
+        # Optional readiness date (ground truth label).
+        readiness_date = None
+        if readiness_col:
+            rtxt = (row.get(readiness_col) or "").strip()
+            if rtxt:
+                try:
+                    readiness_date = _parse_date_val(rtxt).isoformat()
+                except (ValidationError, ValueError) as exc:
+                    issues.append({"line": line_no,
+                                   "problem": f"bad readiness date: {exc}"})
+                    continue
         rows.append({"line": line_no, "plant_ref": ref,
                      "date": obs_date.isoformat(), "age_days": age,
                      "height_cm": height, "growth_rate_cm_per_day": growth,
                      "stem_width_cm": width,
-                     "visible_true_leaf_count": leaves})
+                     "visible_true_leaf_count": leaves,
+                     "readiness_date": readiness_date})
     return fieldnames, rows, issues
 
 
@@ -1254,6 +1270,8 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
         "plants_existing": len(existing_refs),
         "observations_inserted": 0,
         "observations_skipped_duplicate": 0,
+        "readiness_events_recorded": 0,
+        "readiness_events_skipped": 0,
         "issues": preview["issues"],
         "preview": preview,
         "rejected": False,
@@ -1299,6 +1317,34 @@ def run_csv_import(repo: BaseRepository, csv_text: str, *,
         except ValidationError as exc:
             # Should not happen after validation, but if it does, record it.
             report["issues"].append({"line": row["line"], "problem": str(exc)})
+
+    # Record readiness events when the CSV provides a readiness_observed_date.
+    # Idempotent: a duplicate (plant, definition) is skipped, not an error.
+    readiness_by_ref: dict[str, str] = {}
+    for row in rows:
+        rd = row.get("readiness_date")
+        if rd and row["plant_ref"] not in readiness_by_ref:
+            readiness_by_ref[row["plant_ref"]] = rd
+    readiness_recorded = 0
+    readiness_skipped = 0
+    for ref, rdate in readiness_by_ref.items():
+        pid = ref_to_id.get(ref)
+        if pid is None:
+            continue
+        try:
+            repo.record_readiness_event(
+                plant_id=pid,
+                readiness_observed_date=rdate,
+                readiness_definition_version="csv_import_v1",
+                assessment_source="csv_import",
+                data_source="real",
+            )
+            readiness_recorded += 1
+        except Exception as exc:
+            # Duplicate or validation error — skip silently (idempotent).
+            readiness_skipped += 1
+    report["readiness_events_recorded"] = readiness_recorded
+    report["readiness_events_skipped"] = readiness_skipped
     return report
 
 
