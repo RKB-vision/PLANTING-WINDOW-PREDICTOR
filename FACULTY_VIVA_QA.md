@@ -1,305 +1,316 @@
-# Faculty Viva Q&A Guide — Plant Transplant Readiness Prediction System
+# Faculty Viva — Technical Report: Plant Transplant Readiness Prediction System
 
 **Repository:** `RKB-vision/PLANTING-WINDOW-PREDICTOR` (branch `main`)
 **Document:** `FACULTY_VIVA_QA.md` (repository root)
-**Format:** 10 questions, each with 6 fields (Question, Short spoken answer, Deeper explanation, Evidence, Likely follow-up, Evidence status). Code is the source of truth.
 
 ---
 
-## Part 0 — Quick revision sheet
+## 1. System Architecture
 
-### A. Project in one minute
-
-> This is a plant-monitoring system that estimates when a plant species is likely
-> to be ready for transplantation. An ESP32-CAM photographs the plant, the image
-> goes to Cloudinary, and an OpenCV pipeline measures height, stem width, and
-> visible leaf count using a reference rod for scale. Those measurements become
-> daily observations in a SQLite database. The system then compares the current
-> plant against a successful historical cohort (10 Super Orange plants, 250
-> observations over 25 days) and returns a provisional transplant-readiness
-> date, together with the method, uncertainty, and limitations. There is **no
-> trained real-data ML model** in the active prediction path yet — the core
-> predictor is a deterministic historical reference baseline, because verified
-> readiness labels do not exist. Synthetic demo models exist but are never used
-> for real plants unless explicitly enabled. The honest limitation is that the
-> system cannot yet claim a validated readiness predictor: it needs real
-> transplant outcomes recorded over time.
-
-### B. Five-minute speaking sequence
-
-1. **Problem & motivation (≈45 s).** Transplant timing is usually judged by
-   experience. We want a data-driven estimate: given how a plant is growing now,
-   when is it likely to reach transplant size.
-2. **Architecture (≈60 s).** ESP32-CAM → Cloudinary → OpenCV measurement
-   pipeline → daily CSV → SQLite (via service/repository layer) → Next.js UI
-   → feedback (assessment / transplant / 14-day follow-up) → evaluation.
-   Records are kept distinct: raw observations, species summaries, predictions,
-   feedback.
-3. **Computer vision (≈60 s).** HSV segmentation of a coloured reference rod
-   and the plant; `cm_per_pixel = rod_length_cm / rod_pixels`;
-   `height = (base_y − top_y + 1) × cm_per_pixel`; stem width and leaf count.
-   Four captures per day are aggregated into one median daily record.
-   Calibration is verified or quarantined.
-4. **Prediction (≈60 s).** Active predictor: historical reference baseline
-   (age-matched or height-matched group, median days-to-transplant, optional
-   bounded growth-rate adjustment). No trained real-data model is selected
-   because readiness-event labels are missing (0 events). Synthetic demo models
-   exist but are opt-in and labelled.
-5. **Honesty & limitations (≈45 s).** Method always stated. Missing values
-   stay missing. Predictions append-only. Synthetic never silent. Evaluation
-   compares predicted vs. observed but cannot claim validation with 0
-   readiness events. Next step: record real transplant outcomes and train a
-   validated model via the existing grouped-CV pipeline.
-
-### C. End-to-end architecture diagram
-
-```mermaid
-flowchart LR
-    A[ESP32-CAM] -->|upload PlantID_YYYYMMDD_HHMMSS.jpg| B[Cloudinary]
-    B --> C[plant_measurement.py<br/>OpenCV: rod + plant + leaves]
-    C --> D[data/generated/plant_daily_measurements.csv<br/>one row per plant per day]
-    D --> E[camera_import<br/>idempotent, plant-scoped]
-    E --> F[(SQLite: observations)]
-    F --> G[services: species cohort snapshot<br/>medians + plant counts]
-    G --> H{prediction selector}
-    H -->|level 4 / no validated model| I[insufficient evidence<br/>refusal]
-    H -->|provisional baseline| J[historical_reference_baseline<br/>age/height match + bounded adjustment]
-    H -->|opt-in synthetic| K[SYNTHETIC DEMO model]
-    J --> L[Next.js UI: readiness date + method + uncertainty]
+```
+ESP32-CAM → Cloudinary → OpenCV (plant_measurement.py) → CSV → SQLite (plantreadiness/) → Flask API (backend/app.py) → Next.js UI (nextjs/)
 ```
 
+**Three layers:**
+- **Domain layer** (`plantreadiness/`): config, DB, repository, services, reference baseline, model, calibration, CSV/camera import
+- **API layer** (`backend/app.py`): Flask endpoints
+- **UI layer** (`nextjs/`): Next.js frontend
+
 ---
 
-## Part 1 — Ten core questions
+## 2. Code Structure — What Each File Does
+
+### `plantreadiness/` (domain layer)
+
+| File | Role |
+|---|---|
+| `config.py` | All constants: thresholds (MIN_PROVISIONAL_PLANTS=3, MIN_INDEPENDENT_PLANTS=4, MIN_READINESS_EVENTS=6), paths, species names, calibration groups, camera settings, `normalize_plant_ref()` |
+| `db.py` | SQLite schema (10 tables), migrations, raw queries (`readiness_training_rows`, `species_cohort_snapshot`, `record_readiness_event`) |
+| `repository.py` | Repository abstraction (`BaseRepository` + `SQLiteRepository`) — the only way the app touches the DB |
+| `services.py` | Business logic: `run_csv_import`, `predict_species_cohort`, `evaluate_predictions`, `build_reference_baseline`, `_parse_csv_text` |
+| `reference.py` | Builds the reference baseline (medians per age group), `provisional_estimate()` — the active heuristic predictor |
+| `model.py` | ML: `train_countdown_model`, `select_model` (levels 1–4), `predict_days_remaining`, `grouped_cv_mae`, artifact registry |
+| `calibration.py` | Rod-length verification, calibration groups, `is_baseline_usable()` |
+| `csv_import.py` | Low-level CSV importer (append-only, idempotent, growth rate derivation) |
+| `camera_import.py` | Imports OpenCV-measured daily rows into observations; ambiguity quarantine |
+| `camera_refresh.py` | Pulls new Cloudinary images, measures them, imports (fail-open, throttled) |
+| `synthetic.py` | Synthetic demo data generation |
+| `seed.py` | Seeds the DB from the historical CSV |
+| `reset.py` | Wipes DB + backs up generated files |
+| `purge.py` | Removes data by source/cohort (with safety checks) |
+| `verify_calibration.py` | CLI to verify rod length |
+| `reprocess_captures.py` | Re-measure already-processed Cloudinary images |
+| `migrate_species_rename.py` | One-off migration script |
+| `dotenv.py` | Loads `.env` file |
+
+### `backend/`
+| File | Role |
+|---|---|
+| `app.py` | Flask API: `/api/predict/species`, `/api/import`, `/api/reference`, `/api/camera/refresh`, `/api/species`, `/api/feedback`, etc. |
+
+### `nextjs/`
+| File | Role |
+|---|---|
+| `pages/index.tsx` | Main prediction page (species selector, predict, result card) |
+| `pages/feedback.tsx` | Feedback + Reference tabs (CSV upload, baseline view, evaluation) |
+| `pages/api/*.ts` | Next.js API proxy routes to Flask |
+
+### Root files
+| File | Role |
+|---|---|
+| `plant_measurement.py` | OpenCV vision pipeline: `detect_reference_rod`, `detect_plant`, `calculate_measurements`, `median_daily_record`, `group_records_by_date` |
+| `prediction.py` | CLI entry point for ad-hoc prediction |
+| `plant_feedback.py` | CLI: register, observe, predict, transplant, feedback, import-camera, readiness |
+| `reset` | Shell script → calls `plantreadiness/reset.py` |
+| `data/super_orange_growth_data.csv` | Historical reference cohort (10 plants, 250 obs, 25 days) |
+| `Apsara_Yellow_Marigold_Training_Data.csv` | Marigold dataset with readiness labels (12 plants, 300 obs) |
+| `models/synthetic/` | 5 synthetic demo models (joblib) |
+| `models/reference/` | 3 reference baseline JSON files |
+| `models/real/` | 1 real trained model (Marigold, after training) |
+
+---
+
+## 3. The ML Model
+
+### 3.1 Features (X) — `model.py:45`
+```python
+FEATURE_COLUMNS = [
+    "age_days", "height_cm", "growth_rate_cm_per_day",
+    "stem_width_cm", "visible_true_leaf_count",
+    "species", "variety",
+]
+```
+- 5 numeric + 2 categorical = 7 features
+- **Preprocessing:** `SimpleImputer(strategy="median")` → `StandardScaler()` for numeric; `SimpleImputer(strategy="most_frequent")` → `OneHotEncoder(handle_unknown="ignore")` for categorical
+- Missing values filled with column median (not zero)
+- `plant_id`, `observation_date`, `cohort` are **excluded** from X (plant_id used for GroupKFold grouping only)
+
+### 3.2 Target (y) — `db.py:1962`
+```python
+row["days_remaining"] = days_between(row["observation_date"], row["readiness_observed_date"])
+```
+- `days_remaining = readiness_observed_date - observation_date` (calendar days)
+- Computed in `readiness_training_rows()` (L1896): joins plants + observations + readiness events
+- Only observations **at or before** readiness date are included
+- Earliest readiness event per plant is used (`MIN`)
+- Plants without readiness events contribute nothing
+
+### 3.3 Training Pipeline — `model.py:178`
+```
+1. check_min_requirements: ≥4 plants AND ≥6 readiness events
+2. For each of 3 models (mean_baseline, ridge, random_forest):
+   → GroupKFold CV (n_splits = min(5, n_plants), grouped by plant_id)
+   → Record MAE (days) per fold
+3. Compare: best = lowest MAE, must beat mean_baseline
+4. validated = True only if: best ≠ mean_baseline AND best_mae < baseline_mae AND minimums met
+5. Refit winning model on ALL data
+6. Save as artifact with metadata (species, variety, MAE, n_plants, n_events, training date, validation method)
+```
+
+### 3.4 Three Candidate Models
+| Model | Algorithm | Purpose |
+|---|---|---|
+| `mean_baseline` | `DummyRegressor(strategy="mean")` | Null hypothesis — "can any model beat guessing the average?" |
+| `ridge` | `Ridge(alpha=1.0)` | Simple linear, L2 regularization |
+| `random_forest` | `RandomForestRegressor(n_estimators=200, max_depth=8, min_samples_leaf=3)` | Non-linear, captures feature interactions |
+
+### 3.5 Model Selection at Prediction Time — `model.py:332`
+```
+Level 1: Validated species+variety real model → best
+Level 2: Broader validated real model for species → good
+Level 3: Synthetic demo (only if allow_synthetic=True) → demo only
+Level 4: No model → falls through to provisional baseline
+```
+
+### 3.6 Synthetic Models
+- 5 `.joblib` files in `models/synthetic/` (scikit-learn, trained on fake data)
+- Never used unless `allow_synthetic=True` (defaults to false in API)
+- Always labeled "SYNTHETIC DEMO — not a botanical finding"
+
+### 3.7 Real Models
+- `models/real/` — created only after training with real readiness labels
+- Marigold (Apsara Yellow) now has one: `countdown_Marigold(ApsaraYellow)_ANY_...joblib` (Random Forest, MAE 0.04 days, validated=True)
+- Sunflower has none (0 readiness events)
+
+---
+
+## 4. The Reference Baseline (Heuristic Predictor)
+
+**This is NOT ML.** It's a deterministic lookup table.
+
+### Building (`reference.py:build_reference_from_repo`)
+```
+For each plant:
+  1. Sort observations by date
+  2. Compute trajectory (height, growth rate per day)
+  3. Transplant date: recorded if available, else assumed = day after last observation (flagged)
+  4. For each observation, compute days_until_transplant = transplant_date - observation_date
+
+Group by age_days:
+  For each age group:
+    - median_height_cm, median_growth_rate_cm_per_day
+    - median_days_until_transplant  (the "answer")
+    - iqr_days_until_transplant     (uncertainty)
+    - n_plants (independent plant count)
+```
+
+### Predicting (`reference.py:provisional_estimate`)
+```
+1. Find nearest age group (±3 days tolerance), or height group (±1.5 cm)
+2. Check: group has ≥3 independent plants? (MIN_PROVISIONAL_PLANTS)
+3. base_days = group's median_days_until_transplant
+4. factor = clamp(cohort_rate / plant_rate, 0.5, 2.0)  [if both rates available]
+5. adjusted_days = base_days × factor
+6. predicted_date = observation_date + adjusted_days
+7. Return: days_remaining, predicted_date, uncertainty, n_plants, limitations
+```
+
+Always labeled `provisional: true`, `method: provisional historical baseline`.
+
+---
+
+## 5. Key Algorithms
+
+### Growth Rate Derivation (`csv_import.py`)
+```
+rate = (height_t - height_{t-1}) / elapsed_days
+```
+Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
+
+### Camera Measurement (`plant_measurement.py`)
+- `detect_reference_rod()`: HSV segmentation of coloured rod → cm/pixel scale
+- `detect_plant()`: plant contour isolation
+- `calculate_measurements()`: height, stem width, leaf count
+- `median_daily_record()`: aggregates N captures into one daily row (median over valid captures)
+- `group_records_by_date()`: groups by capture date
+
+### Calibration (`calibration.py`)
+- Groups: `manual_measurement`, `camera_verified`, `camera_unverified`, `unknown`
+- `BASELINE_USABLE_CALIBRATION_GROUPS = (manual_measurement, camera_verified)`
+- Unverified camera data is quarantined and excluded from baseline
+
+### Plant ID Resolution (`config.py`, `camera_import.py`, `camera_refresh.py`)
+- `normalize_plant_ref()`: case/whitespace/punctuation-insensitive, zero-padding significant
+- Composite uniqueness: `(data_source, species, variety, external_ref, cohort)`
+- Ambiguous normalized collisions → quarantine, never resolve to first match
+- Historical plants excluded from camera targeting
+
+---
+
+## 6. Database Schema (key tables)
+
+| Table | Purpose |
+|---|---|
+| `plants` | Identity: species, variety, external_ref, cohort, data_source |
+| `observations` | Daily measurements + calibration provenance |
+| `readiness_events` | Ground-truth labels (earliest readiness date per plant) |
+| `feedback_14d` | Transplant + 14-day follow-up (append-only) |
+| `prediction_snapshots` | Immutable prediction records |
+| `calibration_settings` | Rod-length verification state |
+
+---
+
+## 7. API Endpoints
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/import` | CSV upload → import + auto-build baseline |
+| `POST /api/predict/species` | Species-cohort prediction (auto-runs camera refresh) |
+| `GET /api/reference?build=1` | Build/persist reference baseline |
+| `POST /api/camera/refresh` | Pull + measure + import new Cloudinary images |
+| `GET /api/species` | Species catalog (includes configured species with 0 counts) |
+
+---
+
+## 8. Honesty Principles (enforced in code)
+
+1. **Missing ≠ zero:** Growth rate stays `NULL` when interval ≤ 0. `_median()` skips `None`.
+2. **Method always stated:** Every prediction has `method`, `provisional`, `synthetic` fields.
+3. **Synthetic never silent:** `select_model()` returns synthetic only at Level 3 with `allow_synthetic=True`.
+4. **Predictions append-only:** `prediction_snapshots` has no UPDATE path.
+5. **No auto-retrain:** `evaluate_predictions()` returns recommendation; nothing auto-trains.
+6. **Calibration honesty:** Unverified camera data excluded from baseline.
+
+---
+
+## 9. What's Implemented vs. What's Not
+
+| Feature | Status |
+|---|---|
+| Camera measurement (OpenCV) | ✅ Implemented |
+| CSV import (append-only, idempotent) | ✅ Implemented |
+| Reference baseline (provisional) | ✅ Implemented, active predictor |
+| Trained real-data model | ✅ Now possible (after CSV with readiness labels) |
+| Synthetic demo model | ✅ Exists, never used silently |
+| Prediction snapshot (append-only) | ✅ Implemented |
+| Feedback (transplant + 14-day) | ✅ Implemented (CLI + API) |
+| Evaluation (evidence-based) | ✅ Implemented (CLI + API) |
+| Auto-retrain | ❌ Not implemented (by design) |
+| Firmware (ESP32-CAM) | ❌ Outside repo (documented contract only) |
+
+---
+
+## 10. Ten Core Viva Questions (with detail)
 
 ### Q1. What is this system and what problem does it solve?
 
-**Short spoken answer:**
-> "It estimates when a plant species is likely ready for transplantation, using camera measurements and historical growth data, and it is deliberately honest about what it can and cannot claim."
+**Answer:** It estimates when a plant species is likely ready for transplantation, using camera measurements and historical growth data. It is deliberately honest about what it can and cannot claim — there is no trained real-data ML model in the active path; the predictor is a deterministic historical reference baseline.
 
-**Deeper explanation:**
-The system monitors plant growth via an ESP32-CAM, measures height, stem width, and true leaf count using OpenCV with a reference rod for scale, stores daily observations in SQLite, and compares the current plant against a historical cohort of successful plants. It returns a readiness date with the method, uncertainty, and limitations explicitly stated. There is no trained real-data ML model in the active path — the predictor is a deterministic historical reference baseline — because verified readiness labels do not exist yet.
-
-**Evidence:**
-- `plantreadiness/services.py:predict_species_cohort` (L493) — prediction entry point
-- `plantreadiness/reference.py:provisional_estimate` (L429) — the active prediction math
-- `docs/ARCHITECTURE.md` — canonical architecture
-
-**Likely follow-up:** "So it's not really AI?" → "It uses a statistical heuristic (medians + bounded adjustment), which is honest given the data. ML models exist (Random Forest, Ridge) but only as synthetic demos that are never used silently."
-
-**Evidence status:** ✅ Verified — code confirms no real trained model is selected (0 readiness events).
-
----
+**Evidence:** `services.py:predict_species_cohort` (L493), `reference.py:provisional_estimate` (L429)
 
 ### Q2. How does the computer vision pipeline measure the plant?
 
-**Short spoken answer:**
-> "OpenCV segments a coloured reference rod and the plant in HSV space, computes cm/pixel from the rod, then derives height, stem width, and leaf count. Four captures per day are aggregated into one median daily record."
+**Answer:** OpenCV segments a coloured reference rod and the plant in HSV space, computes cm/pixel from the rod, then derives height, stem width, and leaf count. Four captures per day are aggregated into one median daily record. Calibration is verified or quarantined.
 
-**Deeper explanation:**
-1. `detect_reference_rod()` (L711): finds the rod by HSV colour range, computes `cm_per_pixel = rod_length_cm / rod_pixels`.
-2. `detect_plant()` (L1190): isolates the plant contour.
-3. `calculate_measurements()` (L1456): `height = (base_y − top_y + 1) × cm_per_pixel`; stem width at a fixed fraction of height; leaf count via watershed segmentation.
-4. `median_daily_record()` (L2044): four captures per day → one row with median height, width, leaves. Failed captures are counted, never imputed.
-5. Calibration: if the rod length is not verified (`verify_calibration`), observations are quarantined as `camera_unverified` and excluded from the baseline.
-
-**Evidence:**
-- `plant_measurement.py:detect_reference_rod` (L711), `detect_plant` (L1190), `calculate_measurements` (L1456), `median_daily_record` (L2044)
-- `plantreadiness/calibration.py:is_baseline_usable` (L83)
-
-**Likely follow-up:** "What if the rod isn't detected?" → "The capture fails and is counted as a failed capture. The daily record is still produced from valid captures only; if none are valid, the row is skipped."
-
-**Evidence status:** ✅ Verified — code confirms fail-open, never invents measurements.
-
----
+**Evidence:** `plant_measurement.py:detect_reference_rod` (L711), `detect_plant` (L1190), `calculate_measurements` (L1456), `median_daily_record` (L2044)
 
 ### Q3. How does the prediction work — what is the "provisional baseline"?
 
-**Short spoken answer:**
-> "It's a lookup table, not a model. It matches the current plant's age against historical age groups, reads the median days-to-transplant for that group, and adjusts by growth rate — clamped between 0.5× and 2.0×."
+**Answer:** It's a lookup table, not a model. It matches the current plant's age against historical age groups, reads the median days-to-transplant for that group, and adjusts by growth rate — clamped between 0.5× and 2.0×. Always labeled `provisional: true`.
 
-**Deeper explanation:**
-- The historical CSV (10 Super Orange plants, 250 observations over 25 days) is aggregated into `by_age_days` groups: for each age, the median height, median growth rate, and median days-until-transplant (where transplant = day after last observation, assumed).
-- At prediction time: find the nearest age group (±3 days), check it has ≥3 independent plants, read `base_days = median_days_until_transplant`, compute `factor = clamp(cohort_rate / plant_rate, 0.5, 2.0)`, then `adjusted_days = base_days × factor`.
-- If no growth rate is available, `insufficient_growth_history = true` and no adjustment is applied.
-- The result is always labeled `provisional: true`, `method: provisional historical baseline`.
-
-**Evidence:**
-- `plantreadiness/reference.py:provisional_estimate` (L429)
-- `plantreadiness/reference.py:build_reference_from_repo` (L335)
-- `plantreadiness/config.py`: `MIN_PROVISIONAL_PLANTS=3`, `PROVISIONAL_AGE_TOLERANCE_DAYS=3`, `GROWTH_RATE_ADJUSTMENT_MIN/MAX_FACTOR=0.5/2.0`
-
-**Likely follow-up:** "Why is the transplant date assumed?" → "The historical CSV has no verified transplant dates. The system assumes transplant = the day after the plant's last monitoring day, and flags this as an assumption in every prediction."
-
-**Evidence status:** ✅ Verified — code confirms the assumption flag and bounded adjustment.
-
----
+**Evidence:** `reference.py:provisional_estimate` (L429), `reference.py:build_reference_from_repo` (L335), `config.py`: `MIN_PROVISIONAL_PLANTS=3`, `PROVISIONAL_AGE_TOLERANCE_DAYS=3`
 
 ### Q4. Why is there no real trained ML model, and what would it take to get one?
 
-**Short spoken answer:**
-> "A real model needs ground-truth readiness labels — when each plant was actually transplanted. The CSV has measurements only, no transplant dates. We'd need to record transplant outcomes via the feedback loop, then train with the existing grouped-CV pipeline."
+**Answer:** A real model needs ground-truth readiness labels (transplant dates). The CSV has measurements only. You'd need to record transplant outcomes via the feedback loop, then train with the existing grouped-CV pipeline (`train_countdown_model`). The Apsara Yellow CSV now has `readiness_observed_date` → 12 readiness events → a real Random Forest model (MAE 0.04 days).
 
-**Deeper explanation:**
-- `train_countdown_model()` in `model.py` (L178) trains Ridge and Random Forest with GroupKFold CV on `plant_id`.
-- It requires `MIN_INDEPENDENT_PLANTS=4` and `MIN_READINESS_EVENTS=6`.
-- Readiness events come from `record_readiness_event()` — recorded manually via `plant_feedback.py readiness` or imported from a CSV with a `readiness_observed_date` column (now supported).
-- The Apsara Yellow CSV has 12 plants × 12 readiness events → enough to train. After training, `select_model()` finds a Level 2 real model (Random Forest, MAE 0.04 days) instead of falling through to the provisional baseline.
-- Without readiness labels, the system honestly refuses a validated model (Level 4).
-
-**Evidence:**
-- `plantreadiness/model.py:train_countdown_model` (L178), `check_min_requirements` (L150)
-- `plantreadiness/db.py:readiness_training_rows` (L1814) — joins observations with readiness events
-- `plantreadiness/services.py:run_csv_import` — now auto-records readiness events from `readiness_observed_date` column
-
-**Likely follow-up:** "Can the CSV's readiness date be trusted?" → "It's a label, not a measurement. The system records it as a readiness event with `assessment_source='csv_import'`. Whether it's 'verified' depends on how the label was generated — the system doesn't distinguish verified from assumed labels in the current schema."
-
-**Evidence status:** ✅ Verified — code confirms training pipeline exists and works with readiness labels.
-
----
+**Evidence:** `model.py:train_countdown_model` (L178), `check_min_requirements` (L150), `db.py:readiness_training_rows` (L1814)
 
 ### Q5. How does the system prevent CSV plant ID collisions across species?
 
-**Short spoken answer:**
-> "Plant identity is composite: (data_source, species, variety, external_ref, cohort). The same 'Plant01' in a Sunflower CSV and a Marigold CSV creates two distinct plants. Historical and live plants with the same ref are also distinct because their cohort differs."
+**Answer:** Plant identity is composite: (data_source, species, variety, external_ref, cohort). The same 'Plant01' in Sunflower and Marigold CSVs creates two distinct plants. `normalize_plant_ref()` normalizes case/whitespace but zero-padding is significant. Ambiguous collisions are quarantined.
 
-**Deeper explanation:**
-- The DB enforces `UNIQUE (data_source, species, variety, external_ref, cohort)` via the `ux_plants_identity` index (COALESCE for NULLs).
-- `normalize_plant_ref()` in `config.py` normalizes case, whitespace, and punctuation — but **zero-padding is significant** (`Plant01` ≠ `Plant1` ≠ `Plant001`).
-- If two registered refs normalize to the same key (e.g., `Plant01` and `Plant-01`), the camera system quarantines them as ambiguous — never resolves to first match.
-- `camera_import.py` and `camera_refresh.py` exclude historical plants (`cohort = 'reference'` or `'manual_upload'`) from camera targeting, so a live plant sharing an external_ref with a CSV plant is not ambiguous.
-
-**Evidence:**
-- `plantreadiness/db.py` schema (L55–65) + `_migrate_plants_unique_constraint`
-- `plantreadiness/config.py:normalize_plant_ref`
-- `plantreadiness/camera_import.py` (L235–245) — exclusion of reference/manual_upload cohorts
-- `plantreadiness/camera_refresh.py` (L258–265) — same exclusion
-- `tests/test_plant_id_resolution.py` — 15 tests covering collisions, ambiguity, normalization
-
-**Likely follow-up:** "What if someone registers the same external_ref twice for the same species?" → "The NULL-aware duplicate check in `register_plant` catches it and returns the existing plant_id (idempotent)."
-
-**Evidence status:** ✅ Verified — code and tests confirm the design.
-
----
+**Evidence:** `db.py` schema (L55–65), `config.py:normalize_plant_ref`, `camera_import.py` (L235–245), `tests/test_plant_id_resolution.py` (15 tests)
 
 ### Q6. What is the calibration/provenance story for camera measurements?
 
-**Short spoken answer:**
-> "Every observation records its calibration source and whether the rod was verified. Camera observations are quarantined as 'camera_unverified' until the user runs verify_calibration with a specific rod length. Only verified or manual measurements feed the baseline."
+**Answer:** Every observation records its calibration source and whether the rod was verified. Camera observations are quarantined as 'camera_unverified' until `verify_calibration` is run with a specific rod length. Only verified or manual measurements feed the baseline.
 
-**Deeper explanation:**
-- Calibration groups: `manual_measurement` (CSV), `camera_verified`, `camera_unverified`, `unknown`.
-- `BASELINE_USABLE_CALIBRATION_GROUPS = (manual_measurement, camera_verified)`.
-- `is_baseline_usable()` in `calibration.py` (L83) gates which observations contribute to the baseline.
-- Verification is tied to the specific rod length — changing `CAMERA_ROD_LENGTH_CM` resets verification.
-- Camera observations are still stored and used for prediction (current-state input) even when unverified — they're just flagged and excluded from the baseline.
-
-**Evidence:**
-- `plantreadiness/calibration.py` (L83–100)
-- `plantreadiness/config.py`: `CALIBRATION_SOURCE_CAMERA`, `CALIBRATION_SOURCE_CSV`, `BASELINE_USABLE_CALIBRATION_GROUPS`
-- `plantreadiness/camera_import.py` (L347–365) — records calibration_source and calibration_verified
-
-**Likely follow-up:** "Does an unverified camera observation still affect predictions?" → "Yes — it feeds the species cohort snapshot (current state). But it's flagged as unverified, and it doesn't contaminate the reference baseline."
-
-**Evidence status:** ✅ Verified — code confirms the quarantine logic.
-
----
+**Evidence:** `calibration.py:is_baseline_usable` (L83), `camera_import.py` (L347–365)
 
 ### Q7. How does the feedback and evaluation loop work?
 
-**Short spoken answer:**
-> "Predictions are append-only snapshots. The user records a transplant date and a 14-day follow-up. Evaluation compares predicted vs. observed readiness dates and recommends (but never auto-applies) improvements."
+**Answer:** Predictions are append-only snapshots. The user records a transplant date and a 14-day follow-up. Evaluation compares predicted vs. observed readiness dates and recommends (but never auto-applies) improvements. Missing feedback is "pending," never "failure."
 
-**Deeper explanation:**
-- `prediction_snapshots` table: immutable records of every prediction shown.
-- `feedback_14d` table: transplant date, height at transplant, 14-day survival, condition, notes. Append-only; corrections create audit revisions.
-- `evaluate_predictions()` computes MAE, match rate, independent plant count, and a recommendation.
-- The recommendation is **informational** — model promotion requires human decision (no auto-retrain).
-- Missing feedback is "pending," never "failure/death."
-
-**Evidence:**
-- `plantreadiness/services.py:evaluate_predictions` (L905)
-- `plantreadiness/services.py:save_prediction_snapshot` (L765)
-- `backend/app.py:/api/feedback`, `/api/transplant`, `/api/assessments`
-
-**Likely follow-up:** "How do you know when to retrain?" → "Only when evaluation shows a new method outperforms the current one on real data. The system never auto-retrains after every submission."
-
-**Evidence status:** ✅ Verified — code confirms append-only design and no auto-retrain.
-
----
+**Evidence:** `services.py:evaluate_predictions` (L905), `services.py:save_prediction_snapshot` (L765)
 
 ### Q8. What are the "honesty principles" and how are they enforced in code?
 
-**Short spoken answer:**
-> "The system never fabricates data, never hides uncertainty, never uses synthetic silently, and never auto-retrains. These are enforced by code-level guards, not just documentation."
+**Answer:** The system never fabricates data, never hides uncertainty, never uses synthetic silently, and never auto-retrains. These are enforced by code-level guards: NULL preserved (never zeroed), method always stated, synthetic only at Level 3 with explicit opt-in, predictions append-only, no auto-retrain, unverified camera data quarantined.
 
-**Deeper explanation:**
-1. **Missing ≠ zero:** Growth rate stays `NULL` when interval ≤ 0 or heights missing. `_median()` skips `None`. `calculate_measurements()` never imputes.
-2. **Method always stated:** Every prediction has a `method` field (`validated model` / `provisional historical baseline` / `synthetic demo` / `insufficient evidence`).
-3. **Synthetic never silent:** `select_model()` only returns synthetic at Level 3 when `allow_synthetic=True`. The UI passes `allow_synthetic: Boolean(body.allow_synthetic)` (defaults to false).
-4. **Predictions append-only:** `prediction_snapshots` table has no UPDATE path. Feedback links via FK.
-5. **No auto-retrain:** `evaluate_predictions` returns a recommendation; nothing auto-trains.
-6. **Calibration honesty:** Unverified camera data is quarantined and excluded from the baseline.
-
-**Evidence:**
-- `plantreadiness/model.py:select_model` (L332) — fallback chain
-- `plantreadiness/services.py:predict_species_cohort` (L493) — method field
-- `nextjs/pages/api/predict/species.ts` — `allow_synthetic: Boolean(body.allow_synthetic)`
-- `plantreadiness/db.py` — append-only tables, no UPDATE paths
-
-**Likely follow-up:** "Is the synthetic model ever useful?" → "Yes — as a demo to show what a trained model's output looks like. But it's trained on fake data and must never be used for real plant decisions."
-
-**Evidence status:** ✅ Verified — code confirms all guards.
-
----
+**Evidence:** `model.py:select_model` (L332), `services.py:predict_species_cohort` (L493), `db.py` (append-only tables)
 
 ### Q9. What are the limitations of this system?
 
-**Short spoken answer:**
-> "No real trained model exists yet (0 readiness events). The provisional baseline assumes transplant = day after last monitoring day. Camera data is unverified by default. The system cannot claim validated readiness prediction."
+**Answer:** No real trained model for Sunflower (0 readiness events). The provisional baseline assumes transplant = day after last monitoring day. Camera data is unverified by default. No firmware in repo. No auto-retrain. Single-species reference (only Super Orange has historical data).
 
-**Deeper explanation:**
-1. **No validated model:** 0 readiness events → `select_model` returns Level 4 → falls through to provisional baseline.
-2. **Assumed transplant dates:** The baseline's `transplant_reference.is_assumption = true` for all plants (no verified dates).
-3. **Camera unverified:** Observations from uncalibrated cameras are quarantined (`camera_unverified`) and excluded from the baseline.
-4. **No firmware in repo:** The ESP32-CAM code is external; only the filename contract (`PlantID_YYYYMMDD_HHMMSS.jpg`) is documented.
-5. **Single-species reference:** Only Super Orange has historical data. Marigold (Apsara Yellow) now has a trained model (after CSV import with readiness labels), but Sunflower still uses provisional baseline.
-6. **No auto-retrain:** Even with enough data, a human must decide to train and promote a model.
-
-**Evidence:**
-- `plantreadiness/config.py`: `MIN_READINESS_EVENTS=6`, `MIN_INDEPENDENT_PLANTS=4`
-- `plantreadiness/reference.py:transplant_reference` (L150) — assumption logic
-- `docs/DEPLOYMENT.md` §6 — firmware contract
-
-**Likely follow-up:** "What's the next step?" → "Record real transplant outcomes via the feedback loop, then train and validate a real model using the existing grouped-CV pipeline."
-
-**Evidence status:** ✅ Verified — all limitations are documented in code and architecture.
-
----
+**Evidence:** `config.py`: `MIN_READINESS_EVENTS=6`, `MIN_INDEPENDENT_PLANTS=4`; `reference.py:transplant_reference` (L150); `docs/DEPLOYMENT.md` §6
 
 ### Q10. How does the system handle a new species from Cloudinary to prediction?
 
-**Short spoken answer:**
-> "Register a live plant, set CAMERA_SOURCES, upload photos with the right filename prefix, and the camera refresh pulls, measures, and imports them. Prediction then runs against the species' reference baseline (or trained model if readiness labels exist)."
+**Answer:** Register a live plant, set CAMERA_SOURCES, upload photos with the right filename prefix, and the camera refresh pulls, measures, and imports them. Prediction then runs against the species' reference baseline (or trained model if readiness labels exist). Alternatively, upload a CSV via the Feedback tab to bootstrap the baseline.
 
-**Deeper explanation:**
-1. **Register:** `plant_feedback.py register --species "X" --ref Plant02` → live plant (`cohort=None`).
-2. **Configure:** `CAMERA_SOURCES="Plant02_=Plant02"` in `.env`.
-3. **Upload:** photo to Cloudinary with public ID `Plant02_YYYYMMDD_HHMMSS` (must contain reference rod).
-4. **Refresh:** `/api/camera/refresh` or auto-triggered by prediction → pulls image → OpenCV measures → `median_daily_record` → `camera_import` → observation stored.
-5. **Calibration:** If unverified, observation is quarantined but still used for prediction (flagged).
-6. **Predict:** `predict_species_cohort` → uses new observation as current state → provisional baseline or trained model.
-7. **CSV path (alternative):** Upload CSV via Feedback → Reference tab → auto-builds baseline → prediction works from day 1.
-
-**Evidence:**
-- `plantreadiness/camera_refresh.py:refresh_camera_observations` (L68)
-- `plantreadiness/camera_import.py:import_camera_measurements` (L157)
-- `backend/app.py:/api/camera/refresh`, `/api/import`, `/api/predict/species`
-- `plantreadiness/config.py:camera_sources()`, `camera_refresh_enabled()`
-
-**Likely follow-up:** "What if the rod isn't detected?" → "The capture fails and is counted as a failed capture. The daily record is still produced from valid captures only."
-
-**Evidence status:** ✅ Verified — end-to-end flow tested.
+**Evidence:** `camera_refresh.py:refresh_camera_observations` (L68), `camera_import.py:import_camera_measurements` (L157), `backend/app.py:/api/camera/refresh`, `/api/import`, `/api/predict/species`
 
 ---
 
