@@ -3,76 +3,138 @@
 **Repository:** `RKB-vision/PLANTING-WINDOW-PREDICTOR` (branch `main`)
 **Document:** `FACULTY_VIVA_QA.md` (repository root)
 
----
-
-## 1. System Architecture
-
-```
-ESP32-CAM → Cloudinary → OpenCV (plant_measurement.py) → CSV → SQLite (plantreadiness/) → Flask API (backend/app.py) → Next.js UI (nextjs/)
-```
-
-**Three layers:**
-- **Domain layer** (`plantreadiness/`): config, DB, repository, services, reference baseline, model, calibration, CSV/camera import
-- **API layer** (`backend/app.py`): Flask endpoints
-- **UI layer** (`nextjs/`): Next.js frontend
+This document explains the entire system — from camera to prediction — in plain language, with exact file and function references. Written so that someone with little background can follow it.
 
 ---
 
-## 2. Code Structure — What Each File Does
+## 1. What Does This System Do? (The Big Picture)
 
-### `plantreadiness/` (domain layer)
+Imagine you are growing plants in a nursery. You need to know **when each plant is ready to be moved (transplanted) to the field**. Doing this by eye is unreliable. This system:
 
-| File | Role |
-|---|---|
-| `config.py` | All constants: thresholds (MIN_PROVISIONAL_PLANTS=3, MIN_INDEPENDENT_PLANTS=4, MIN_READINESS_EVENTS=6), paths, species names, calibration groups, camera settings, `normalize_plant_ref()` |
-| `db.py` | SQLite schema (10 tables), migrations, raw queries (`readiness_training_rows`, `species_cohort_snapshot`, `record_readiness_event`) |
-| `repository.py` | Repository abstraction (`BaseRepository` + `SQLiteRepository`) — the only way the app touches the DB |
-| `services.py` | Business logic: `run_csv_import`, `predict_species_cohort`, `evaluate_predictions`, `build_reference_baseline`, `_parse_csv_text` |
-| `reference.py` | Builds the reference baseline (medians per age group), `provisional_estimate()` — the active heuristic predictor |
-| `model.py` | ML: `train_countdown_model`, `select_model` (levels 1–4), `predict_days_remaining`, `grouped_cv_mae`, artifact registry |
-| `calibration.py` | Rod-length verification, calibration groups, `is_baseline_usable()` |
-| `csv_import.py` | Low-level CSV importer (append-only, idempotent, growth rate derivation) |
-| `camera_import.py` | Imports OpenCV-measured daily rows into observations; ambiguity quarantine |
-| `camera_refresh.py` | Pulls new Cloudinary images, measures them, imports (fail-open, throttled) |
-| `synthetic.py` | Synthetic demo data generation |
-| `seed.py` | Seeds the DB from the historical CSV |
-| `reset.py` | Wipes DB + backs up generated files |
-| `purge.py` | Removes data by source/cohort (with safety checks) |
-| `verify_calibration.py` | CLI to verify rod length |
-| `reprocess_captures.py` | Re-measure already-processed Cloudinary images |
-| `migrate_species_rename.py` | One-off migration script |
-| `dotenv.py` | Loads `.env` file |
+1. Takes **photos** of the plant every day using an ESP32-CAM (a small camera module).
+2. **Measures** the plant's height, stem width, and leaf count from each photo using computer vision (OpenCV).
+3. **Stores** those measurements in a database.
+4. **Compares** the current plant's measurements against a historical record of plants that were successfully transplanted.
+5. **Predicts** how many days remain until this plant reaches transplant size.
+6. **Learns** from real outcomes over time (did the plant actually survive after transplant?).
+
+The system is deliberately honest: it always says *how* it predicted (method), *how sure* it is (uncertainty), and *what its limitations* are. It never fabricates data.
+
+---
+
+## 2. The Three Layers
+
+The system has three layers, like a three-storey building:
+
+### Layer 1: Domain layer (`plantreadiness/` package)
+This is the "brain." It contains all the business logic, database access, prediction math, and calibration rules. Every other layer calls into this.
+
+### Layer 2: API layer (`backend/app.py`)
+A Flask web server that exposes HTTP endpoints. The frontend and CLI call these endpoints. Each endpoint opens a database connection, calls the domain layer, and returns JSON.
+
+### Layer 3: UI layer (`nextjs/`)
+A Next.js web application. The user selects a species, picks a date, clicks "Predict," and sees the result. There is also a Feedback page for uploading CSVs and viewing evaluations.
+
+---
+
+## 3. What Each File Does (Complete Inventory)
+
+### `plantreadiness/` — The Domain Layer (18 files)
+
+| File | What it does | Key functions |
+|---|---|---|
+| `config.py` | All constants and settings. Thresholds (MIN_PROVISIONAL_PLANTS=3, MIN_READINESS_EVENTS=6), paths, species names, calibration groups, camera settings. Also `normalize_plant_ref()` which normalizes plant IDs. | `normalize_plant_ref`, `camera_sources`, `camera_refresh_enabled` |
+| `db.py` | Creates the SQLite database schema (10 tables). Handles migrations. Contains raw SQL queries including `readiness_training_rows` (builds ML training data) and `species_cohort_snapshot` (pulls observations for prediction). | `init_db`, `record_readiness_event`, `readiness_training_rows`, `species_cohort_snapshot`, `days_between` |
+| `repository.py` | The "repository pattern" — an abstraction layer over the database. `BaseRepository` defines the interface; `SQLiteRepository` implements it. All DB access goes through this. | `register_plant`, `add_observation`, `get_observations`, `record_readiness_event`, `species_cohort_snapshot` |
+| `services.py` | The "business logic" layer. Orchestrates everything: CSV import, prediction, camera refresh, evaluation, snapshot saving. | `run_csv_import`, `predict_species_cohort`, `evaluate_predictions`, `build_reference_baseline`, `_parse_csv_text`, `refresh_camera_observations` |
+| `reference.py` | Builds the reference baseline (median heights, growth rates, days-to-transplant per age group). Also contains `provisional_estimate()` — the heuristic prediction algorithm. | `build_reference_from_repo`, `provisional_estimate`, `transplant_reference`, `compute_plant_trajectory` |
+| `model.py` | Machine learning: trains Ridge/Random Forest with GroupKFold CV, selects models (levels 1-4), predicts, manages artifact registry. | `train_countdown_model`, `select_model`, `predict_days_remaining`, `grouped_cv_mae`, `build_training_frame`, `save_artifact` |
+| `calibration.py` | Rod-length verification. Determines which calibration groups can feed the baseline. | `is_baseline_usable`, `verification_applies` |
+| `csv_import.py` | Low-level CSV importer. Append-only, idempotent. Derives growth rates when missing. | `import_csv` |
+| `camera_import.py` | Imports OpenCV-measured daily rows into observations. Handles ambiguity quarantine. | `import_camera_measurements`, `ref_to_plants` |
+| `camera_refresh.py` | Pulls new Cloudinary images, measures them, imports. Fail-open, throttled. | `refresh_camera_observations`, `_index_plants` |
+| `synthetic.py` | Generates synthetic demo data for testing/demo. | (synthetic data generation) |
+| `seed.py` | Seeds the database from the historical CSV. | `seed_database` |
+| `reset.py` | Wipes the database and backs up generated files. | `reset_database` |
+| `purge.py` | Removes data by source/cohort (with safety checks). | `purge` |
+| `verify_calibration.py` | CLI to verify rod length. | `verify` |
+| `reprocess_captures.py` | Re-measures already-processed Cloudinary images. | `reprocess` |
+| `migrate_species_rename.py` | One-off migration script. | — |
+| `dotenv.py` | Loads `.env` file. | `load_dotenv` |
 
 ### `backend/`
 | File | Role |
 |---|---|
-| `app.py` | Flask API: `/api/predict/species`, `/api/import`, `/api/reference`, `/api/camera/refresh`, `/api/species`, `/api/feedback`, etc. |
+| `app.py` | Flask API server. 15 endpoints: `/api/predict/species`, `/api/import`, `/api/reference`, `/api/camera/refresh`, `/api/species`, `/api/feedback`, `/api/transplant`, `/api/assessments`, etc. |
 
 ### `nextjs/`
 | File | Role |
 |---|---|
-| `pages/index.tsx` | Main prediction page (species selector, predict, result card) |
-| `pages/feedback.tsx` | Feedback + Reference tabs (CSV upload, baseline view, evaluation) |
-| `pages/api/*.ts` | Next.js API proxy routes to Flask |
+| `pages/index.tsx` | Main prediction page: species selector, date picker, predict button, result card with method/uncertainty/limitations |
+| `pages/feedback.tsx` | Feedback + Reference tabs: CSV upload panel, baseline view, evaluation, assessment/transplant forms |
+| `pages/api/*.ts` | Next.js proxy routes that forward requests to Flask (e.g., `predict/species.ts`, `import.ts`) |
 
 ### Root files
 | File | Role |
 |---|---|
-| `plant_measurement.py` | OpenCV vision pipeline: `detect_reference_rod`, `detect_plant`, `calculate_measurements`, `median_daily_record`, `group_records_by_date` |
-| `prediction.py` | CLI entry point for ad-hoc prediction |
-| `plant_feedback.py` | CLI: register, observe, predict, transplant, feedback, import-camera, readiness |
+| `plant_measurement.py` | OpenCV vision pipeline: `detect_reference_rod` (L711), `detect_plant` (L1190), `calculate_measurements` (L1456), `median_daily_record` (L2044), `group_records_by_date` (L414) |
+| `prediction.py` | CLI entry point: `python prediction.py --species X --age-days 20 --height-cm 5.0 --json` |
+| `plant_feedback.py` | CLI: register, observe, predict, transplant, feedback, import-camera, readiness, species-status, list |
 | `reset` | Shell script → calls `plantreadiness/reset.py` |
-| `data/super_orange_growth_data.csv` | Historical reference cohort (10 plants, 250 obs, 25 days) |
-| `Apsara_Yellow_Marigold_Training_Data.csv` | Marigold dataset with readiness labels (12 plants, 300 obs) |
-| `models/synthetic/` | 5 synthetic demo models (joblib) |
-| `models/reference/` | 3 reference baseline JSON files |
-| `models/real/` | 1 real trained model (Marigold, after training) |
+| `data/super_orange_growth_data.csv` | Historical reference cohort (10 plants, 250 obs, 25 days, 4 columns: Date, Age, Plant_ID, Height_cm) |
+| `Apsara_Yellow_Marigold_Training_Data.csv` | Marigold dataset with readiness labels (12 plants, 300 obs, 8 columns including `readiness_observed_date`) |
+| `models/synthetic/` | 5 synthetic demo models (scikit-learn joblib) |
+| `models/reference/` | 3 reference baseline JSON files (heuristic) |
+| `models/real/` | 1 real trained model (Marigold, Random Forest, MAE 0.04 days) |
 
 ---
 
-## 3. The ML Model
+## 4. Complete Data Flow: Camera → Prediction
 
-### 3.1 Features (X) — `model.py:45`
+Here is the exact path a photo takes from the camera to a prediction result:
+
+### Step 1: Image capture and upload
+- ESP32-CAM takes a photo and uploads it to Cloudinary with filename `Plant02_20260915_100000.jpg`
+- The filename follows the contract: `PlantID_YYYYMMDD_HHMMSS.jpg`
+- The prefix (`Plant02_`) identifies which plant
+
+### Step 2: Camera refresh (triggered by prediction or manual call)
+- `backend/app.py:/api/camera/refresh` → `services.py:refresh_camera_observations()` (L68)
+- Reads `CAMERA_SOURCES` from `.env` (e.g., `Plant02_=Plant02`)
+- For each source:
+  1. `camera_refresh.py:_index_plants()` (L258) — looks up registered plants by normalized external_ref. Excludes historical plants (`cohort = 'reference'` or `'manual_upload'`).
+  2. If plant not found → status "unregistered", skip
+  3. If multiple plants match → status "ambiguous", quarantine
+  4. If species mismatch → status "other_species", skip
+  5. Pull new images from Cloudinary via `plant_measurement.py:find_new_cloudinary_images()`
+  6. Measure each image with OpenCV: `detect_reference_rod()` → `detect_plant()` → `calculate_measurements()`
+  7. `group_records_by_date()` groups captures by date
+  8. `median_daily_record()` aggregates N captures into one row (median over valid captures)
+  9. `camera_import.py:import_camera_measurements()` inserts observations (append-only, idempotent)
+- Throttled to 60 seconds by default (`CAMERA_MIN_REFRESH_INTERVAL_SECONDS`)
+- Fail-open: any error is reported, never raised
+
+### Step 3: Prediction
+- `backend/app.py:/api/predict/species` → `services.py:predict_species_cohort()` (L493)
+- `db.py:species_cohort_snapshot()` (L1334) — pulls all observations for the species on the latest date
+- Aggregates into population median: height, age, growth rate, stem width, leaves, plants represented
+- `model.py:select_model()` (L332) — tries Level 1 → 2 → 3 → 4
+- If a model is found: `model.py:predict_days_remaining()` (L440) — predicts days remaining
+- If no model (Level 4) and `allow_provisional_baseline=True`: `reference.py:provisional_estimate()` (L429) — heuristic
+- `_snapshot_result()` → saves to `prediction_snapshots` table (append-only)
+- Returns JSON: method, days_remaining, predicted_readiness_date, uncertainty, cohort snapshot, readiness event counts
+
+### Step 4: Feedback loop
+- User records transplant date → `feedback_14d` table
+- User records 14-day follow-up → survival, condition, height
+- `services.py:evaluate_predictions()` (L905) → compares predicted vs. observed, computes MAE, match rate, recommendation
+
+---
+
+## 5. The ML Model — How It Works
+
+### 5.1 What enters the model (Features)
+
 ```python
 FEATURE_COLUMNS = [
     "age_days", "height_cm", "growth_rate_cm_per_day",
@@ -80,22 +142,22 @@ FEATURE_COLUMNS = [
     "species", "variety",
 ]
 ```
+
 - 5 numeric + 2 categorical = 7 features
 - **Preprocessing:** `SimpleImputer(strategy="median")` → `StandardScaler()` for numeric; `SimpleImputer(strategy="most_frequent")` → `OneHotEncoder(handle_unknown="ignore")` for categorical
 - Missing values filled with column median (not zero)
-- `plant_id`, `observation_date`, `cohort` are **excluded** from X (plant_id used for GroupKFold grouping only)
+- `plant_id`, `observation_date`, `cohort` are **excluded** (plant_id used for GroupKFold grouping only)
 
-### 3.2 Target (y) — `db.py:1962`
+### 5.2 The target (y)
+
 ```python
-row["days_remaining"] = days_between(row["observation_date"], row["readiness_observed_date"])
+days_remaining = readiness_observed_date - observation_date  (calendar days)
 ```
-- `days_remaining = readiness_observed_date - observation_date` (calendar days)
-- Computed in `readiness_training_rows()` (L1896): joins plants + observations + readiness events
-- Only observations **at or before** readiness date are included
-- Earliest readiness event per plant is used (`MIN`)
-- Plants without readiness events contribute nothing
 
-### 3.3 Training Pipeline — `model.py:178`
+Computed in `db.py:readiness_training_rows()` (L1896). Only observations at or before readiness date are included. Plants without readiness events contribute nothing.
+
+### 5.3 Training (`model.py:train_countdown_model`)
+
 ```
 1. check_min_requirements: ≥4 plants AND ≥6 readiness events
 2. For each of 3 models (mean_baseline, ridge, random_forest):
@@ -104,17 +166,19 @@ row["days_remaining"] = days_between(row["observation_date"], row["readiness_obs
 3. Compare: best = lowest MAE, must beat mean_baseline
 4. validated = True only if: best ≠ mean_baseline AND best_mae < baseline_mae AND minimums met
 5. Refit winning model on ALL data
-6. Save as artifact with metadata (species, variety, MAE, n_plants, n_events, training date, validation method)
+6. Save as artifact with metadata
 ```
 
-### 3.4 Three Candidate Models
+### 5.4 The three candidate models
+
 | Model | Algorithm | Purpose |
 |---|---|---|
 | `mean_baseline` | `DummyRegressor(strategy="mean")` | Null hypothesis — "can any model beat guessing the average?" |
 | `ridge` | `Ridge(alpha=1.0)` | Simple linear, L2 regularization |
 | `random_forest` | `RandomForestRegressor(n_estimators=200, max_depth=8, min_samples_leaf=3)` | Non-linear, captures feature interactions |
 
-### 3.5 Model Selection at Prediction Time — `model.py:332`
+### 5.5 Model selection at prediction time (`model.py:select_model`)
+
 ```
 Level 1: Validated species+variety real model → best
 Level 2: Broader validated real model for species → good
@@ -122,37 +186,21 @@ Level 3: Synthetic demo (only if allow_synthetic=True) → demo only
 Level 4: No model → falls through to provisional baseline
 ```
 
-### 3.6 Synthetic Models
-- 5 `.joblib` files in `models/synthetic/` (scikit-learn, trained on fake data)
-- Never used unless `allow_synthetic=True` (defaults to false in API)
-- Always labeled "SYNTHETIC DEMO — not a botanical finding"
+### 5.6 Synthetic vs. Real
 
-### 3.7 Real Models
-- `models/real/` — created only after training with real readiness labels
-- Marigold (Apsara Yellow) now has one: `countdown_Marigold(ApsaraYellow)_ANY_...joblib` (Random Forest, MAE 0.04 days, validated=True)
-- Sunflower has none (0 readiness events)
+- **Synthetic:** 5 `.joblib` files in `models/synthetic/`, trained on fake data. Never used unless `allow_synthetic=True`. Always labeled "SYNTHETIC DEMO."
+- **Real:** `models/real/` — created only after training with real readiness labels. Marigold (Apsara Yellow) now has one (Random Forest, MAE 0.04 days). Sunflower has none (0 readiness events).
 
 ---
 
-## 4. The Reference Baseline (Heuristic Predictor)
+## 6. The Reference Baseline (Heuristic Predictor)
 
-**This is NOT ML.** It's a deterministic lookup table.
+**This is NOT machine learning.** It's a deterministic lookup table.
 
 ### Building (`reference.py:build_reference_from_repo`)
-```
-For each plant:
-  1. Sort observations by date
-  2. Compute trajectory (height, growth rate per day)
-  3. Transplant date: recorded if available, else assumed = day after last observation (flagged)
-  4. For each observation, compute days_until_transplant = transplant_date - observation_date
-
-Group by age_days:
-  For each age group:
-    - median_height_cm, median_growth_rate_cm_per_day
-    - median_days_until_transplant  (the "answer")
-    - iqr_days_until_transplant     (uncertainty)
-    - n_plants (independent plant count)
-```
+- For each plant: sort observations, compute trajectory, determine transplant date (recorded or assumed = day after last observation)
+- For each observation: `days_until_transplant = transplant_date - observation_date`
+- Group by `age_days`: for each age, compute median height, median growth rate, median days-until-transplant, IQR, n_plants
 
 ### Predicting (`reference.py:provisional_estimate`)
 ```
@@ -162,14 +210,13 @@ Group by age_days:
 4. factor = clamp(cohort_rate / plant_rate, 0.5, 2.0)  [if both rates available]
 5. adjusted_days = base_days × factor
 6. predicted_date = observation_date + adjusted_days
-7. Return: days_remaining, predicted_date, uncertainty, n_plants, limitations
 ```
 
 Always labeled `provisional: true`, `method: provisional historical baseline`.
 
 ---
 
-## 5. Key Algorithms
+## 7. Key Algorithms
 
 ### Growth Rate Derivation (`csv_import.py`)
 ```
@@ -197,7 +244,7 @@ Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
 
 ---
 
-## 6. Database Schema (key tables)
+## 8. Database Schema (key tables)
 
 | Table | Purpose |
 |---|---|
@@ -210,7 +257,7 @@ Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
 
 ---
 
-## 7. API Endpoints
+## 9. API Endpoints
 
 | Endpoint | Purpose |
 |---|---|
@@ -222,7 +269,7 @@ Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
 
 ---
 
-## 8. Honesty Principles (enforced in code)
+## 10. Honesty Principles (enforced in code)
 
 1. **Missing ≠ zero:** Growth rate stays `NULL` when interval ≤ 0. `_median()` skips `None`.
 2. **Method always stated:** Every prediction has `method`, `provisional`, `synthetic` fields.
@@ -233,7 +280,7 @@ Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
 
 ---
 
-## 9. What's Implemented vs. What's Not
+## 11. What's Implemented vs. What's Not
 
 | Feature | Status |
 |---|---|
@@ -250,7 +297,7 @@ Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
 
 ---
 
-## 10. Ten Core Viva Questions (with detail)
+## 12. Ten Core Viva Questions
 
 ### Q1. What is this system and what problem does it solve?
 
@@ -278,7 +325,7 @@ Only when both heights exist and interval > 0. Otherwise `NULL`. Never invented.
 
 ### Q5. How does the system prevent CSV plant ID collisions across species?
 
-**Answer:** Plant identity is composite: (data_source, species, variety, external_ref, cohort). The same 'Plant01' in Sunflower and Marigold CSVs creates two distinct plants. `normalize_plant_ref()` normalizes case/whitespace but zero-padding is significant. Ambiguous collisions are quarantined.
+**Answer:** Plant identity is composite: (data_source, species, variety, external_ref, cohort). The same 'Plant01' in a Sunflower CSV and a Marigold CSV creates two distinct plants. `normalize_plant_ref()` normalizes case/whitespace but zero-padding is significant. Ambiguous collisions are quarantined.
 
 **Evidence:** `db.py` schema (L55–65), `config.py:normalize_plant_ref`, `camera_import.py` (L235–245), `tests/test_plant_id_resolution.py` (15 tests)
 
