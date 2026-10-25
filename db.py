@@ -111,26 +111,51 @@ def register_plant(
     species: str,
     variety: str,
     planted_date: Optional[date | str] = None,
-) -> None:
+) -> Any:
     planted_val = str(planted_date) if planted_date else None
+    plant_id_str = str(plant_id).strip()
     with get_connection(db_path) as conn:
         cols = [c[1] for c in conn.execute("PRAGMA table_info(plants)").fetchall()]
         date_col = "planted_date" if "planted_date" in cols else "date_started"
-        has_ds = "data_source" in cols
 
-        if has_ds:
-            conn.execute(
-                f"""
-                INSERT INTO plants (plant_id, species, variety, {date_col}, data_source)
-                VALUES (?, ?, ?, ?, 'real')
-                ON CONFLICT(plant_id) DO UPDATE SET
-                    species=excluded.species,
-                    variety=excluded.variety,
-                    {date_col}=COALESCE(excluded.{date_col}, plants.{date_col})
-                """,
-                (str(plant_id).strip(), species.strip(), variety.strip(), planted_val),
-            )
+        if "external_ref" in cols:
+            # Legacy schema: plant_id is INTEGER PRIMARY KEY AUTOINCREMENT
+            row = conn.execute(
+                "SELECT plant_id FROM plants WHERE external_ref = ? OR CAST(plant_id AS TEXT) = ?",
+                (plant_id_str, plant_id_str),
+            ).fetchone()
+            if row:
+                conn.execute(
+                    f"UPDATE plants SET species = ?, variety = ?, {date_col} = COALESCE(?, {date_col}) WHERE plant_id = ?",
+                    (species.strip(), variety.strip(), planted_val, row[0]),
+                )
+                return row[0]
+
+            try:
+                num_id = int(plant_id_str)
+            except ValueError:
+                num_id = None
+
+            if num_id is not None:
+                conn.execute(
+                    f"""
+                    INSERT INTO plants (plant_id, species, variety, {date_col}, data_source, external_ref)
+                    VALUES (?, ?, ?, ?, 'real', ?)
+                    """,
+                    (num_id, species.strip(), variety.strip(), planted_val, plant_id_str),
+                )
+                return num_id
+            else:
+                cur = conn.execute(
+                    f"""
+                    INSERT INTO plants (species, variety, {date_col}, data_source, external_ref)
+                    VALUES (?, ?, ?, 'real', ?)
+                    """,
+                    (species.strip(), variety.strip(), planted_val, plant_id_str),
+                )
+                return cur.lastrowid
         else:
+            # Clean schema: plant_id is TEXT PRIMARY KEY
             conn.execute(
                 f"""
                 INSERT INTO plants (plant_id, species, variety, {date_col})
@@ -140,8 +165,9 @@ def register_plant(
                     variety=excluded.variety,
                     {date_col}=COALESCE(excluded.{date_col}, plants.{date_col})
                 """,
-                (str(plant_id).strip(), species.strip(), variety.strip(), planted_val),
+                (plant_id_str, species.strip(), variety.strip(), planted_val),
             )
+            return plant_id_str
 
 
 def record_observation(
@@ -356,12 +382,12 @@ def seed_from_csv(
 
     for plant_id, obs_list in rows_by_plant.items():
         obs_list.sort(key=lambda x: x["date"])
-        register_plant(db_path, plant_id, species, variety)
+        resolved_pid = register_plant(db_path, plant_id, species, variety)
 
         for item in obs_list:
             record_observation(
                 db_path,
-                plant_id=plant_id,
+                plant_id=resolved_pid,
                 observation_date=item["date"],
                 height_cm=item["height_cm"],
                 stem_width_cm=item["stem_width_cm"],
@@ -380,7 +406,7 @@ def seed_from_csv(
 
         record_readiness_event(
             db_path,
-            plant_id=plant_id,
+            plant_id=resolved_pid,
             event_date=event_d,
             status="transplanted",
             notes=f"Readiness event for {species}",
