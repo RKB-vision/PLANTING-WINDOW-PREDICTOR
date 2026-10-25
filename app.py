@@ -63,12 +63,13 @@ with st.container(border=True):
         st.metric("Evaluated outcomes", eval_res.get("evaluations_count", 0))
 
 # Main Tabs
-tab_pred, tab_vision, tab_trends, tab_feedback, tab_train = st.tabs([
+tab_pred, tab_upload, tab_vision, tab_trends, tab_feedback, tab_train = st.tabs([
     ":material/psychology: Predict readiness",
+    ":material/upload_file: Upload CSV dataset",
     ":material/photo_camera: Vision & measurement",
     ":material/show_chart: Growth trajectories",
     ":material/fact_check: Feedback & outcomes",
-    ":material/dataset: Data & ML models",
+    ":material/model_training: Model training & evaluation",
 ])
 
 
@@ -153,7 +154,81 @@ with tab_pred:
 
 
 # ---------------------------------------------------------
-# TAB 2: VISION & CAMERA MEASUREMENT
+# TAB 2: UPLOAD CSV DATASET
+# ---------------------------------------------------------
+with tab_upload:
+    st.subheader("Upload plant growth CSV dataset")
+    st.write(
+        "Upload a CSV containing daily plant growth observations. "
+        "The system will compute temporal growth rates and register the cohort for predictions."
+    )
+
+    u_col1, u_col2 = st.columns([1, 1])
+
+    with u_col1:
+        with st.container(border=True):
+            st.markdown("##### Select and upload file")
+            uploaded_csv = st.file_uploader(
+                "Choose CSV file",
+                type=["csv"],
+                help="Columns: Date, Plant_ID, Height_cm, Age, etc.",
+                key="csv_file_uploader",
+            )
+
+            c_spec, c_var = st.columns(2)
+            with c_spec:
+                input_species = st.text_input("Species name", value="Sunflower (SuperOrange)")
+            with c_var:
+                input_variety = st.text_input("Variety name", value="SuperOrange")
+
+            if uploaded_csv is not None:
+                if st.button("Import & seed database", type="primary", width="stretch"):
+                    with st.spinner("Processing and seeding observations..."):
+                        uploaded_csv.seek(0)
+                        count = db.seed_from_csv(
+                            db.DEFAULT_DB_PATH,
+                            uploaded_csv.read(),
+                            species=input_species,
+                            variety=input_variety,
+                        )
+                    st.success(f"Successfully imported {count} observations for '{input_species}'!")
+                    st.cache_data.clear()
+            else:
+                st.divider()
+                st.caption("Or load the default historical cohort from disk:")
+                if st.button("Load default super_orange_growth_data.csv", width="stretch"):
+                    with st.spinner("Importing default cohort..."):
+                        count = db.seed_from_csv(db.DEFAULT_DB_PATH, "data/super_orange_growth_data.csv")
+                    st.success(f"Seeded {count} observations into the database.")
+                    st.cache_data.clear()
+
+    with u_col2:
+        with st.container(border=True):
+            st.markdown("##### CSV preview & format reference")
+            if uploaded_csv is not None:
+                try:
+                    uploaded_csv.seek(0)
+                    df_preview = pd.read_csv(uploaded_csv)
+                    st.caption(f"Found {len(df_preview)} rows and {len(df_preview.columns)} columns in uploaded file:")
+                    st.dataframe(df_preview.head(5), width="stretch")
+                except Exception as e:
+                    st.error(f"Error parsing CSV: {e}")
+            else:
+                st.info("Upload a CSV file on the left to see an instant preview of its rows and columns.")
+                st.markdown("""
+                **Supported columns:**
+                - `Plant_ID` / `plant_id` (e.g. `1`, `Plant02`)
+                - `Date` / `date` (e.g. `02-09-2026` or `2026-09-02`)
+                - `Height_cm` / `height_cm` (e.g. `1.5`)
+                - `Age` / `age_days` (optional, e.g. `8 days` or `8`)
+                - `Stem_Width_cm` (optional)
+                - `Leaf_Count` (optional)
+                - `readiness_observed_date` (optional ground truth label)
+                """)
+
+
+# ---------------------------------------------------------
+# TAB 3: VISION & CAMERA MEASUREMENT
 # ---------------------------------------------------------
 with tab_vision:
     st.subheader("OpenCV camera measurement pipeline")
@@ -305,38 +380,19 @@ with tab_train:
 
     with m_col_right:
         with st.container(border=True):
-            st.markdown("##### Import CSV dataset")
-            st.write("Upload a CSV file containing plant growth observations.")
-
-            uploaded_csv = st.file_uploader("Choose CSV file", type=["csv"], key="csv_uploader")
-
-            s_col1, s_col2 = st.columns(2)
-            with s_col1:
-                input_species = st.text_input("Species name", value="Sunflower (SuperOrange)")
-            with s_col2:
-                input_variety = st.text_input("Variety name", value="SuperOrange")
-
-            if uploaded_csv is not None:
-                try:
-                    df_preview = pd.read_csv(uploaded_csv)
-                    st.caption(f"Preview: {len(df_preview)} rows found in file")
-                    st.dataframe(df_preview.head(3), width="stretch")
-
-                    if st.button("Import & seed database", type="primary", width="stretch"):
-                        uploaded_csv.seek(0)
-                        count = db.seed_from_csv(
-                            db.DEFAULT_DB_PATH,
-                            uploaded_csv.read(),
-                            species=input_species,
-                            variety=input_variety,
-                        )
-                        st.success(f"Successfully imported {count} observations for {input_species}!")
-                        st.cache_data.clear()
-                except Exception as e:
-                    st.error(f"Error reading CSV: {e}")
+            st.markdown("##### Species dataset summary")
+            if species_list:
+                summary_data = []
+                for sp in species_list:
+                    obs_count = len(db.get_observations(species=sp))
+                    t_rows = len(db.get_training_rows(species=sp))
+                    summary_data.append({
+                        "Species": sp,
+                        "Observations": obs_count,
+                        "Training samples (with readiness)": t_rows,
+                    })
+                st.dataframe(pd.DataFrame(summary_data), width="stretch")
             else:
-                if st.button("Re-seed from default super_orange_growth_data.csv", width="stretch"):
-                    with st.spinner("Importing default cohort..."):
-                        count = db.seed_from_csv(db.DEFAULT_DB_PATH, "data/super_orange_growth_data.csv")
-                    st.success(f"Seeded {count} observations into the database.")
-                    st.cache_data.clear()
+                st.info("No species data in database.")
+
+            st.caption("To upload additional plant observation data, visit the 'Upload CSV dataset' tab.")
