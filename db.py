@@ -114,17 +114,34 @@ def register_plant(
 ) -> None:
     planted_val = str(planted_date) if planted_date else None
     with get_connection(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO plants (plant_id, species, variety, planted_date)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(plant_id) DO UPDATE SET
-                species=excluded.species,
-                variety=excluded.variety,
-                planted_date=COALESCE(excluded.planted_date, plants.planted_date)
-            """,
-            (str(plant_id).strip(), species.strip(), variety.strip(), planted_val),
-        )
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(plants)").fetchall()]
+        date_col = "planted_date" if "planted_date" in cols else "date_started"
+        has_ds = "data_source" in cols
+
+        if has_ds:
+            conn.execute(
+                f"""
+                INSERT INTO plants (plant_id, species, variety, {date_col}, data_source)
+                VALUES (?, ?, ?, ?, 'real')
+                ON CONFLICT(plant_id) DO UPDATE SET
+                    species=excluded.species,
+                    variety=excluded.variety,
+                    {date_col}=COALESCE(excluded.{date_col}, plants.{date_col})
+                """,
+                (str(plant_id).strip(), species.strip(), variety.strip(), planted_val),
+            )
+        else:
+            conn.execute(
+                f"""
+                INSERT INTO plants (plant_id, species, variety, {date_col})
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(plant_id) DO UPDATE SET
+                    species=excluded.species,
+                    variety=excluded.variety,
+                    {date_col}=COALESCE(excluded.{date_col}, plants.{date_col})
+                """,
+                (str(plant_id).strip(), species.strip(), variety.strip(), planted_val),
+            )
 
 
 def record_observation(
@@ -137,16 +154,10 @@ def record_observation(
     age_days: Optional[int] = None,
     source: str = "manual",
 ) -> None:
-    """
-    Records a plant observation and strictly computes growth rate
-    relative to the immediate previous valid observation date.
-    When only 1 measurement exists, growth_rate is None (never 0).
-    """
     obs_date = parse_date(str(observation_date)) if isinstance(observation_date, str) else observation_date
     plant_id_str = str(plant_id).strip()
 
     with get_connection(db_path) as conn:
-        # Find prior observation closest to obs_date
         cur = conn.execute(
             """
             SELECT observation_date, height_cm
@@ -165,11 +176,16 @@ def record_observation(
             if days_diff > 0:
                 growth_rate = round((height_cm - prev["height_cm"]) / days_diff, 4)
 
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(observations)").fetchall()]
+        has_source = "source" in cols
+        src_col = "source" if has_source else "data_source"
+        src_val = "real" if (not has_source and source not in ("real", "synthetic")) else source
+
         conn.execute(
-            """
+            f"""
             INSERT INTO observations (
                 plant_id, observation_date, age_days, height_cm,
-                stem_width_cm, visible_true_leaf_count, growth_rate_cm_per_day, source
+                stem_width_cm, visible_true_leaf_count, growth_rate_cm_per_day, {src_col}
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(plant_id, observation_date) DO UPDATE SET
                 height_cm = excluded.height_cm,
@@ -177,7 +193,7 @@ def record_observation(
                 visible_true_leaf_count = COALESCE(excluded.visible_true_leaf_count, observations.visible_true_leaf_count),
                 age_days = COALESCE(excluded.age_days, observations.age_days),
                 growth_rate_cm_per_day = excluded.growth_rate_cm_per_day,
-                source = excluded.source
+                {src_col} = excluded.{src_col}
             """,
             (
                 plant_id_str,
@@ -187,7 +203,7 @@ def record_observation(
                 float(stem_width_cm) if stem_width_cm is not None else None,
                 int(leaf_count) if leaf_count is not None else None,
                 growth_rate,
-                source,
+                src_val,
             ),
         )
 
@@ -200,17 +216,37 @@ def record_readiness_event(
     notes: Optional[str] = None,
 ) -> None:
     ev_date = parse_date(str(event_date)) if isinstance(event_date, str) else event_date
+    plant_id_str = str(plant_id).strip()
     with get_connection(db_path) as conn:
-        conn.execute(
-            """
-            INSERT INTO readiness_events (plant_id, event_date, status, notes)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(plant_id, event_date) DO UPDATE SET
-                status = excluded.status,
-                notes = COALESCE(excluded.notes, readiness_events.notes)
-            """,
-            (str(plant_id).strip(), ev_date.isoformat(), status, notes),
-        )
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(readiness_events)").fetchall()]
+        d_col = "readiness_observed_date" if "readiness_observed_date" in cols else "event_date"
+
+        # Check if already recorded
+        existing = conn.execute(
+            f"SELECT 1 FROM readiness_events WHERE plant_id = ? AND {d_col} = ?",
+            (plant_id_str, ev_date.isoformat()),
+        ).fetchone()
+
+        if existing:
+            return
+
+        if "readiness_definition_version" in cols:
+            conn.execute(
+                f"""
+                INSERT INTO readiness_events (
+                    plant_id, {d_col}, readiness_definition_version, assessment_source, data_source, notes
+                ) VALUES (?, ?, 'v1', 'cli', 'real', ?)
+                """,
+                (plant_id_str, ev_date.isoformat(), f"{status}: {notes}" if notes else status),
+            )
+        else:
+            conn.execute(
+                f"""
+                INSERT INTO readiness_events (plant_id, {d_col}, status, notes)
+                VALUES (?, ?, ?, ?)
+                """,
+                (plant_id_str, ev_date.isoformat(), status, notes),
+            )
 
 
 def seed_from_csv(
