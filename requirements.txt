@@ -1,14 +1,14 @@
-# Computer-vision measurement pipeline (ESP32-CAM -> Cloudinary -> OpenCV)
-numpy
-opencv-python
-rembg[cpu]
+# Core Computer Vision & Image Processing
+opencv-python>=4.8.0
+numpy>=1.24.0
 
-# Data / model layer
-pandas
-scikit-learn
-joblib
+# Data, Model Training & Evaluation
+pandas>=2.0.0
+scikit-learn>=1.3.0
+joblib>=1.3.0
 
-# Backend API (Flask)
-flask
+# Web Dashboard (Streamlit)
+streamlit>=1.30.0
 
-# Storage is local SQLite on this device (no cloud database dependency).
+# Automated Testing
+pytest>=8.0.0
