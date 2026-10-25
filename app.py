@@ -305,11 +305,38 @@ with tab_train:
 
     with m_col_right:
         with st.container(border=True):
-            st.markdown("##### Historical database seed")
-            st.write("Seed the database from the canonical historical successful-plant CSV cohort.")
+            st.markdown("##### Import CSV dataset")
+            st.write("Upload a CSV file containing plant growth observations.")
 
-            if st.button("Re-seed from super_orange_growth_data.csv", width="stretch"):
-                with st.spinner("Importing historical cohort..."):
-                    count = db.seed_from_csv(db.DEFAULT_DB_PATH, "data/super_orange_growth_data.csv")
-                st.success(f"Seeded {count} observations into the database.")
-                st.cache_data.clear()
+            uploaded_csv = st.file_uploader("Choose CSV file", type=["csv"], key="csv_uploader")
+
+            s_col1, s_col2 = st.columns(2)
+            with s_col1:
+                input_species = st.text_input("Species name", value="Sunflower (SuperOrange)")
+            with s_col2:
+                input_variety = st.text_input("Variety name", value="SuperOrange")
+
+            if uploaded_csv is not None:
+                try:
+                    df_preview = pd.read_csv(uploaded_csv)
+                    st.caption(f"Preview: {len(df_preview)} rows found in file")
+                    st.dataframe(df_preview.head(3), width="stretch")
+
+                    if st.button("Import & seed database", type="primary", width="stretch"):
+                        uploaded_csv.seek(0)
+                        count = db.seed_from_csv(
+                            db.DEFAULT_DB_PATH,
+                            uploaded_csv.read(),
+                            species=input_species,
+                            variety=input_variety,
+                        )
+                        st.success(f"Successfully imported {count} observations for {input_species}!")
+                        st.cache_data.clear()
+                except Exception as e:
+                    st.error(f"Error reading CSV: {e}")
+            else:
+                if st.button("Re-seed from default super_orange_growth_data.csv", width="stretch"):
+                    with st.spinner("Importing default cohort..."):
+                        count = db.seed_from_csv(db.DEFAULT_DB_PATH, "data/super_orange_growth_data.csv")
+                    st.success(f"Seeded {count} observations into the database.")
+                    st.cache_data.clear()

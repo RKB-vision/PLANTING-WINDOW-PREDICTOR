@@ -251,52 +251,92 @@ def record_readiness_event(
 
 def seed_from_csv(
     db_path: Path | str,
-    csv_path: Path | str,
-    species: str = "Sunflower(SuperOrange)",
+    csv_source: Union[Path, str, bytes, io.StringIO],
+    species: str = "Sunflower (SuperOrange)",
     variety: str = "SuperOrange",
 ) -> int:
     """
-    Seeds database from historical CSV (e.g. super_orange_growth_data.csv).
-    Automatically records transplant readiness on the day after the final
-    monitoring observation per plant.
+    Seeds database from historical CSV file, path, or string content.
+    Supports columns:
+      - Plant_ID / plant_id / plant_ref
+      - Date / date / observation_date
+      - Age / age / age_days
+      - Height_cm / height_cm / height
+      - Stem_Width_cm / stem_width_cm (optional)
+      - Leaf_Count / visible_true_leaf_count (optional)
+      - readiness_observed_date / transplant_date (optional ground truth)
     """
+    import io
+
     init_db(db_path)
-    csv_file = Path(csv_path)
-    if not csv_file.exists():
-        raise FileNotFoundError(f"CSV file not found: {csv_file}")
+
+    # Resolve input stream
+    if isinstance(csv_source, bytes):
+        f = io.StringIO(csv_source.decode("utf-8-sig", errors="replace"))
+        should_close = True
+    elif isinstance(csv_source, io.StringIO):
+        f = csv_source
+        should_close = False
+    elif isinstance(csv_source, (str, Path)):
+        p = Path(csv_source)
+        if p.exists() and p.is_file():
+            f = open(p, "r", encoding="utf-8-sig")
+            should_close = True
+        elif isinstance(csv_source, str) and "\n" in csv_source:
+            f = io.StringIO(csv_source)
+            should_close = True
+        else:
+            raise FileNotFoundError(f"CSV file not found: {csv_source}")
+    else:
+        raise TypeError(f"Unsupported csv_source type: {type(csv_source)}")
 
     rows_by_plant: Dict[str, List[Dict[str, Any]]] = {}
+    readiness_by_plant: Dict[str, date] = {}
 
-    with open(csv_file, "r", encoding="utf-8-sig") as f:
+    try:
         reader = csv.DictReader(f)
         for raw_r in reader:
-            # Strip whitespace from keys and values
-            r = {k.strip(): v.strip() for k, v in raw_r.items() if k and v}
-            p_id = r.get("Plant_ID") or r.get("plant_id")
+            r = {k.strip(): v.strip() for k, v in raw_r.items() if k and v is not None}
+            p_id = r.get("Plant_ID") or r.get("plant_id") or r.get("plant_ref") or r.get("PlantID")
             if not p_id:
                 continue
             p_id = str(p_id).strip()
 
-            d_str = r.get("Date") or r.get("date")
+            d_str = r.get("Date") or r.get("date") or r.get("observation_date") or r.get("Observation_Date")
+            if not d_str:
+                continue
             obs_date = parse_date(d_str)
 
-            age_str = r.get("Age") or r.get("age") or ""
+            age_str = r.get("Age") or r.get("age") or r.get("age_days") or ""
             age_days = None
             if age_str:
-                clean_age = "".join(ch for ch in age_str if ch.isdigit())
+                clean_age = "".join(ch for ch in str(age_str) if ch.isdigit())
                 if clean_age:
                     age_days = int(clean_age)
 
-            h_str = r.get("Height_cm") or r.get("height_cm") or r.get("Height")
+            h_str = r.get("Height_cm") or r.get("height_cm") or r.get("Height") or r.get("height")
             if h_str is None or h_str == "":
                 continue
             height_cm = float(h_str)
 
-            stem_str = r.get("Stem_Width_cm") or r.get("stem_width_cm")
+            stem_str = r.get("Stem_Width_cm") or r.get("stem_width_cm") or r.get("stem_width")
             stem_width = float(stem_str) if stem_str else None
 
-            leaves_str = r.get("Leaf_Count") or r.get("visible_true_leaf_count")
+            leaves_str = r.get("Leaf_Count") or r.get("visible_true_leaf_count") or r.get("leaves") or r.get("leaf_count")
             leaves = int(leaves_str) if leaves_str else None
+
+            # Check optional explicit readiness/transplant label in row
+            ready_str = (
+                r.get("readiness_observed_date")
+                or r.get("transplant_date")
+                or r.get("readiness_date")
+                or r.get("ready_date")
+            )
+            if ready_str and p_id not in readiness_by_plant:
+                try:
+                    readiness_by_plant[p_id] = parse_date(ready_str)
+                except Exception:
+                    pass
 
             if p_id not in rows_by_plant:
                 rows_by_plant[p_id] = []
@@ -307,10 +347,14 @@ def seed_from_csv(
                 "stem_width_cm": stem_width,
                 "leaves": leaves,
             })
+    finally:
+        if should_close:
+            f.close()
 
     total_inserted = 0
+    from datetime import timedelta
+
     for plant_id, obs_list in rows_by_plant.items():
-        # Sort chronologically to preserve temporal order
         obs_list.sort(key=lambda x: x["date"])
         register_plant(db_path, plant_id, species, variety)
 
@@ -323,20 +367,23 @@ def seed_from_csv(
                 stem_width_cm=item["stem_width_cm"],
                 leaf_count=item["leaves"],
                 age_days=item["age_days"],
-                source="historical_csv",
+                source="real",
             )
             total_inserted += 1
 
-        # Final monitoring day + 1 day = actual historical transplantation
-        final_obs = obs_list[-1]["date"]
-        from datetime import timedelta
-        transplant_date = final_obs + timedelta(days=1)
+        # Use explicit readiness date if provided; otherwise final monitoring day + 1 day
+        if plant_id in readiness_by_plant:
+            event_d = readiness_by_plant[plant_id]
+        else:
+            final_obs = obs_list[-1]["date"]
+            event_d = final_obs + timedelta(days=1)
+
         record_readiness_event(
             db_path,
             plant_id=plant_id,
-            event_date=transplant_date,
+            event_date=event_d,
             status="transplanted",
-            notes="Historical successful plant cohort transplant",
+            notes=f"Readiness event for {species}",
         )
 
     return total_inserted
