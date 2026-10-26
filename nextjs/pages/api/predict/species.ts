@@ -17,7 +17,6 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
         ? null
         : body.variety,
     observation_date: body.observation_date || body.date || null,
-    allow_synthetic: Boolean(body.allow_synthetic),
   }
 
   if (!payload.species) {

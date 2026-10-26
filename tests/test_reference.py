@@ -264,7 +264,7 @@ class TestPersistenceAndReproducibility(unittest.TestCase):
         self.assertTrue(provisional["provisional"])
         self.assertEqual(provisional["method"],
                          config.METHOD_REFERENCE_BASELINE)
-        self.assertFalse(provisional["synthetic"])
+
         self.assertTrue(provisional["limitations"])
 
 

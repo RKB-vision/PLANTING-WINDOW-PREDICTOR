@@ -375,11 +375,10 @@ def correct_feedback(repo: BaseRepository, *, feedback_id: int,
 
 
 def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
-                      allow_synthetic: bool = False,
                       allow_provisional_baseline: bool = False) -> dict:
     """Species-aware prediction for a registered plant's latest observation.
 
-    When no validated/synthetic model is available AND
+    When no validated model is available AND
     ``allow_provisional_baseline`` is set, the successful-cohort reference
     baseline may supply a clearly-labelled *provisional* estimate. The flag
     defaults to off so an ordinary real-plant prediction still refuses
@@ -398,7 +397,6 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
             "available": False,
             "message": "No observations recorded for this plant yet - "
                        "the system is still collecting data.",
-            "synthetic": False,
             "plant_id": plant_id,
             "species": species,
             "variety": variety,
@@ -407,11 +405,8 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
                 species, variety, data_source="real"),
         }
 
-    selection = mdl.select_model(species, variety, models_dir,
-                                 allow_synthetic=allow_synthetic)
-    # Real plants must not silently use synthetic models: select_model only
-    # returns a synthetic artefact when allow_synthetic=True - an explicit
-    # caller request - and the result below is labelled accordingly.
+    selection = mdl.select_model(species, variety, models_dir)
+    # Real plants use only validated real models.
     mdl.load_selection(selection, models_dir)
 
     observation = {
@@ -434,15 +429,7 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
         "observation": dict(obs),
         "readiness_event_counts": repo.readiness_event_counts(
             species, variety, data_source="real"),
-        "synthetic_note": (
-            "SYNTHETIC DEMO: provisional prediction from simulated data - "
-            "not a botanical finding."
-            if result.get("synthetic") else None),
     })
-    if result.get("synthetic") and plant_source == "real":
-        result["cross_source_warning"] = (
-            "This is a REAL plant being shown an explicitly-enabled "
-            "SYNTHETIC DEMO prediction. Do not treat it as evidence.")
     if not result.get("available") and allow_provisional_baseline:
         result = _apply_provisional_baseline(
             result, models_dir, species, variety, observation)
@@ -452,10 +439,9 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
 
 
 def predict_ad_hoc(species: str, variety: Optional[str], observation: dict,
-                   models_dir: Path, allow_synthetic: bool = False) -> dict:
+                   models_dir: Path) -> dict:
     """Prediction from caller-supplied values (no stored plant required)."""
-    selection = mdl.select_model(species, variety, models_dir,
-                                 allow_synthetic=allow_synthetic)
+    selection = mdl.select_model(species, variety, models_dir)
     mdl.load_selection(selection, models_dir)
     observation = dict(observation)
     observation["species"] = species
@@ -494,7 +480,6 @@ def predict_species_cohort(repo: BaseRepository, species: str,
                            variety: Optional[str] = None,
                            models_dir: Path = Path("models"),
                            observation_date: Optional[str] = None,
-                           allow_synthetic: bool = False,
                            allow_provisional_baseline: bool = False) -> dict:
     """Predict readiness for a species using its latest observed cohort.
 
@@ -523,7 +508,6 @@ def predict_species_cohort(repo: BaseRepository, species: str,
                 f"No real observations found for {species_label} on the "
                 "latest available date - the system is still collecting data."
             ),
-            "synthetic": False,
             "species": species,
             "variety": variety,
             "observation_date": target_date,
@@ -579,8 +563,7 @@ def predict_species_cohort(repo: BaseRepository, species: str,
     }
 
     result = predict_ad_hoc(
-        species, variety, representative_observation, models_dir,
-        allow_synthetic=allow_synthetic)
+        species, variety, representative_observation, models_dir)
 
     result.update({
         "species": species,
@@ -589,10 +572,6 @@ def predict_species_cohort(repo: BaseRepository, species: str,
         "prediction_scope": "species_cohort",
         "cohort_snapshot": cohort_snapshot,
         "readiness_event_counts": event_counts,
-        "synthetic_note": (
-            "SYNTHETIC DEMO: provisional prediction from simulated data - "
-            "not a botanical finding."
-            if result.get("synthetic") else None),
     })
     if not result.get("available") and allow_provisional_baseline:
         result = _apply_provisional_baseline(
@@ -643,11 +622,9 @@ def model_status(models_dir: Path) -> dict:
 
 
 def species_model_plan(repo: BaseRepository, species: str,
-                       variety: Optional[str], models_dir: Path,
-                       allow_synthetic: bool = False) -> dict:
+                       variety: Optional[str], models_dir: Path) -> dict:
     """Which fallback level *would* be used for this species/variety."""
-    selection = mdl.select_model(species, variety, models_dir,
-                                 allow_synthetic=allow_synthetic)
+    selection = mdl.select_model(species, variety, models_dir)
     real_counts = repo.readiness_event_counts(species, variety,
                                               data_source="real")
     return {
@@ -676,8 +653,6 @@ def _method_for(result: dict) -> str:
     explicit = result.get("method")
     if explicit:
         return explicit
-    if result.get("synthetic"):
-        return config.METHOD_SYNTHETIC_DEMO
     if result.get("available"):
         return config.METHOD_VALIDATED_MODEL
     return config.METHOD_UNAVAILABLE
@@ -711,7 +686,6 @@ def _apply_provisional_baseline(result: dict, models_dir: Path, species: str,
         "available": True,
         "method": config.METHOD_REFERENCE_BASELINE,
         "provisional": True,
-        "synthetic": False,
         "data_source": "real",
         "days_remaining": estimate.get("days_remaining"),
         "predicted_readiness_date": estimate.get("predicted_readiness_date"),
@@ -729,7 +703,6 @@ def _apply_provisional_baseline(result: dict, models_dir: Path, species: str,
         "message": (estimate.get("message")
                     or config.PROVISIONAL_BASELINE_MESSAGE),
         "limitations": estimate.get("limitations", []),
-        "synthetic_note": None,
     })
     return merged
 
@@ -790,7 +763,6 @@ def save_prediction_snapshot(repo: BaseRepository, result: dict, *,
                           or result.get("prediction_scope") or "plant"),
         observation_date=result.get("observation_date"),
         level=_coerce_level(result.get("level")),
-        synthetic=bool(result.get("synthetic")),
         provisional=bool(result.get("provisional")),
         days_remaining=days,
         predicted_readiness_date=result.get("predicted_readiness_date"),

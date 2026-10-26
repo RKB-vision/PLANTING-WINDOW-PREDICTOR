@@ -331,16 +331,14 @@ def list_artifacts(models_dir: Path, data_source: str) -> list[dict]:
 
 def select_model(species: str,
                  variety: Optional[str],
-                 models_dir: Path,
-                 allow_synthetic: bool = False) -> dict:
-    """Apply the fallback order of task section 8.
+                 models_dir: Path) -> dict:
+    """Apply the fallback order.
 
     1. validated species/variety model (real),
     2. broader validated real model for the species,
-    3. synthetic demo model - ONLY when explicitly enabled, clearly labelled,
-    4. otherwise: insufficient evidence (level 4, no model).
+    3. otherwise: insufficient evidence (level 3, no model).
 
-    Returns a dict with ``level`` (1-4), ``artifact`` (or None),
+    Returns a dict with ``level`` (1-3), ``artifact`` (or None),
     ``entry`` (or None) and a human-readable ``message``.
     """
     species_l = (species or "").strip().lower()
@@ -348,8 +346,6 @@ def select_model(species: str,
 
     real_entries = [e for e in list_artifacts(models_dir, "real")
                     if e.get("active", True)]
-    synth_entries = [e for e in list_artifacts(models_dir, "synthetic")
-                     if e.get("active", True)]
 
     def _validated(entry) -> bool:
         return bool(entry["metadata"].get("validated"))
@@ -396,35 +392,14 @@ def select_model(species: str,
                             "(no validated species/variety model yet); "
                             "uncertainty and limitations apply.")}
 
-    # ---- Level 3: synthetic demo, explicit opt-in only --------------------
-    if allow_synthetic:
-        synth_specific_variety = [e for e in synth_entries
-                                  if _exact_scope(e, species_l, variety_l)]
-        synth_species = [e for e in synth_entries
-                         if e not in synth_specific_variety
-                         and _species_covered(e, species_l)]
-        for entry in synth_specific_variety + _prefer_species_specific(
-                synth_species, species_l):
-            scope = "species/variety" if entry in synth_specific_variety \
-                else "broader species"
-            return {"level": 3, "data_source": "synthetic", "entry": entry,
-                    "artifact": None,
-                    "message": (f"Level 3: SYNTHETIC DEMO prediction "
-                                f"({scope} simulated model) - clearly "
-                                f"labelled, not a botanical finding.")}
-
-    # ---- Level 4: insufficient evidence -----------------------------------
-    note = ""
-    if not allow_synthetic and synth_entries:
-        note = (" Synthetic demo models exist but were NOT used: synthetic "
-                "fallback must be explicitly enabled for this plant.")
-    return {"level": 4, "data_source": None, "entry": None, "artifact": None,
-            "message": config.UNAVAILABLE_MESSAGE + note}
+    # ---- Level 3: insufficient evidence -----------------------------------
+    return {"level": 3, "data_source": None, "entry": None, "artifact": None,
+            "message": config.UNAVAILABLE_MESSAGE}
 
 
 def load_selection(selection: dict, models_dir: Path) -> dict:
     """Load the model for a selection result (no-op for level 4)."""
-    if selection["level"] == 4 or selection["entry"] is None:
+    if selection["level"] == 3 or selection["entry"] is None:
         selection["artifact"] = None
         return selection
     selection["artifact"] = load_artifact(
@@ -451,14 +426,10 @@ def predict_days_remaining(selection: dict, observation: dict) -> dict:
     past_readiness is True, status is 'past_readiness', and a descriptive note
     is included indicating readiness was reached prior to this observation.
     """
-    if selection["level"] == 4 or not selection.get("artifact"):
+    if selection["level"] == 3 or not selection.get("artifact"):
         return {
             "available": False,
-            # selection.message already equals config.UNAVAILABLE_MESSAGE,
-            # plus an explanatory note (e.g. "synthetic models exist but were
-            # NOT used") - surfacing it keeps the refusal honest.
             "message": selection.get("message") or config.UNAVAILABLE_MESSAGE,
-            "synthetic": False,
             "predicted_readiness_date": None,
         }
 
@@ -506,7 +477,6 @@ def predict_days_remaining(selection: dict, observation: dict) -> dict:
         "level": selection["level"],
         "message": selection["message"],
         "data_source": selection["data_source"],
-        "synthetic": bool(meta.get("is_synthetic")),
         "validated": bool(meta.get("validated")),
         "model_name": meta.get("model_name"),
         "n_independent_plants": meta.get("n_independent_plants"),

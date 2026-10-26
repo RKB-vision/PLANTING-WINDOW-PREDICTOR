@@ -41,8 +41,7 @@ interface PredictionResult {
   species: string
   variety: string | null
   observation_date: string | null
-  synthetic: boolean
-  synthetic_note?: string | null
+
   provisional?: boolean
   method?: string
   reference_basis?: string
@@ -78,14 +77,12 @@ function isPlantable(result: PredictionResult): boolean {
 }
 
 function methodBadgeClass(result: PredictionResult): string {
-  if (result.synthetic) return 'badge badge-warning'
   if (result.provisional) return 'badge badge-info'
   if (result.available) return 'badge badge-success'
   return 'badge badge-neutral'
 }
 
 function methodLabel(result: PredictionResult): string {
-  if (result.synthetic) return 'Synthetic demo'
   if (result.provisional) return 'Provisional baseline'
   if (result.available) return 'Validated model'
   return 'Insufficient evidence'
@@ -96,8 +93,6 @@ export default function Home() {
   const [selectedSpecies, setSelectedSpecies] = useState('')
   const [selectedVariety, setSelectedVariety] = useState('All varieties')
   const [selectedDate, setSelectedDate] = useState('')
-  const [allowSynthetic, setAllowSynthetic] = useState(false)
-
   const [loadingSpecies, setLoadingSpecies] = useState(true)
   const [loadingPrediction, setLoadingPrediction] = useState(false)
   const [result, setResult] = useState<PredictionResult | null>(null)
@@ -145,7 +140,6 @@ export default function Home() {
         species: selectedSpecies,
         variety: selectedVariety,
         observation_date: selectedDate || null,
-        allow_synthetic: allowSynthetic,
       })
       setResult(resp.data)
     } catch (e: any) {
@@ -262,14 +256,6 @@ export default function Home() {
                   'Predict readiness'
                 )}
               </button>
-              <label className="checkbox-row" style={{ margin: 0 }}>
-                <input
-                  type="checkbox"
-                  checked={allowSynthetic}
-                  onChange={e => setAllowSynthetic(e.target.checked)}
-                />
-                Synthetic demo
-              </label>
             </div>
 
             {currentSpecies && (
@@ -337,12 +323,7 @@ export default function Home() {
               </>
             )}
 
-            {result.synthetic && (
-              <p className="small" style={{ margin: '10px 0 0' }}>
-                Synthetic demo result — not a validated production prediction.
-              </p>
-            )}
-            {result.provisional && !result.synthetic && (
+            {result.provisional && (
               <p className="small" style={{ margin: '10px 0 0' }}>
                 Provisional estimate from the reference baseline. The reference
                 transplant date is assumed, not verified.

@@ -39,34 +39,6 @@ interface FeedbackRow {
   feedback_state?: { status: string; days_overdue: number }
 }
 
-interface Evaluation {
-  n_predictions_evaluated: number
-  n_independent_plants: number
-  skipped_after_transplant: number
-  sufficient_evidence: boolean
-  overall: {
-    mean_abs_error_days: number | null
-    match_rate: number | null
-    n_with_14d_outcome: number
-    survival_rate_14d: number | null
-    n_incomplete_feedback: number
-  }
-  by_method: Record<
-    string,
-    {
-      n_predictions: number
-      n_independent_plants: number
-      mean_abs_error_days: number | null
-    }
-  >
-  comparison: {
-    methods_compared: string[]
-    better_method: string | null
-    auto_applied: boolean
-    recommendation: string
-  }
-  notes: string[]
-}
 
 interface Baseline {
   species: string
@@ -88,12 +60,11 @@ interface Baseline {
   limitations: string[]
 }
 
-type TabKey = 'feedback' | 'reference' | 'evaluation'
+type TabKey = 'feedback' | 'reference'
 
 const TABS: { key: TabKey; label: string }[] = [
   { key: 'feedback', label: 'Feedback' },
   { key: 'reference', label: 'Reference' },
-  { key: 'evaluation', label: 'Evaluation' },
 ]
 
 function fmt(v: number | string | null | undefined, suffix = ''): string {
@@ -116,7 +87,6 @@ export default function FeedbackPage() {
 
   const [predictions, setPredictions] = useState<Prediction[]>([])
   const [pending, setPending] = useState<FeedbackRow[]>([])
-  const [evaluation, setEvaluation] = useState<Evaluation | null>(null)
   const [message, setMessage] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [tab, setTab] = useState<TabKey>('feedback')
@@ -196,16 +166,6 @@ export default function FeedbackPage() {
     }
   }
 
-  const loadEvaluation = async (sp?: string) => {
-    try {
-      const resp = await axios.get('/api/evaluation', {
-        params: sp ? { species: sp } : {},
-      })
-      setEvaluation(resp.data)
-    } catch (e: any) {
-      setError(e?.response?.data?.error || 'Failed to load evaluation.')
-    }
-  }
 
   const loadBaseline = async (sp: string) => {
     if (!sp) return
@@ -227,13 +187,11 @@ export default function FeedbackPage() {
     loadPlants()
     loadPending()
     loadPredictions()
-    loadEvaluation()
   }, [])
 
   useEffect(() => {
     if (selectedSpecies) {
       loadBaseline(selectedSpecies)
-      loadEvaluation(selectedSpecies)
     }
   }, [selectedSpecies])
 
@@ -368,7 +326,6 @@ export default function FeedbackPage() {
       setFollowFeedback('')
       setFollowNotes('')
       loadPending()
-      loadEvaluation(selectedSpecies)
     } catch (e: any) {
       setError(e?.response?.data?.error || 'Failed to submit follow-up.')
     }
@@ -939,136 +896,6 @@ export default function FeedbackPage() {
       </>
       )}
 
-      {tab === 'evaluation' && (
-        <section className="card">
-          <h2 className="card-title">Evaluation</h2>
-          <p className="card-hint">
-            Predicted vs observed transplant dates. Models are never promoted
-            automatically.
-          </p>
-          {!evaluation ? (
-            <p className="muted">Loading…</p>
-          ) : (
-            <>
-              <div className="grid">
-                <Stat
-                  label="Predictions evaluated"
-                  value={fmt(evaluation.n_predictions_evaluated)}
-                />
-                <Stat
-                  label="Independent plants"
-                  value={fmt(evaluation.n_independent_plants)}
-                />
-                <Stat
-                  label="Mean abs error"
-                  value={fmt(evaluation.overall.mean_abs_error_days, ' d')}
-                />
-              </div>
-
-              <div
-                className={
-                  'alert ' +
-                  (evaluation.sufficient_evidence
-                    ? 'alert-success'
-                    : 'alert-warning')
-                }
-                style={{ marginTop: 16 }}
-              >
-                {evaluation.sufficient_evidence
-                  ? 'Enough independent evidence has accumulated to compare methods.'
-                  : 'Not enough independent evidence yet — predictions are not being promoted or retrained.'}
-              </div>
-
-              <div className="stat" style={{ marginTop: 4 }}>
-                <div className="stat-label">Comparison (never auto-applied)</div>
-                <p style={{ marginTop: 8, marginBottom: 6 }}>
-                  {evaluation.comparison.recommendation}
-                </p>
-                <p className="muted small" style={{ margin: 0 }}>
-                  Methods compared:{' '}
-                  {evaluation.comparison.methods_compared.join(', ') || '—'} ·
-                  auto-applied: {String(evaluation.comparison.auto_applied)}
-                </p>
-              </div>
-
-              <details className="disclosure">
-                <summary>More details</summary>
-                <div className="grid" style={{ marginTop: 12 }}>
-                  <Stat
-                    label="Matched observed date"
-                    value={
-                      evaluation.overall.match_rate === null
-                        ? '—'
-                        : `${Math.round(evaluation.overall.match_rate * 100)}%`
-                    }
-                  />
-                  <Stat
-                    label="14-day outcomes"
-                    value={fmt(evaluation.overall.n_with_14d_outcome)}
-                  />
-                  <Stat
-                    label="Incomplete feedback"
-                    value={fmt(evaluation.overall.n_incomplete_feedback)}
-                  />
-                </div>
-                {evaluation.notes.length > 0 && (
-                  <ul className="list">
-                    {evaluation.notes.map((n, i) => (
-                      <li key={i}>{n}</li>
-                    ))}
-                  </ul>
-                )}
-              </details>
-
-              <div className="subhead">Prediction history</div>
-              {predictions.length === 0 ? (
-                <p className="muted small" style={{ margin: 0 }}>
-                  No predictions recorded yet.
-                </p>
-              ) : (
-                <div className="table-wrap">
-                  <table className="table">
-                    <thead>
-                      <tr>
-                        <th>#</th>
-                        <th>Plant</th>
-                        <th>Method</th>
-                        <th className="num">Countdown</th>
-                        <th>Readiness date</th>
-                        <th>Created</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {predictions.map(p => (
-                        <tr key={p.prediction_id}>
-                          <td>{p.prediction_id}</td>
-                          <td>{p.plant_id ?? '—'}</td>
-                          <td>
-                            {p.method}
-                            {p.provisional ? (
-                              <span
-                                className="badge badge-info"
-                                style={{ marginLeft: 8 }}
-                              >
-                                provisional
-                              </span>
-                            ) : null}
-                          </td>
-                          <td className="num">
-                            {countdownText(p.days_remaining)}
-                          </td>
-                          <td>{fmt(p.predicted_readiness_date)}</td>
-                          <td>{p.created_at?.split('T')[0]}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )}
-            </>
-          )}
-        </section>
-      )}
     </Layout>
   )
 }

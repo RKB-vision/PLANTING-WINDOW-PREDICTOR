@@ -54,9 +54,9 @@ class TestFallbackOrder(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_level4_when_no_models(self):
+    def test_level3_when_no_models(self):
         sel = mdl.select_model("Super Orange", "Early", self.models)
-        self.assertEqual(sel["level"], 4)
+        self.assertEqual(sel["level"], 3)
         self.assertEqual(sel["message"], config.UNAVAILABLE_MESSAGE)
 
     def test_level1_exact_species_variety_real_model(self):
@@ -90,43 +90,17 @@ class TestFallbackOrder(unittest.TestCase):
                            validated=False)["metadata"],
         ])
         sel = mdl.select_model("Super Orange", "Early", self.models)
-        self.assertEqual(sel["level"], 4)
+        self.assertEqual(sel["level"], 3)
 
-    def test_unknown_species_is_level4(self):
+    def test_unknown_species_is_level3(self):
         _register(self.models, "real", [
             _make_artifact("Super Orange", "Early", "real")["metadata"],
         ])
         sel = mdl.select_model("Tomato", "Roma", self.models)
-        self.assertEqual(sel["level"], 4)
-
-    def test_synthetic_not_used_without_explicit_opt_in(self):
-        _register(self.models, "synthetic", [
-            _make_artifact("Super Orange", "Early", "synthetic")["metadata"],
-        ])
-        sel = mdl.select_model("Super Orange", "Early", self.models)
-        self.assertEqual(sel["level"], 4)
-        self.assertIn("NOT used", sel["message"])
-
-    def test_synthetic_used_only_when_explicitly_enabled(self):
-        _register(self.models, "synthetic", [
-            _make_artifact("Super Orange", "Early", "synthetic")["metadata"],
-        ])
-        sel = mdl.select_model("Super Orange", "Early", self.models,
-                               allow_synthetic=True)
         self.assertEqual(sel["level"], 3)
-        self.assertEqual(sel["data_source"], "synthetic")
 
-    def test_real_model_preferred_over_synthetic(self):
-        _register(self.models, "real", [
-            _make_artifact("Super Orange", "Early", "real")["metadata"],
-        ])
-        _register(self.models, "synthetic", [
-            _make_artifact("Super Orange", "Early", "synthetic")["metadata"],
-        ])
-        sel = mdl.select_model("Super Orange", "Early", self.models,
-                               allow_synthetic=True)
-        self.assertEqual(sel["level"], 1)
-        self.assertEqual(sel["data_source"], "real")
+
+
 
     def test_retired_artifacts_not_selected(self):
         meta = _make_artifact("Super Orange", "Early", "real")["metadata"]
@@ -138,42 +112,8 @@ class TestFallbackOrder(unittest.TestCase):
              "artifacts": [{"file": "old.joblib", "metadata": meta,
                             "active": False}]}))
         sel = mdl.select_model("Super Orange", "Early", self.models)
-        self.assertEqual(sel["level"], 4)
+        self.assertEqual(sel["level"], 3)
 
-
-class TestDataSourceSeparation(unittest.TestCase):
-    """Synthetic-trained and real-trained models live in separate dirs."""
-
-    def test_registry_paths_are_separate(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            models = Path(tmp)
-            _register(models, "real", [
-                _make_artifact("Super Orange", "Early", "real")["metadata"]])
-            _register(models, "synthetic", [
-                _make_artifact("Super Orange", "Early", "synthetic")["metadata"]])
-            self.assertTrue((models / "real" / "registry.json").exists())
-            self.assertTrue((models / "synthetic" / "registry.json").exists())
-            # removing the synthetic dir must not affect real listings
-            import shutil
-            shutil.rmtree(models / "synthetic")
-            real = mdl.list_artifacts(models, "real")
-            synth = mdl.list_artifacts(models, "synthetic")
-            self.assertEqual(len(real), 1)
-            self.assertEqual(len(synth), 0)
-
-    def test_save_artifact_goes_to_source_dir_only(self):
-        from plantreadiness import synthetic as syn
-        with tempfile.TemporaryDirectory() as tmp:
-            models = Path(tmp)
-            df_rows = []
-            artifact = {"model": None,
-                        "metadata": _make_artifact(
-                            "Super Orange", "Early", "synthetic")["metadata"]}
-            saved = mdl.save_artifact(artifact, models)
-            self.assertTrue(Path(saved["file"]).exists())
-            self.assertIn(str(models / "synthetic"), saved["file"])
-            self.assertFalse((models / "real").exists())
-            _ = df_rows, syn
 
 
 class TestTrainingGuards(unittest.TestCase):

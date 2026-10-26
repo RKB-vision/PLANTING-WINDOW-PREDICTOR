@@ -79,7 +79,6 @@ class TestPredictAndFeedbackApi(BackendApiBase):
         self.assertTrue(body["available"])
         self.assertTrue(body["provisional"])
         self.assertEqual(body["method"], "historical_reference_baseline")
-        self.assertFalse(body["synthetic"])
 
     def test_assessment_transplant_followup_flow(self):
         self.client.post("/api/reference/build",
@@ -119,11 +118,6 @@ class TestPredictAndFeedbackApi(BackendApiBase):
             "height_after_14d_cm": 3.0,
             "visible_condition": "healthy"})
         self.assertEqual(resp.status_code, 201)
-
-        eval_resp = self.client.get(
-            "/api/evaluation?species=Super Orange").get_json()
-        self.assertEqual(eval_resp["n_predictions_evaluated"], 1)
-        self.assertEqual(eval_resp["overall"]["n_with_14d_outcome"], 1)
 
         # prediction history is preserved (species prediction was snapshotted)
         history = self.client.get(

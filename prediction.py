@@ -51,21 +51,17 @@ from plantreadiness.repository import SQLiteRepository
 
 
 def predict_for_plant(conn, plant_id: int, models_dir: Path,
-                      allow_synthetic: bool = False,
                       allow_provisional_baseline: bool = False) -> dict:
     """Species-aware prediction for a registered plant's latest observation."""
     return svc.predict_for_plant(SQLiteRepository(conn), plant_id, models_dir,
-                                 allow_synthetic=allow_synthetic,
                                  allow_provisional_baseline=(
                                      allow_provisional_baseline))
 
 
 def predict_ad_hoc(species: str, variety: str | None,
-                   observation: dict, models_dir: Path,
-                   allow_synthetic: bool = False) -> dict:
+                   observation: dict, models_dir: Path) -> dict:
     """Prediction from values given on the command line."""
-    return svc.predict_ad_hoc(species, variety, observation, models_dir,
-                              allow_synthetic=allow_synthetic)
+    return svc.predict_ad_hoc(species, variety, observation, models_dir)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,9 +166,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--true-leaves", type=int)
     parser.add_argument("--db", default=str(config.DEFAULT_DB_PATH))
     parser.add_argument("--models-dir", default=str(config.MODELS_DIR))
-    parser.add_argument("--allow-synthetic", action="store_true",
-                        help="explicitly allow the SYNTHETIC DEMO model "
-                             "(never silent, always labelled)")
+
     parser.add_argument("--json", action="store_true",
                         help="print the raw result as JSON")
     return parser
@@ -186,7 +180,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.plant is not None:
             result = predict_for_plant(conn, args.plant, models_dir,
-                                       allow_synthetic=args.allow_synthetic)
+                                     allow_provisional_baseline=False)
+
         elif args.species:
             observation = {
                 "age_days": args.age_days,
@@ -201,8 +196,8 @@ def main(argv: list[str] | None = None) -> int:
                       file=sys.stderr)
                 return 2
             result = predict_ad_hoc(args.species, args.variety, observation,
-                                    models_dir,
-                                    allow_synthetic=args.allow_synthetic)
+                                    models_dir)
+
             counts = dbm.readiness_event_counts(
                 conn, args.species, args.variety, data_source="real")
             result["readiness_event_counts"] = counts

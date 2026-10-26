@@ -231,62 +231,18 @@ class TestPredictionFallback(ServiceBase):
         res = svc.predict_for_plant(self.repo, pid, self.models)
         self.assertFalse(res["available"])
         self.assertEqual(res["message"], config.UNAVAILABLE_MESSAGE)
-        self.assertFalse(res["synthetic"])
         self.assertIn("readiness_event_counts", res)
 
     def test_unknown_plant_raises(self):
         with self.assertRaises(NotFoundError):
             svc.predict_for_plant(self.repo, 9999, self.models)
 
-    def test_synthetic_not_used_without_opt_in(self):
-        """Even with a trained synthetic model, the default is refusal."""
-        pid = self._plant()
-        self._seed_observations(pid)
-        self._train_synthetic_model()
-        res = svc.predict_for_plant(self.repo, pid, self.models)
-        self.assertFalse(res["available"])
-        # honest refusal, plus the explanation that demo models exist
-        # but were deliberately NOT used
-        self.assertTrue(res["message"].startswith(config.UNAVAILABLE_MESSAGE))
-        self.assertIn("NOT used", res["message"])
-        self.assertFalse(res["synthetic"])
 
-        opted = svc.predict_for_plant(self.repo, pid, self.models,
-                                      allow_synthetic=True)
-        self.assertTrue(opted["available"])
-        self.assertTrue(opted["synthetic"])
-        self.assertIn("SYNTHETIC DEMO", opted["message"])
-        self.assertIn("cross_source_warning", opted)
-
-    def _train_synthetic_model(self):
-        """Train + save a small validated synthetic artefact for Level 3."""
-        import random
-        rng = random.Random(7)
-        rows = []
-        for pid in range(1, 13):
-            ready_age = rng.randint(26, 34)
-            for age in range(8, ready_age + 1, 3):
-                rows.append({
-                    "plant_id": pid,
-                    "species": "Super Orange",
-                    "variety": "Early",
-                    "age_days": age,
-                    "height_cm": 0.3 + 0.25 * age + rng.gauss(0, 0.1),
-                    "growth_rate_cm_per_day": 0.25 + rng.gauss(0, 0.05),
-                    "stem_width_cm": None,
-                    "visible_true_leaf_count": None,
-                    "days_remaining": ready_age - age,
-                })
-        df = mdl.build_training_frame(rows)
-        artifact = mdl.train_countdown_model(
-            df, data_source="synthetic", species="Super Orange",
-            variety="Early", source_label="unit test")
-        mdl.save_artifact(artifact, self.models)
 
     def test_species_plan_reports_evidence_shortfall(self):
         plan = svc.species_model_plan(self.repo, "Super Orange", "Early",
                                       self.models)
-        self.assertEqual(plan["level"], 4)
+        self.assertEqual(plan["level"], 3)
         self.assertFalse(plan["meets_min_requirements"])
         self.assertEqual(plan["real_readiness_event_counts"]
                          ["readiness_events"], 0)
@@ -311,25 +267,18 @@ class TestPredictionFallback(ServiceBase):
 class TestDashboardSeparation(ServiceBase):
     def test_dashboard_groups_by_source(self):
         real = self._plant(data_source="real")
-        syn = self._plant(species="Demo Bean", variety="Bush",
-                          data_source="synthetic")
         svc.record_observation(self.repo, plant_id=real,
                                observation_date="2083-05-10", height_cm=3)
-        svc.record_observation(self.repo, plant_id=syn,
-                               observation_date="2083-05-10", height_cm=3,
-                               data_source="synthetic")
         summary = svc.dashboard_summary(self.repo, self.models)
-        self.assertEqual(summary["n_plants"], 2)
+        self.assertEqual(summary["n_plants"], 1)
         sources = {r["data_source"]
                    for r in summary["readiness_by_species"]}
-        self.assertEqual(sources, {"real", "synthetic"})
+        self.assertEqual(sources, {"real"})
         self.assertEqual(summary["model_status"]["real"]["active"], 0)
-        self.assertEqual(summary["model_status"]["synthetic"]["active"], 0)
 
     def test_model_status_handles_missing_registry(self):
         status = svc.model_status(Path("/nonexistent/models"))
         self.assertEqual(status["real"]["total"], 0)
-        self.assertEqual(status["synthetic"]["total"], 0)
 
 
 if __name__ == "__main__":

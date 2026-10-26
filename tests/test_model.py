@@ -7,7 +7,6 @@ from pathlib import Path
 from plantreadiness import csv_import
 from plantreadiness import db as dbm
 from plantreadiness import model as mdl
-from plantreadiness import synthetic
 
 ROOT = Path(__file__).resolve().parent.parent
 CSV_PATH = ROOT / "data" / "super_orange_growth_data.csv"
@@ -53,7 +52,7 @@ class TestGroupedValidation(unittest.TestCase):
 
     def test_training_metadata_lists_disjoint_plants_and_metrics(self):
         df = _synthetic_frame()
-        artifact = mdl.train_countdown_model(df, data_source="synthetic",
+        artifact = mdl.train_countdown_model(df, data_source="real",
                                              source_label="unit test")
         meta = artifact["metadata"]
         self.assertIn("mae_days", meta["validation_metrics"])
@@ -69,9 +68,9 @@ class TestGroupedValidation(unittest.TestCase):
 
     def test_prediction_returns_non_negative_days(self):
         df = _synthetic_frame()
-        artifact = mdl.train_countdown_model(df, data_source="synthetic",
+        artifact = mdl.train_countdown_model(df, data_source="real",
                                              source_label="unit test")
-        sel = {"level": 3, "data_source": "synthetic", "entry": {},
+        sel = {"level": 1, "data_source": "real", "entry": {},
                "artifact": artifact, "message": "test"}
         res = mdl.predict_days_remaining(sel, {
             "age_days": 20, "height_cm": 5.0, "growth_rate_cm_per_day": 0.25,
@@ -79,7 +78,6 @@ class TestGroupedValidation(unittest.TestCase):
             "species": "Super Orange", "variety": "Early"})
         self.assertTrue(res["available"])
         self.assertGreaterEqual(res["days_remaining"], 0)
-        self.assertTrue(res["synthetic"])
 
 
 def config_target():
@@ -93,7 +91,7 @@ class TestRetrainGate(unittest.TestCase):
     def _artifact(self, validated=True):
         return {"model": None,
                 "metadata": {"validated": validated,
-                             "training_data_source": "synthetic"}}
+                             "training_data_source": "real"}}
 
     def test_replace_when_candidate_better(self):
         d = mdl.decide_update(self._artifact(), self._artifact(),
@@ -211,60 +209,6 @@ class TestCsvImport(unittest.TestCase):
             self.assertGreaterEqual(len(report["issues"]), 3)
         finally:
             path.unlink()
-
-
-class TestSyntheticGenerator(unittest.TestCase):
-    def test_reproducible_with_seed(self):
-        cfg = synthetic.DemoConfig(seed=42)
-        a = synthetic.generate_demo_cohort(cfg, label="initial")
-        b = synthetic.generate_demo_cohort(synthetic.DemoConfig(seed=42),
-                                           label="initial")
-        self.assertEqual(len(a), len(b))
-        for x, y in zip(a, b):
-            self.assertEqual(x.readiness_date, y.readiness_date)
-            self.assertEqual(len(x.observations), len(y.observations))
-
-    def test_different_seed_differs(self):
-        a = synthetic.generate_demo_cohort(synthetic.DemoConfig(seed=1),
-                                           label="initial")
-        b = synthetic.generate_demo_cohort(synthetic.DemoConfig(seed=2),
-                                           label="initial")
-        self.assertNotEqual(
-            [p.readiness_date for p in a],
-            [p.readiness_date for p in b])
-
-    def test_multiple_species_and_varieties_generated(self):
-        plants = synthetic.generate_demo_cohort(synthetic.DemoConfig())
-        combos = {(p.species, p.variety) for p in plants}
-        self.assertGreaterEqual(len(combos), 4)   # >= 2 species x 2 varieties
-
-    def test_every_demo_plant_has_readiness_and_feedback(self):
-        plants = synthetic.generate_demo_cohort(synthetic.DemoConfig())
-        for p in plants:
-            self.assertIsNotNone(p.readiness_date)
-            self.assertIsNotNone(p.feedback)
-            self.assertIn("survived", p.feedback)
-
-    def test_post_readiness_observations_exist_but_excluded_in_training(self):
-        # generator records a few days AFTER readiness for monitoring;
-        # readiness_training_rows must exclude them (verified via DB below).
-        conn = dbm.init_db(":memory:")
-        plants = synthetic.generate_demo_cohort(
-            synthetic.DemoConfig(plants_per_species_variety=3))
-        synthetic.load_cohort_into_db(conn, plants)
-        rows = dbm.readiness_training_rows(conn, data_source="synthetic")
-        self.assertTrue(all(r["days_remaining"] >= 0 for r in rows))
-        obs_after = conn.execute(
-            """SELECT COUNT(*) FROM observations o
-               JOIN readiness_events r ON r.plant_id = o.plant_id
-               WHERE o.observation_date > r.readiness_observed_date"""
-        ).fetchone()[0]
-        self.assertGreater(obs_after, 0)          # they exist in storage...
-        train_dates = {(r["plant_id"], r["observation_date"])
-                       for r in rows}
-        self.assertTrue(all(
-            r["observation_date"] <= r["readiness_observed_date"]
-            for r in rows))                        # ...but never in training
 
 
 if __name__ == "__main__":

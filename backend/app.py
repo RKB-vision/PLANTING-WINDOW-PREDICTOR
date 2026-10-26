@@ -124,13 +124,11 @@ def predict_plant():
     except (TypeError, ValueError):
         return jsonify({'error': 'plantId must be an integer'}), 400
 
-    allow_synthetic = bool(data.get('allow_synthetic', False))
     allow_provisional = bool(data.get('allow_provisional_baseline', False))
     conn = dbm.connect(DB_PATH)
     try:
         repo = SQLiteRepository(conn)
         result = predict_for_plant(conn, plant_id, MODELS_DIR,
-                                   allow_synthetic=allow_synthetic,
                                    allow_provisional_baseline=allow_provisional)
         _snapshot_result(repo, result, plant_id=plant_id,
                          prediction_scope='plant')
@@ -201,7 +199,6 @@ def predict_species():
     variety = _clean_variety(data.get('variety'))
     observation_date = _clean_date(
         data.get('observation_date') or data.get('date'))
-    allow_synthetic = bool(data.get('allow_synthetic', False))
     # The species endpoint labels provisional baseline estimates explicitly,
     # so it may fall back to the reference baseline when no model is available.
     allow_provisional = bool(data.get('allow_provisional_baseline', True))
@@ -220,7 +217,6 @@ def predict_species():
             variety,
             MODELS_DIR,
             observation_date=observation_date,
-            allow_synthetic=allow_synthetic,
             allow_provisional_baseline=allow_provisional,
         )
         _snapshot_result(repo, result, prediction_scope='species_cohort',
@@ -516,22 +512,6 @@ def prediction_history():
         return jsonify(svc.list_prediction_history(
             repo, plant_id=plant_id, species=species,
             data_source=data_source, scope=scope, limit=limit))
-    except Exception as e:
-        return _error_response(e)
-    finally:
-        conn.close()
-
-
-@app.route('/api/evaluation', methods=['GET'])
-def evaluation():
-    """Feedback-driven evaluation of predictions vs actual transplants."""
-    species = _clean_date(request.args.get('species'))
-    variety = _clean_variety(request.args.get('variety'))
-    conn = dbm.connect(DB_PATH)
-    try:
-        repo = SQLiteRepository(conn)
-        return jsonify(svc.evaluate_predictions(
-            repo, species=species, variety=variety))
     except Exception as e:
         return _error_response(e)
     finally:
