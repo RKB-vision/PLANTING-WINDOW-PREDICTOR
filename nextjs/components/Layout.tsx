@@ -1,7 +1,7 @@
 import Link from 'next/link'
 import type { ReactNode } from 'react'
 
-type NavKey = 'dashboard' | 'feedback' | 'readings'
+type NavKey = 'dashboard' | 'feedback'
 
 export default function Layout({
   active,
@@ -43,12 +43,6 @@ export default function Layout({
               className={'nav-link' + (active === 'feedback' ? ' is-active' : '')}
             >
               Feedback
-            </Link>
-            <Link
-              href="/readings"
-              className={'nav-link' + (active === 'readings' ? ' is-active' : '')}
-            >
-              Readings
             </Link>
           </div>
         </div>
