@@ -4,7 +4,7 @@ app.py — Streamlit Web Application
 Flow:
   1. Select species + date
   2. Click "Predict"
-     - If measurements exist → show them, proceed to predict
+     - If measurements exist → show them, predict
      - If not → modal: "Plant details are not calibrated"
        → "Pull parameters" button → fetch from Cloudinary, measure, show image carousel
        → "Calibrate & Predict" button → generate prediction
@@ -43,7 +43,7 @@ if not species_list:
 
 selected_species = st.selectbox("Species", species_list, key="species")
 
-# --- Date selector ---
+# --- Date selector (calendar always visible) ---
 use_latest = st.checkbox("Use latest available date", value=True, key="use_latest")
 if use_latest:
     obs = db.get_observations(db_path=db.DEFAULT_DB_PATH, species=selected_species)
@@ -84,6 +84,7 @@ def uncalibrated_modal():
         with st.spinner("Pulling images from Cloudinary and measuring..."):
             report = cr.refresh(db.DEFAULT_DB_PATH, species=selected_species, captures=4)
         st.session_state["pull_report"] = report
+        st.session_state["img_idx"] = 0
         st.rerun()
 
     report = st.session_state.get("pull_report")
@@ -95,10 +96,7 @@ def uncalibrated_modal():
 
         if all_images:
             # Image carousel with left/right navigation
-            if "img_idx" not in st.session_state:
-                st.session_state["img_idx"] = 0
-
-            idx = st.session_state["img_idx"]
+            idx = st.session_state.get("img_idx", 0)
             idx = max(0, min(idx, len(all_images) - 1))
             st.session_state["img_idx"] = idx
 
@@ -126,13 +124,13 @@ def uncalibrated_modal():
             # Left/right navigation
             nav1, nav2, nav3 = st.columns([1, 2, 1])
             with nav1:
-                if st.button("◀ Prev", disabled=(idx == 0), width="stretch"):
+                if st.button("◀ Prev", disabled=(idx == 0), width="stretch", key="prev_btn"):
                     st.session_state["img_idx"] = idx - 1
                     st.rerun()
             with nav2:
                 st.caption(f"Image {idx + 1} / {len(all_images)}")
             with nav3:
-                if st.button("Next ▶", disabled=(idx == len(all_images) - 1), width="stretch"):
+                if st.button("Next ▶", disabled=(idx == len(all_images) - 1), width="stretch", key="next_btn"):
                     st.session_state["img_idx"] = idx + 1
                     st.rerun()
 
@@ -161,7 +159,7 @@ def uncalibrated_modal():
 
         # Calibrate & Predict button
         st.divider()
-        if st.button("Calibrate & Predict", type="primary", width="stretch"):
+        if st.button("Calibrate & Predict", type="primary", width="stretch", key="calib_predict"):
             st.session_state["calibrate_predict"] = True
             st.rerun()
 
@@ -174,7 +172,6 @@ if predict_btn:
     if not has_data and "pull_report" not in st.session_state:
         uncalibrated_modal()
     else:
-        # Re-read observations
         obs = db.get_observations(db_path=db.DEFAULT_DB_PATH, species=selected_species)
         date_obs = [o for o in obs if str(o["observation_date"]) == str(obs_date)] if obs else []
         recent = date_obs[-1] if date_obs else (obs[-1] if obs else None)
@@ -200,7 +197,6 @@ if predict_btn:
                 trained_model=pipe,
             )
 
-        # --- Kid-friendly result ---
         st.divider()
         if pred.predicted_days_remaining is not None:
             st.markdown("### 🌱 Result")
@@ -225,7 +221,6 @@ if predict_btn:
 # Handle Calibrate & Predict from modal
 if st.session_state.get("calibrate_predict"):
     del st.session_state["calibrate_predict"]
-    # Re-read observations
     obs = db.get_observations(db_path=db.DEFAULT_DB_PATH, species=selected_species)
     date_obs = [o for o in obs if str(o["observation_date"]) == str(obs_date)] if obs else []
     recent = date_obs[-1] if date_obs else (obs[-1] if obs else None)
