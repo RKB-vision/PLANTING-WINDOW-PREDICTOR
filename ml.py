@@ -11,7 +11,7 @@ Adheres to non-negotiable principles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,6 +44,7 @@ FEATURE_COLUMNS = [
 
 MIN_PLANTS_FOR_VALIDATION = 4
 MIN_EVENTS_FOR_VALIDATION = 6
+MIN_PLANTS_FOR_CONFIDENT_BASELINE = 3
 
 
 @dataclass
@@ -51,11 +52,14 @@ class PredictionResult:
     species: str
     predicted_days_remaining: Optional[float]
     predicted_readiness_date: Optional[str]
-    method: str  # 'validated_ml_model' | 'provisional_historical_baseline' | 'insufficient_evidence'
+    method: str  # 'validated_ml_model' | 'provisional_historical_baseline' | 'provisional_height_matched_baseline' | 'insufficient_evidence'
     confidence: str  # 'high' | 'moderate' | 'low' | 'none'
     contributing_plants: int
     summary_message: str
     details: Dict[str, Any]
+    data_sufficient: bool = False
+    limitations: List[str] = field(default_factory=list)
+    age_source: str = "unknown"
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -97,8 +101,64 @@ class BaselineTrajectory:
         days = float(self.max_age - current_age)
         return max(0.0, days)
 
+    def estimate_days_remaining_by_height(self, height_cm: Optional[float]) -> Optional[Dict[str, Any]]:
+        """Match the current height to the cohort's median-height trajectory.
+
+        Used only when the plant's age is unknown (no planted_date). The
+        height source is a camera measurement, so this is deliberately
+        reported as a provisional, lower-confidence baseline — never as a
+        validated model.
+        """
+        if height_cm is None or self.trajectory_df.empty or self.max_age is None:
+            return None
+        df = self.trajectory_df.dropna(subset=["median_height"])
+        if df.empty:
+            return None
+        df = df.assign(distance=(df["median_height"] - float(height_cm)).abs())
+        match = df.sort_values("distance").iloc[0]
+        matched_age = int(match["age_days"])
+        return {
+            "days_remaining": max(0.0, float(self.max_age - matched_age)),
+            "matched_age_days": matched_age,
+            "matched_median_height_cm": round(float(match["median_height"]), 2),
+            "height_delta_cm": round(abs(float(match["median_height"]) - float(height_cm)), 2),
+            "contributing_plants": int(match["contributing_plants"]),
+            "target_transplant_age": int(self.max_age),
+        }
+
+
+_MODEL_CACHE: Dict[Tuple[str, str, int, int, str], Dict[str, Any]] = {}
+
+
+def _training_fingerprint(db_path: Path | str, species: Optional[str]) -> Tuple[str, str, int, int, str]:
+    """Cache key that changes whenever observations or readiness events change."""
+    stats = db.get_cohort_stats(db_path, species=species)
+    path_key = ":memory:" if str(db_path) == ":memory:" else str(Path(db_path).resolve())
+    return (
+        path_key,
+        species or "*",
+        int(stats["n_observations"]),
+        int(stats["n_readiness_events"]),
+        str(stats["latest_observation_date"] or ""),
+    )
+
 
 def train_countdown_model(
+    db_path: Path | str = db.DEFAULT_DB_PATH,
+    species: Optional[str] = None,
+    use_cache: bool = True,
+) -> Dict[str, Any]:
+    """Train/validate the countdown model, reusing the result while data is unchanged."""
+    fingerprint = _training_fingerprint(db_path, species)
+    if use_cache and fingerprint in _MODEL_CACHE:
+        return _MODEL_CACHE[fingerprint]
+    result = _train_countdown_model_uncached(db_path, species)
+    if use_cache:
+        _MODEL_CACHE[fingerprint] = result
+    return result
+
+
+def _train_countdown_model_uncached(
     db_path: Path | str = db.DEFAULT_DB_PATH,
     species: Optional[str] = None,
 ) -> Dict[str, Any]:
@@ -192,6 +252,7 @@ def predict_species_readiness(
     current_stem_width: Optional[float] = None,
     current_leaf_count: Optional[int] = None,
     trained_model: Optional[Any] = None,
+    plant_id: Optional[str] = None,
 ) -> PredictionResult:
     """
     Executes the Fallback Prediction Ladder:
@@ -205,22 +266,68 @@ def predict_species_readiness(
         else date.today()
     )
 
-    observations = db.get_observations(db_path, species=species)
+    limitations: List[str] = []
+    age_source = "unknown"
+
+    # Resolve the plant's own latest measurement only. Never borrow another
+    # plant's row just to fill a gap: missing values stay missing.
+    if plant_id and any(
+        value is None
+        for value in (
+            current_height_cm,
+            current_age_days,
+            current_growth_rate,
+            current_stem_width,
+            current_leaf_count,
+        )
+    ):
+        latest = db.get_latest_observation(db_path, plant_id)
+        if latest:
+            if current_obs_date is None:
+                obs_date = db.parse_date(str(latest["observation_date"]))
+            if current_height_cm is None and latest.get("height_cm") is not None:
+                current_height_cm = float(latest["height_cm"])
+            if current_age_days is None and latest.get("age_days") is not None:
+                current_age_days = int(latest["age_days"])
+                age_source = "observation"
+            if current_growth_rate is None and latest.get("growth_rate_cm_per_day") is not None:
+                current_growth_rate = float(latest["growth_rate_cm_per_day"])
+            if current_stem_width is None and latest.get("stem_width_cm") is not None:
+                current_stem_width = float(latest["stem_width_cm"])
+            if current_leaf_count is None and latest.get("visible_true_leaf_count") is not None:
+                current_leaf_count = int(latest["visible_true_leaf_count"])
+
+    # Cohort quarantine: the plant being predicted never contributes to its own
+    # reference, and unverified camera rows are excluded from the cohort.
+    all_observations = db.get_observations(db_path, species=species)
+    observations = [
+        o
+        for o in all_observations
+        if (not plant_id or str(o["plant_id"]) != str(plant_id))
+        and not (o.get("source") == "camera" and not o.get("calibration_verified"))
+    ]
     baseline = BaselineTrajectory(observations)
     unique_plants = len({o["plant_id"] for o in observations})
+    cohort_stats = db.get_cohort_stats(db_path, species=species, exclude_plant_id=plant_id)
 
-    # If inputs are not explicitly provided, try to compute from current database observations
-    if current_height_cm is None and observations:
-        df_obs = pd.DataFrame(observations)
-        recent = df_obs.sort_values("observation_date").iloc[-1]
-        current_height_cm = float(recent["height_cm"])
-        current_age_days = int(recent["age_days"]) if pd.notnull(recent.get("age_days")) else None
-        current_growth_rate = float(recent["growth_rate_cm_per_day"]) if pd.notnull(recent.get("growth_rate_cm_per_day")) else None
-        current_stem_width = float(recent["stem_width_cm"]) if pd.notnull(recent.get("stem_width_cm")) else None
-        current_leaf_count = int(recent["visible_true_leaf_count"]) if pd.notnull(recent.get("visible_true_leaf_count")) else None
+    if cohort_stats["n_plants"] == 0:
+        limitations.append("No historical reference plants exist for this species.")
+    elif cohort_stats["n_plants"] < MIN_PLANTS_FOR_CONFIDENT_BASELINE:
+        limitations.append(
+            f"Small reference cohort: {cohort_stats['n_plants']} plant(s)."
+        )
+    if current_age_days is None:
+        limitations.append(
+            "Planting date (age) is unknown, so age-based methods are unavailable."
+        )
 
-    # LEVEL 1: Check for Validated ML Model
-    if trained_model and getattr(trained_model, "predict", None) is not None:
+    # LEVEL 1: Validated ML model (requires an observed age and height)
+    if (
+        trained_model is not None
+        and getattr(trained_model, "predict", None) is not None
+        and current_age_days is not None
+        and current_height_cm is not None
+    ):
         sample_df = pd.DataFrame([{
             "age_days": current_age_days,
             "height_cm": current_height_cm,
@@ -232,6 +339,10 @@ def predict_species_readiness(
             pred_val = float(trained_model.predict(sample_df)[0])
             pred_days = max(0.0, round(pred_val, 1))
             ready_date = obs_date + timedelta(days=int(round(pred_days)))
+            if current_growth_rate is None:
+                limitations.append(
+                    "Growth rate missing; the model imputed it from the training cohort."
+                )
             return PredictionResult(
                 species=species,
                 predicted_days_remaining=pred_days,
@@ -239,33 +350,104 @@ def predict_species_readiness(
                 method="validated_ml_model",
                 confidence="high",
                 contributing_plants=unique_plants,
-                summary_message=f"Estimated {pred_days} days remaining based on validated machine learning model.",
-                details={"inputs": sample_df.to_dict(orient="records")[0]},
+                summary_message=(
+                    f"Estimated {pred_days} days remaining from a validated machine "
+                    f"learning model trained on {unique_plants} plants."
+                ),
+                details={
+                    "inputs": sample_df.to_dict(orient="records")[0],
+                    "cohort_stats": cohort_stats,
+                },
+                data_sufficient=True,
+                limitations=list(limitations),
+                age_source=age_source or "supplied",
             )
-        except Exception:
-            pass  # Fall through to Level 2
+        except Exception as exc:  # noqa: BLE001 - fall through to the baseline
+            limitations.append(f"ML model could not score this plant ({exc}).")
 
-    # LEVEL 2: Historical Cohort Baseline
+    # LEVEL 2: Historical cohort baseline, age-based
     if current_age_days is not None and not baseline.trajectory_df.empty:
         pred_days = baseline.estimate_days_remaining(current_age_days)
         if pred_days is not None:
             ready_date = obs_date + timedelta(days=int(round(pred_days)))
+            confidence = (
+                "moderate"
+                if cohort_stats["n_plants"] >= MIN_PLANTS_FOR_CONFIDENT_BASELINE
+                else "low"
+            )
+            if baseline.max_age is not None and current_age_days >= baseline.max_age:
+                limitations.append(
+                    "Age is at or past the reference cohort's transplant age."
+                )
             return PredictionResult(
                 species=species,
                 predicted_days_remaining=pred_days,
                 predicted_readiness_date=ready_date.isoformat(),
                 method="provisional_historical_baseline",
-                confidence="moderate",
+                confidence=confidence,
                 contributing_plants=unique_plants,
-                summary_message=f"Estimated {pred_days} days remaining based on historical successful-plant median trajectory.",
+                summary_message=(
+                    f"Estimated {pred_days} days remaining by comparing age "
+                    f"{current_age_days} d to the historical successful-plant trajectory "
+                    f"(transplant at ~{baseline.max_age} d)."
+                ),
                 details={
                     "current_age": current_age_days,
                     "target_transplant_age": baseline.max_age,
                     "median_height_cm": current_height_cm,
+                    "cohort_stats": cohort_stats,
                 },
+                data_sufficient=True,
+                limitations=list(limitations),
+                age_source=age_source if age_source != "unknown" else "supplied",
             )
 
-    # LEVEL 3: Insufficient Evidence Fallback
+    # LEVEL 2b: Historical cohort matched by height (age unknown)
+    if current_height_cm is not None and not baseline.trajectory_df.empty:
+        match = baseline.estimate_days_remaining_by_height(current_height_cm)
+        if match is not None:
+            pred_days = float(match["days_remaining"])
+            ready_date = obs_date + timedelta(days=int(round(pred_days)))
+            limitations.append(
+                "Age unknown: days remaining inferred by matching current height to "
+                f"the cohort median height at age {match['matched_age_days']} d."
+            )
+            limitations.append(
+                "Height comes from a camera measurement; scale or segmentation error "
+                "shifts the matched age."
+            )
+            return PredictionResult(
+                species=species,
+                predicted_days_remaining=pred_days,
+                predicted_readiness_date=ready_date.isoformat(),
+                method="provisional_height_matched_baseline",
+                confidence="low",
+                contributing_plants=unique_plants,
+                summary_message=(
+                    f"Estimated {pred_days} days remaining by matching the measured "
+                    f"height {current_height_cm:.2f} cm to the cohort median "
+                    f"{match['matched_median_height_cm']:.2f} cm at age "
+                    f"{match['matched_age_days']} d."
+                ),
+                details={
+                    "current_height_cm": current_height_cm,
+                    "match": match,
+                    "cohort_stats": cohort_stats,
+                },
+                data_sufficient=True,
+                limitations=list(limitations),
+                age_source="height_matched",
+            )
+
+    # LEVEL 3: Insufficient evidence
+    missing: List[str] = []
+    if current_height_cm is None:
+        missing.append("a measured height")
+    if cohort_stats["n_plants"] == 0:
+        missing.append("historical reference plants for this species")
+    elif current_age_days is None:
+        missing.append("the planting date (age)")
+    limitations.extend(f"Missing {item}." for item in missing)
     return PredictionResult(
         species=species,
         predicted_days_remaining=None,
@@ -273,12 +455,21 @@ def predict_species_readiness(
         method="insufficient_evidence",
         confidence="none",
         contributing_plants=unique_plants,
-        summary_message="Insufficient observation evidence: missing age or historical trajectory for this species.",
+        summary_message=(
+            "Insufficient evidence to predict: "
+            + (", ".join(missing) if missing else "measurements and reference data are required")
+            + "."
+        ),
         details={
-            "observations_found": len(observations),
+            "observations_found": len(all_observations),
+            "cohort_observations": len(observations),
             "current_height": current_height_cm,
             "current_age": current_age_days,
+            "cohort_stats": cohort_stats,
         },
+        data_sufficient=False,
+        limitations=list(limitations),
+        age_source=age_source,
     )
 
 

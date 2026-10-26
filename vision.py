@@ -32,12 +32,13 @@ class Rectangle:
 class MeasurementResult:
     height_cm: float
     stem_width_cm: Optional[float]
-    leaf_count: int
+    leaf_count: Optional[int]
     pixels_per_cm: float
     calibrated: bool
     annotated_image: np.ndarray
     rod_rect: Optional[Rectangle] = None
     plant_rect: Optional[Rectangle] = None
+    leaf_count_method: str = "contour_concavity_estimate"
 
 
 def detect_reference_rod(
@@ -105,14 +106,51 @@ def detect_reference_rod(
     return None, default_px_per_cm, False
 
 
+def _select_plant_contour(
+    contours: list,
+    rod_rect: Optional[Rectangle],
+    image_shape: Tuple[int, ...],
+) -> Optional[np.ndarray]:
+    """Pick the plant contour, preferring the foliage next to the calibration rod.
+
+    Background foliage is often larger than the subject, so raw "largest
+    contour" is not reliable. The rod is always adjacent to the plant, so
+    contours are scored by area discounted by their horizontal gap to the rod.
+    """
+    if not contours:
+        return None
+    height, width = image_shape[:2]
+    min_area = max(1.0, 0.0003 * height * width)
+    valid = [c for c in contours if cv2.contourArea(c) >= min_area]
+    if not valid:
+        return None
+    if rod_rect is None:
+        return max(valid, key=cv2.contourArea)
+
+    rod_w = max(1, rod_rect.w)
+
+    def score(contour: np.ndarray) -> float:
+        x, y, w, h = cv2.boundingRect(contour)
+        gap = max(0, rod_rect.x - (x + w), x - (rod_rect.x + rod_rect.w))
+        return cv2.contourArea(contour) * float(np.exp(-gap / (2.0 * rod_w)))
+
+    return max(valid, key=score)
+
+
 def detect_plant(
     image: np.ndarray,
     pixels_per_cm: float,
     rod_rect: Optional[Rectangle] = None,
-) -> Tuple[Rectangle, float, Optional[float], int, np.ndarray]:
+) -> Tuple[Rectangle, float, Optional[float], Optional[int], np.ndarray, str]:
     """
     Segments green plant foliage and measures height, stem width, and leaves.
-    Returns: (plant_rect, height_cm, stem_width_cm, leaf_count, plant_mask)
+    Returns: (plant_rect, height_cm, stem_width_cm, leaf_count, plant_mask, leaf_count_method)
+
+    ``leaf_count`` is a *measurement-derived estimate* of visible leaves from
+    contour concavities (the gaps between adjacent leaves). It is never a
+    constant: a plant whose outline has no measurable concavity reports 1.
+    Compound leaves (e.g. marigold) can still be under-counted, so the method
+    is returned alongside the number by ``measure_image``.
     """
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
     # Plant foliage green range
@@ -137,11 +175,10 @@ def detect_plant(
     plant_mask = cv2.morphologyEx(plant_mask, cv2.MORPH_CLOSE, kernel)
 
     contours, _ = cv2.findContours(plant_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return Rectangle(0, 0, 0, 0), 0.0, None, 0, plant_mask
+    main_contour = _select_plant_contour(contours, rod_rect, image.shape)
+    if main_contour is None:
+        return Rectangle(0, 0, 0, 0), 0.0, None, None, plant_mask, "no_plant_found"
 
-    # Pick the main plant contour (largest area)
-    main_contour = max(contours, key=cv2.contourArea)
     px, py, pw, ph = cv2.boundingRect(main_contour)
     plant_rect = Rectangle(px, py, pw, ph)
 
@@ -163,25 +200,31 @@ def detect_plant(
         median_stem_px = float(np.median(stem_widths))
         stem_width_cm = round(median_stem_px / pixels_per_cm, 3)
 
-    # Leaf count estimation: convexity defects & contour peaks
-    leaf_count = 2  # base cotyledon / true leaves
+    # Leaf count: each significant concavity in the plant outline is the gap
+    # between two adjacent leaves. OpenCV returns convexityDefects as either
+    # (N, 1, 4) or (N, 4) depending on version, so reshaped defensively; the
+    # previous (N, 1, 4)-only loop raised and silently left the count at 2.
+    leaf_count: Optional[int] = None
+    leaf_count_method = "none"
     hull = cv2.convexHull(main_contour, returnPoints=False)
-    if hull is not None and len(hull) > 3 and len(main_contour) > 3:
+    if hull is not None and len(hull) >= 3 and len(main_contour) >= 3:
         try:
             defects = cv2.convexityDefects(main_contour, hull)
-            if defects is not None:
-                # Count significant deep defects representing leaf separations
-                significant_defects = 0
-                for i in range(defects.shape[0]):
-                    s, e, f, d = defects[i, 0]
-                    depth_px = d / 256.0
-                    if depth_px > (ph * 0.05):  # Defect depth > 5% of height
-                        significant_defects += 1
-                leaf_count = max(2, min(14, significant_defects + 1))
-        except Exception:
-            pass
+        except cv2.error:
+            defects = None
+        if defects is not None and np.asarray(defects).size:
+            depths = np.asarray(defects).reshape(-1, 4)[:, 3].astype(np.float64) / 256.0
+            # Relative threshold (1.2% of plant height) with a 6 px floor so
+            # leaf serrations are not counted as separate leaves.
+            min_depth = max(6.0, ph * 0.012)
+            significant = int(np.count_nonzero(depths > min_depth))
+            leaf_count = max(1, min(24, significant + 1))
+            leaf_count_method = "contour_concavity_estimate"
+    if leaf_count is None:
+        leaf_count = 1
+        leaf_count_method = "single_blade_fallback"
 
-    return plant_rect, height_cm, stem_width_cm, leaf_count, plant_mask
+    return plant_rect, height_cm, stem_width_cm, leaf_count, plant_mask, leaf_count_method
 
 
 def measure_image(
@@ -211,7 +254,9 @@ def measure_image(
     rod_rect, px_per_cm, calibrated = detect_reference_rod(img, rod_length_cm=rod_length_cm)
 
     # 2. Detect plant
-    plant_rect, height_cm, stem_width_cm, leaf_count, _ = detect_plant(img, px_per_cm, rod_rect)
+    plant_rect, height_cm, stem_width_cm, leaf_count, _, leaf_method = detect_plant(
+        img, px_per_cm, rod_rect
+    )
 
     # 3. Create rich annotated visualization
     annotated = img.copy()
@@ -256,7 +301,9 @@ def measure_image(
         )
 
         # Overlay measurement HUD card
-        hud_text = f"Height: {height_cm:.2f} cm | Stem: {stem_width_cm or 0:.2f} cm | Leaves: {leaf_count}"
+        leaves_text = "—" if leaf_count is None else str(leaf_count)
+        stem_text = "—" if stem_width_cm is None else f"{stem_width_cm:.2f}"
+        hud_text = f"Height: {height_cm:.2f} cm | Stem: {stem_text} cm | Leaves: {leaves_text}"
         cv2.putText(
             annotated,
             hud_text,
@@ -288,4 +335,5 @@ def measure_image(
         annotated_image=annotated,
         rod_rect=rod_rect,
         plant_rect=plant_rect,
+        leaf_count_method=leaf_method,
     )

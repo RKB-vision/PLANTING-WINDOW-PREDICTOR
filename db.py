@@ -11,6 +11,7 @@ Preserves non-negotiable architectural principles:
 from __future__ import annotations
 
 import csv
+import re
 import sqlite3
 from datetime import datetime, date
 from pathlib import Path
@@ -35,7 +36,9 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
         CREATE TABLE IF NOT EXISTS plants (
             plant_id TEXT PRIMARY KEY,
             species TEXT NOT NULL,
-            variety TEXT NOT NULL,
+            variety TEXT,
+            external_ref TEXT,
+            cohort TEXT,
             planted_date DATE,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
@@ -50,6 +53,9 @@ def init_db(db_path: Path | str = DEFAULT_DB_PATH) -> None:
             visible_true_leaf_count INTEGER,
             growth_rate_cm_per_day REAL,
             source TEXT DEFAULT 'manual',
+            calibration_source TEXT DEFAULT 'csv_import_no_calibration',
+            calibration_verified INTEGER DEFAULT 0,
+            rod_length_cm REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(plant_id, observation_date)
         );
@@ -105,20 +111,38 @@ def parse_date(date_str: str) -> date:
     raise ValueError(f"Unable to parse date: {date_str}")
 
 
+def normalize_plant_ref(raw: str | None) -> str:
+    """Normalize a plant reference for grouping/comparison.
+
+    Case, whitespace, hyphens and underscores are ignored, but zero-padding
+    is significant: 'Plant01' != 'Plant1' != 'Plant001'.
+    """
+    if raw is None:
+        return ""
+    text = str(raw).strip().lower()
+    # collapse whitespace, hyphens, underscores
+    text = re.sub(r"[\s\-_]+", "", text)
+    return text
+
+
 def register_plant(
     db_path: Path | str,
     plant_id: str,
     species: str,
-    variety: str,
+    variety: str = "",
     planted_date: Optional[date | str] = None,
+    cohort: Optional[str] = None,
+    external_ref: Optional[str] = None,
 ) -> Any:
     planted_val = str(planted_date) if planted_date else None
     plant_id_str = str(plant_id).strip()
+    if external_ref is None:
+        external_ref = plant_id_str
     with get_connection(db_path) as conn:
         cols = [c[1] for c in conn.execute("PRAGMA table_info(plants)").fetchall()]
         date_col = "planted_date" if "planted_date" in cols else "date_started"
 
-        if "external_ref" in cols:
+        if "data_source" in cols:
             # Legacy schema: plant_id is INTEGER PRIMARY KEY AUTOINCREMENT
             row = conn.execute(
                 "SELECT plant_id FROM plants WHERE external_ref = ? OR CAST(plant_id AS TEXT) = ?",
@@ -156,17 +180,33 @@ def register_plant(
                 return cur.lastrowid
         else:
             # Clean schema: plant_id is TEXT PRIMARY KEY
-            conn.execute(
-                f"""
-                INSERT INTO plants (plant_id, species, variety, {date_col})
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(plant_id) DO UPDATE SET
-                    species=excluded.species,
-                    variety=excluded.variety,
-                    {date_col}=COALESCE(excluded.{date_col}, plants.{date_col})
-                """,
-                (plant_id_str, species.strip(), variety.strip(), planted_val),
-            )
+            if "external_ref" in cols:
+                conn.execute(
+                    """
+                    INSERT INTO plants (plant_id, species, variety, external_ref, cohort, planted_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(plant_id) DO UPDATE SET
+                        species=excluded.species,
+                        variety=COALESCE(excluded.variety, plants.variety),
+                        external_ref=COALESCE(excluded.external_ref, plants.external_ref),
+                        cohort=COALESCE(excluded.cohort, plants.cohort),
+                        planted_date=COALESCE(excluded.planted_date, plants.planted_date)
+                    """,
+                    (plant_id_str, species.strip(), variety.strip() if variety else None,
+                     external_ref, cohort, planted_val),
+                )
+            else:
+                conn.execute(
+                    f"""
+                    INSERT INTO plants (plant_id, species, variety, {date_col})
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(plant_id) DO UPDATE SET
+                        species=excluded.species,
+                        variety=excluded.variety,
+                        {date_col}=COALESCE(excluded.{date_col}, plants.{date_col})
+                    """,
+                    (plant_id_str, species.strip(), variety.strip() if variety else None, planted_val),
+                )
             return plant_id_str
 
 
@@ -179,6 +219,9 @@ def record_observation(
     leaf_count: Optional[int] = None,
     age_days: Optional[int] = None,
     source: str = "manual",
+    calibration_source: str = "csv_import_no_calibration",
+    calibration_verified: bool = False,
+    rod_length_cm: Optional[float] = None,
 ) -> None:
     obs_date = parse_date(str(observation_date)) if isinstance(observation_date, str) else observation_date
     plant_id_str = str(plant_id).strip()
@@ -207,31 +250,68 @@ def record_observation(
         src_col = "source" if has_source else "data_source"
         src_val = "real" if (not has_source and source not in ("real", "synthetic")) else source
 
-        conn.execute(
-            f"""
-            INSERT INTO observations (
-                plant_id, observation_date, age_days, height_cm,
-                stem_width_cm, visible_true_leaf_count, growth_rate_cm_per_day, {src_col}
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(plant_id, observation_date) DO UPDATE SET
-                height_cm = excluded.height_cm,
-                stem_width_cm = COALESCE(excluded.stem_width_cm, observations.stem_width_cm),
-                visible_true_leaf_count = COALESCE(excluded.visible_true_leaf_count, observations.visible_true_leaf_count),
-                age_days = COALESCE(excluded.age_days, observations.age_days),
-                growth_rate_cm_per_day = excluded.growth_rate_cm_per_day,
-                {src_col} = excluded.{src_col}
-            """,
-            (
-                plant_id_str,
-                obs_date.isoformat(),
-                age_days,
-                float(height_cm),
-                float(stem_width_cm) if stem_width_cm is not None else None,
-                int(leaf_count) if leaf_count is not None else None,
-                growth_rate,
-                src_val,
-            ),
-        )
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(observations)").fetchall()]
+        has_calib = "calibration_source" in cols
+
+        if has_calib:
+            conn.execute(
+                f"""
+                INSERT INTO observations (
+                    plant_id, observation_date, age_days, height_cm,
+                    stem_width_cm, visible_true_leaf_count, growth_rate_cm_per_day, {src_col},
+                    calibration_source, calibration_verified, rod_length_cm
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plant_id, observation_date) DO UPDATE SET
+                    height_cm = excluded.height_cm,
+                    stem_width_cm = COALESCE(excluded.stem_width_cm, observations.stem_width_cm),
+                    visible_true_leaf_count = COALESCE(excluded.visible_true_leaf_count, observations.visible_true_leaf_count),
+                    age_days = COALESCE(excluded.age_days, observations.age_days),
+                    growth_rate_cm_per_day = excluded.growth_rate_cm_per_day,
+                    {src_col} = excluded.{src_col},
+                    calibration_source = COALESCE(excluded.calibration_source, observations.calibration_source),
+                    calibration_verified = excluded.calibration_verified,
+                    rod_length_cm = COALESCE(excluded.rod_length_cm, observations.rod_length_cm)
+                """,
+                (
+                    plant_id_str,
+                    obs_date.isoformat(),
+                    age_days,
+                    float(height_cm),
+                    float(stem_width_cm) if stem_width_cm is not None else None,
+                    int(leaf_count) if leaf_count is not None else None,
+                    growth_rate,
+                    src_val,
+                    calibration_source,
+                    1 if calibration_verified else 0,
+                    rod_length_cm,
+                ),
+            )
+        else:
+            conn.execute(
+                f"""
+                INSERT INTO observations (
+                    plant_id, observation_date, age_days, height_cm,
+                    stem_width_cm, visible_true_leaf_count, growth_rate_cm_per_day, {src_col}
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(plant_id, observation_date) DO UPDATE SET
+                    height_cm = excluded.height_cm,
+                    stem_width_cm = COALESCE(excluded.stem_width_cm, observations.stem_width_cm),
+                    visible_true_leaf_count = COALESCE(excluded.visible_true_leaf_count, observations.visible_true_leaf_count),
+                    age_days = COALESCE(excluded.age_days, observations.age_days),
+                    growth_rate_cm_per_day = excluded.growth_rate_cm_per_day,
+                    {src_col} = excluded.{src_col}
+                """,
+                (
+                    plant_id_str,
+                    obs_date.isoformat(),
+                    age_days,
+                    float(height_cm),
+                    float(stem_width_cm) if stem_width_cm is not None else None,
+                    int(leaf_count) if leaf_count is not None else None,
+                    growth_rate,
+                    src_val,
+                ),
+            )
 
 
 def record_readiness_event(
@@ -382,7 +462,7 @@ def seed_from_csv(
 
     for plant_id, obs_list in rows_by_plant.items():
         obs_list.sort(key=lambda x: x["date"])
-        resolved_pid = register_plant(db_path, plant_id, species, variety)
+        resolved_pid = register_plant(db_path, plant_id, species, variety, cohort="reference")
 
         for item in obs_list:
             record_observation(
@@ -394,6 +474,8 @@ def seed_from_csv(
                 leaf_count=item["leaves"],
                 age_days=item["age_days"],
                 source="real",
+                calibration_source="csv_import_no_calibration",
+                calibration_verified=False,
             )
             total_inserted += 1
 
@@ -451,6 +533,52 @@ def get_observations(
             params.append(species)
         query += " ORDER BY o.observation_date ASC, o.plant_id ASC"
         return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+
+def species_cohort_snapshot(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    species: Optional[str] = None,
+    observation_date: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Raw observations for a species on one date (latest if omitted).
+
+    Returns a dict with 'observation_date', 'rows', 'row_count', 'plants_represented'.
+    Missing data is preserved; no rows are invented.
+    """
+    with get_connection(db_path) as conn:
+        if observation_date:
+            target_date = observation_date
+        else:
+            if species:
+                row = conn.execute(
+                    "SELECT MAX(o.observation_date) AS d FROM observations o JOIN plants p ON o.plant_id=p.plant_id WHERE p.species=?",
+                    (species,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT MAX(observation_date) AS d FROM observations").fetchone()
+            target_date = row["d"] if row and row["d"] else None
+
+        if not target_date:
+            return {"species": species, "observation_date": None, "rows": [], "row_count": 0, "plants_represented": 0}
+
+        query = """
+            SELECT o.*, p.species, p.variety
+            FROM observations o JOIN plants p ON o.plant_id = p.plant_id
+            WHERE o.observation_date = ?
+        """
+        params: List[Any] = [target_date]
+        if species:
+            query += " AND p.species = ?"
+            params.append(species)
+        query += " ORDER BY o.plant_id, o.id"
+        rows = [dict(r) for r in conn.execute(query, params).fetchall()]
+        return {
+            "species": species,
+            "observation_date": target_date,
+            "rows": rows,
+            "row_count": len(rows),
+            "plants_represented": len({r["plant_id"] for r in rows}),
+        }
 
 
 def get_training_rows(db_path: Path | str = DEFAULT_DB_PATH, species: Optional[str] = None) -> List[Dict[str, Any]]:
@@ -558,3 +686,157 @@ def save_feedback(
             ),
         )
         return cur.lastrowid
+
+
+def normalize_species(raw: str | None) -> str:
+    """Species comparison key: case and whitespace insensitive."""
+    return re.sub(r"\s+", "", str(raw or "")).lower()
+
+
+def get_plant(db_path: Path | str = DEFAULT_DB_PATH, plant_id: str | None = None) -> Optional[Dict[str, Any]]:
+    """Fetch one plant row, or None when it does not exist."""
+    if not plant_id:
+        return None
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT * FROM plants WHERE plant_id = ?", (str(plant_id).strip(),)
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def find_plants_by_ref(db_path: Path | str = DEFAULT_DB_PATH, ref: str | None = None) -> List[Dict[str, Any]]:
+    """Find all plants matching a normalized plant/external reference.
+
+    Ambiguity is preserved: callers must treat len(result) > 1 as quarantined.
+    """
+    norm = normalize_plant_ref(ref)
+    if not norm:
+        return []
+    return [
+        p for p in get_plants(db_path)
+        if normalize_plant_ref(p.get("plant_id")) == norm
+        or normalize_plant_ref(p.get("external_ref")) == norm
+    ]
+
+
+def get_latest_observation(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    plant_id: str | None = None,
+) -> Optional[Dict[str, Any]]:
+    """Latest observation for one plant (None when the plant has none)."""
+    if not plant_id:
+        return None
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT o.*, p.species, p.variety, p.planted_date
+            FROM observations o
+            JOIN plants p ON o.plant_id = p.plant_id
+            WHERE o.plant_id = ?
+            ORDER BY o.observation_date DESC, o.id DESC
+            LIMIT 1
+            """,
+            (str(plant_id).strip(),),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_observation(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    plant_id: str | None = None,
+    observation_date: date | str | None = None,
+) -> Optional[Dict[str, Any]]:
+    """One plant's observation on one date, if present."""
+    if not plant_id or not observation_date:
+        return None
+    obs_date = parse_date(str(observation_date)) if isinstance(observation_date, str) else observation_date
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            """
+            SELECT o.*, p.species, p.variety, p.planted_date
+            FROM observations o
+            JOIN plants p ON o.plant_id = p.plant_id
+            WHERE o.plant_id = ? AND o.observation_date = ?
+            """,
+            (str(plant_id).strip(), obs_date.isoformat()),
+        ).fetchone()
+        return dict(row) if row else None
+
+
+def get_cohort_stats(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    species: str | None = None,
+    exclude_plant_id: str | None = None,
+) -> Dict[str, Any]:
+    """Counts describing the historical cohort a prediction would use.
+
+    The live plant being predicted is excluded so its own measurements never
+    become its reference. Missing data is reported as 0 counts, never invented.
+    """
+    key = normalize_species(species)
+    plants = [p for p in get_plants(db_path) if not key or normalize_species(p.get("species")) == key]
+    plant_ids = {str(p["plant_id"]) for p in plants}
+    if exclude_plant_id:
+        plant_ids.discard(str(exclude_plant_id))
+
+    observations = [
+        o for o in get_observations(db_path)
+        if str(o["plant_id"]) in plant_ids
+    ]
+    ages = [o["age_days"] for o in observations if o.get("age_days") is not None]
+
+    with get_connection(db_path) as conn:
+        cols = [c[1] for c in conn.execute("PRAGMA table_info(readiness_events)").fetchall()]
+        date_col = "readiness_observed_date" if "readiness_observed_date" in cols else "event_date"
+        event_rows = conn.execute(
+            f"SELECT plant_id, {date_col} AS event_date FROM readiness_events"
+        ).fetchall()
+    events = [dict(r) for r in event_rows if str(r["plant_id"]) in plant_ids]
+
+    latest = max((str(o["observation_date"]) for o in observations), default=None)
+    return {
+        "species": species,
+        "n_plants": len(plant_ids),
+        "n_observations": len(observations),
+        "n_readiness_events": len(events),
+        "n_readiness_plants": len({str(e["plant_id"]) for e in events}),
+        "min_age_days": min(ages) if ages else None,
+        "max_age_days": max(ages) if ages else None,
+        "latest_observation_date": latest,
+    }
+
+
+def get_predictions(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    plant_id: str | None = None,
+    species: str | None = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Newest-first prediction history (append-only; never rewritten)."""
+    query = "SELECT * FROM predictions WHERE 1=1"
+    params: List[Any] = []
+    if plant_id:
+        query += " AND plant_id = ?"
+        params.append(str(plant_id).strip())
+    if species:
+        query += " AND REPLACE(species, ' ', '') = ?"
+        params.append(species.replace(" ", ""))
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(int(limit))
+    with get_connection(db_path) as conn:
+        return [dict(r) for r in conn.execute(query, params).fetchall()]
+
+
+def get_feedback_for_prediction(
+    db_path: Path | str = DEFAULT_DB_PATH,
+    prediction_id: int | None = None,
+) -> List[Dict[str, Any]]:
+    if prediction_id is None:
+        return []
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM feedback WHERE prediction_id = ? ORDER BY id DESC",
+            (prediction_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
