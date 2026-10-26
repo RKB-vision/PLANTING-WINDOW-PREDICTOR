@@ -1,6 +1,6 @@
 # Plant Transplant Readiness Prediction System — Complete Technical Documentation
 
-**Repository:** `RKB-vision/PLANTING-WINDOW-PREDICTOR` (branch `main`)
+**Repository:** `RKB-vision/PLANTING-WINDOW-PREDICTOR` (branch `simplified-architecture`)
 **Document:** `SYSTEM_DOCUMENTATION.md` (repository root)
 **Purpose:** Explain how the entire system works, how every file functions, and how they interact.
 
