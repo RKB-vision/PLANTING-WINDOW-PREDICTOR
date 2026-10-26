@@ -116,6 +116,7 @@ def refresh_camera_observations(
         "rows_written": 0,
         "observations_inserted": 0,
         "observations_skipped_duplicate": 0,
+        "captures_staged": 0,
         "errors": [],
     }
 
@@ -245,6 +246,9 @@ def refresh_camera_observations(
         report["observations_skipped_duplicate"] += int(
             result.get("observations_skipped_duplicate", 0)
         )
+        report["captures_staged"] += int(
+            result.get("staged_captures", 0)
+        )
         report["sources"].append(entry)
 
     return report
@@ -293,6 +297,7 @@ def _write_and_import(
         buffer,
         auto_register=False,
         data_source="real",
+        stage_only=True,
     )
 
 

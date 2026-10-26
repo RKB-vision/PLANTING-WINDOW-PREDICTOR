@@ -44,8 +44,10 @@ interface PredictionResult {
 
   provisional?: boolean
   method?: string
+  model_name?: string | null
   reference_basis?: string
   n_independent_plants?: number
+  n_labelled_readiness_events?: number
   reference_transplant_is_assumption?: boolean
   insufficient_growth_history?: boolean
   history_note?: string | null
@@ -56,6 +58,12 @@ interface PredictionResult {
   predicted_readiness_date?: string | null
   level?: string
   mae_days?: number | null
+  mae_days_std?: number | null
+  baseline_mae_days?: number | null
+  model_candidates?: Record<string, number> | null
+  limitations?: string | null
+  pending_review_count?: number
+  status_note?: string | null
   cohort_snapshot: CohortSnapshot
   readiness_event_counts: ReadinessCounts
 }
@@ -331,52 +339,84 @@ export default function Home() {
             )}
           </div>
 
-          <details className="disclosure">
-            <summary>Details and evidence</summary>
-
-            {result.reference_basis && (
-              <p className="small" style={{ marginTop: 8 }}>
-                Reference basis: {result.reference_basis} ·{' '}
-                {formatValue(result.n_independent_plants)} independent plants
-                {result.reference_transplant_is_assumption
-                  ? ' (transplant date assumed)'
-                  : ''}
+          {result.available && !result.provisional && result.mae_days != null && (
+            <div className="card" style={{ marginTop: 12, padding: 14 }}>
+              <p className="small" style={{ margin: 0, fontWeight: 600 }}>Model score (validation)</p>
+              <p className="small" style={{ margin: '4px 0 0' }}>
+                MAE {formatValue(result.mae_days)} days
+                {result.mae_days_std != null ? ` \u00b1 ${formatValue(result.mae_days_std)}` : ''}{' '}
+                \u00b7 baseline {formatValue(result.baseline_mae_days)} days (lower is better)
               </p>
-            )}
-
-            {result.provisional &&
-              result.days_remaining_uncertainty_days !== null &&
-              result.days_remaining_uncertainty_days !== undefined && (
-                <p className="small">
-                  Uncertainty ±{result.days_remaining_uncertainty_days} days
-                  (reference-group spread)
+              <p className="muted small" style={{ margin: '2px 0 0' }}>
+                {result.model_name ?? 'validated model'} \u00b7{' '}
+                {formatValue(result.n_independent_plants)} independent plants \u00b7{' '}
+                {formatValue(result.n_labelled_readiness_events)} readiness events
+              </p>
+              {result.model_candidates && Object.keys(result.model_candidates).length > 0 && (
+                <p className="muted small" style={{ margin: '2px 0 0' }}>
+                  Candidates:{' '}
+                  {Object.entries(result.model_candidates)
+                    .map(([k, v]) => `${k} ${formatValue(v)} d`)
+                    .join(' \\u00b7 ')}
                 </p>
               )}
+            </div>
+          )}
 
-            {result.history_note && (
-              <p className="small">{result.history_note}</p>
-            )}
-
-
-
-            {cohort && (
-              <p className="small">
-                Cohort: {formatValue(cohort.median_height_cm)} cm height ·{' '}
-                {formatValue(cohort.median_age_days)} days ·{' '}
-                {formatValue(cohort.median_growth_rate_cm_per_day)} cm/day ·{' '}
-                {formatValue(cohort.plants_represented)} plants
+          {result.provisional && (
+            <div className="card" style={{ marginTop: 12, padding: 14 }}>
+              <p className="small" style={{ margin: 0, fontWeight: 600 }}>Provisional baseline</p>
+              {result.days_remaining_uncertainty_days != null && result.days_remaining_uncertainty_days !== undefined && (
+                <p className="small" style={{ margin: '4px 0 0' }}>
+                  Reference spread \u00b1{result.days_remaining_uncertainty_days} days
+                </p>
+              )}
+              <p className="muted small" style={{ margin: '2px 0 0' }}>
+                {formatValue(result.n_independent_plants)} independent plants \u00b7 transplant date
+                {result.reference_transplant_is_assumption ? ' assumed (not verified)' : ' recorded'}
               </p>
-            )}
+            </div>
+          )}
 
+          {cohort && (
+            <div className="card" style={{ marginTop: 12, padding: 14 }}>
+              <p className="small" style={{ margin: 0, fontWeight: 600 }}>
+                Values used (cohort medians, {formatValue(cohort.plants_represented)} plants)
+              </p>
+              <div className="grid" style={{ marginTop: 6 }}>
+                <p className="small" style={{ margin: 0 }}>Height: {formatValue(cohort.median_height_cm)} cm</p>
+                <p className="small" style={{ margin: 0 }}>Growth rate:{' '}
+                  {cohort.median_growth_rate_cm_per_day != null
+                    ? `${formatValue(cohort.median_growth_rate_cm_per_day)} cm/day`
+                    : 'needs \u22652 measurements'}
+                </p>
+                <p className="small" style={{ margin: 0 }}>Canopy width: {formatValue(cohort.median_canopy_width_cm)} cm</p>
+                <p className="small" style={{ margin: 0 }}>Stem width: {formatValue(cohort.median_stem_width_cm)} cm</p>
+                <p className="small" style={{ margin: 0 }}>True leaves: {formatValue(cohort.median_visible_true_leaf_count)}</p>
+                <p className="small" style={{ margin: 0 }}>Age: {formatValue(cohort.median_age_days)} days</p>
+                <p className="small" style={{ margin: 0 }}>Observation date: {formatValue(cohort.observation_date)}</p>
+              </div>
+            </div>
+          )}
 
+          {result.limitations && (
+            <p className="muted small" style={{ margin: '8px 0 0' }}>Limitations: {result.limitations}</p>
+          )}
 
+          {result.pending_review_count != null && result.pending_review_count > 0 && (
+            <div className="alert alert-warning" style={{ marginTop: 12 }}>
+              <p className="alert-title">Review pending readings</p>
+              <p>{result.pending_review_count} new OpenCV reading(s) are waiting for review and were not used for this prediction.</p>
+              <p style={{ margin: 0 }}><a href="/readings">Review readings \u2192</a></p>
+            </div>
+          )}
+
+          {!result.available && (
             <p className="muted small" style={{ margin: '8px 0 0' }}>
-              {formatValue(result.readiness_event_counts?.independent_plants)}{' '}
-              independent plants ·{' '}
-              {formatValue(result.readiness_event_counts?.readiness_events)}{' '}
-              readiness events
+              Readings from the camera are stored even when prediction is unavailable.
+              Record a transplant in Feedback to create a training label; the model is retrained manually after enough labels.
             </p>
-          </details>
+          )}
         </section>
       )}
     </Layout>

@@ -474,6 +474,7 @@ def predict_days_remaining(selection: dict, observation: dict) -> dict:
         "mae_days": metrics.get("mae_days"),
         "mae_days_std": metrics.get("mae_days_std"),
         "baseline_mae_days": metrics.get("baseline_mean_mae_days"),
+        "model_candidates": metrics.get("all_candidates"),
         "level": selection["level"],
         "message": selection["message"],
         "data_source": selection["data_source"],

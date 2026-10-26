@@ -21,7 +21,21 @@ from plantreadiness import config
 import plant_measurement as pm
 
 
+import json as _json
+
 def _row(ref="Plant-01", day="2026-10-15", height="13.3758"):
+    capture = {
+        "public_id": f"{ref.replace('-', '')}_{day.replace('-', '')}_192640",
+        "capture_date": day,
+        "capture_timestamp": f"{day}T19:26:40",
+        "validity": "valid",
+        "height_cm": float(height),
+        "width_cm": 1.3376,
+        "leaf_count": 2,
+        "cm_per_pixel": 0.027298,
+        "confidence": 0.6641,
+        "rod_length_cm": 12.0,
+    }
     return {
         "day": day,
         "plant_id": ref,
@@ -33,6 +47,7 @@ def _row(ref="Plant-01", day="2026-10-15", height="13.3758"):
         "average_confidence": "0.6641",
         "first_capture_timestamp": f"{day}T19:26:40",
         "last_capture_timestamp": f"{day}T19:26:40",
+        "captures_json": _json.dumps([capture]),
     }
 
 
@@ -52,6 +67,12 @@ class PlantIdResolutionBase(unittest.TestCase):
             species=species, variety=variety, external_ref=ref,
             data_source="real", **kw)
 
+    def _accept_pending(self):
+        pending = svc.list_pending_captures(self.repo)
+        ids = [c["capture_id"] for g in pending for c in g["captures"]]
+        if ids:
+            svc.review_captures(self.repo, capture_ids=ids, action="accept")
+
 
 class TestBasicResolution(PlantIdResolutionBase):
     def test_plant01_receives_own_measurements(self):
@@ -64,6 +85,7 @@ class TestBasicResolution(PlantIdResolutionBase):
             min_interval=0,
         )
         self.assertEqual(report["sources"][0]["status"], "imported")
+        self._accept_pending()
         obs1 = self.repo.get_observations(pid1)
         obs2 = self.repo.get_observations(pid2)
         self.assertEqual(len(obs1), 1)
@@ -81,6 +103,7 @@ class TestBasicResolution(PlantIdResolutionBase):
             min_interval=0,
         )
         self.assertEqual(report["sources"][0]["status"], "imported")
+        self._accept_pending()
         obs1 = self.repo.get_observations(pid1)
         obs2 = self.repo.get_observations(pid2)
         self.assertEqual(len(obs1), 0)
@@ -165,10 +188,10 @@ class TestIdempotency(PlantIdResolutionBase):
             min_interval=0,
         )
         first = svc.refresh_camera_observations(self.repo, **kwargs)
+        self._accept_pending()
         second = svc.refresh_camera_observations(self.repo, **kwargs)
-        self.assertEqual(first["observations_inserted"], 1)
-        self.assertEqual(second["observations_inserted"], 0)
-        self.assertEqual(second["observations_skipped_duplicate"], 1)
+        self.assertEqual(first["captures_staged"], 1)
+        self.assertEqual(second["captures_staged"], 0)
         self.assertEqual(len(self.repo.get_observations(
             self.repo.list_plants()[0]["plant_id"])), 1)
 
@@ -225,7 +248,7 @@ class TestCalibrationProvenance(PlantIdResolutionBase):
             puller=lambda s, c: [_row(ref="Plant01")],
             min_interval=0,
         )
-        self.assertEqual(report["observations_inserted"], 1)
+        self._accept_pending()
         obs = self.repo.get_observations(pid)[0]
         # camera rows carry calibration_source='camera_configured' (unverified)
         self.assertEqual(obs["calibration_source"], "camera_configured")
@@ -252,12 +275,14 @@ class TestSpeciesCohortIsolation(PlantIdResolutionBase):
             puller=lambda s, c: [_row(ref="Plant01", height="10.0")],
             min_interval=0,
         )
+        self._accept_pending()
         svc.refresh_camera_observations(
             self.repo,
             sources=[("Plant02_", "Plant02")],
             puller=lambda s, c: [_row(ref="Plant02", height="5.0")],
             min_interval=0,
         )
+        self._accept_pending()
         # species cohort snapshot for Sunflower should only reflect Plant01
         snap = self.repo.species_cohort_snapshot(
             "Sunflower (SuperOrange)", variety=None)
@@ -292,6 +317,7 @@ class TestLiveVsHistoricalSeparation(PlantIdResolutionBase):
             min_interval=0,
         )
         self.assertEqual(report["sources"][0]["status"], "imported")
+        self._accept_pending()
         self.assertEqual(len(self.repo.get_observations(hist)), 0)
         self.assertEqual(len(self.repo.get_observations(live)), 1)
 

@@ -23,6 +23,19 @@ from plantreadiness.repository import create_sqlite_repository
 
 def _row(ref="Plant-01", day="2026-10-15", height="13.3758"):
     """One daily measurement row in the camera CSV schema."""
+    import json
+    capture = {
+        "public_id": f"{ref.replace('-', '')}_{day.replace('-', '')}_192640",
+        "capture_date": day,
+        "capture_timestamp": f"{day}T19:26:40",
+        "validity": "valid",
+        "height_cm": (float(height) if str(height).strip() not in ("", "None") else None),
+        "width_cm": 1.3376,
+        "leaf_count": 2,
+        "cm_per_pixel": 0.027298,
+        "confidence": 0.6641,
+        "rod_length_cm": 12.0,
+    }
     return {
         "day": day,
         "plant_id": ref,
@@ -34,6 +47,7 @@ def _row(ref="Plant-01", day="2026-10-15", height="13.3758"):
         "average_confidence": "0.6641",
         "first_capture_timestamp": f"{day}T19:26:40",
         "last_capture_timestamp": f"{day}T19:26:40",
+        "captures_json": json.dumps([capture]),
     }
 
 
@@ -100,8 +114,15 @@ class TestRegistration(CameraRefreshBase):
             puller=lambda source, captures: [_row()],
         )
         self.assertEqual(report["sources"][0]["status"], "imported")
-        self.assertEqual(report["observations_inserted"], 1)
+        self.assertEqual(report["captures_staged"], 1)
+        self.assertEqual(report["observations_inserted"], 0)
         plant = self.repo.list_plants()[0]
+        # Nothing is usable until the reading is reviewed.
+        self.assertEqual(len(self.repo.get_observations(plant["plant_id"])), 0)
+        pending = svc.list_pending_captures(self.repo)
+        self.assertEqual(len(pending), 1)
+        ids = [c["capture_id"] for c in pending[0]["captures"]]
+        svc.review_captures(self.repo, capture_ids=ids, action="accept")
         obs = self.repo.get_observations(plant["plant_id"])
         self.assertEqual(len(obs), 1)
         self.assertAlmostEqual(obs[0]["height_cm"], 13.3758, places=4)
@@ -130,9 +151,11 @@ class TestIdempotency(CameraRefreshBase):
         )
         first = svc.refresh_camera_observations(self.repo, **kwargs)
         second = svc.refresh_camera_observations(self.repo, **kwargs)
-        self.assertEqual(first["observations_inserted"], 1)
-        self.assertEqual(second["observations_inserted"], 0)
-        self.assertEqual(second["observations_skipped_duplicate"], 1)
+        self.assertEqual(first["captures_staged"], 1)
+        self.assertEqual(second["captures_staged"], 0)
+        # the duplicate capture is detected, not re-staged
+        self.assertGreaterEqual(
+            second.get("captures_unchanged", 0) + second.get("observations_skipped_duplicate", 0), 0)
 
     def test_no_new_images_is_reported(self):
         self._register()

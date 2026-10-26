@@ -397,10 +397,21 @@ class SQLiteRepository(BaseRepository):
         return dbm.add_capture(self.conn, **fields)
 
     def list_captures(self, plant_id, observation_date=None,
-                      data_source=None) -> list[dict]:
+                      data_source=None, review_status=None) -> list[dict]:
         return dbm.list_captures(self.conn, plant_id,
                                  observation_date=observation_date,
-                                 data_source=data_source)
+                                 data_source=data_source,
+                                 review_status=review_status)
+
+    def review_captures(self, capture_ids, action, reviewed_at=None) -> list[dict]:
+        return dbm.review_captures(self.conn, capture_ids, action,
+                                  reviewed_at=reviewed_at)
+
+    def pending_capture_groups(self, species=None, variety=None,
+                               data_source='real') -> list[dict]:
+        return dbm.pending_capture_groups(self.conn, species=species,
+                                         variety=variety,
+                                         data_source=data_source)
 
     def captures_on_date(self, plant_id, observation_date) -> list[dict]:
         return dbm.captures_on_date(self.conn, plant_id, observation_date)

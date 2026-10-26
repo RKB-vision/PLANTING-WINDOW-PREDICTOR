@@ -94,6 +94,7 @@ export default function FeedbackPage() {
   // dataset upload (Feedback -> Reference tab)
   const [uploadCsv, setUploadCsv] = useState('')
   const [uploadSpecies, setUploadSpecies] = useState('')
+  const [newSpeciesName, setNewSpeciesName] = useState('')
   const [uploadBusy, setUploadBusy] = useState(false)
   const [uploadResult, setUploadResult] = useState<string | null>(null)
 
@@ -216,7 +217,9 @@ export default function FeedbackPage() {
       setError('Paste a CSV (with at least Date, Age/ Age_days, Plant_ID, Height_cm).')
       return
     }
-    const sp = (uploadSpecies || selectedSpecies).trim()
+    const sp = (uploadSpecies === '__new__'
+      ? newSpeciesName.trim()
+      : (uploadSpecies || selectedSpecies)).trim()
     if (!sp) {
       setError('Species is required.')
       return
@@ -541,6 +544,10 @@ export default function FeedbackPage() {
               />
               The transplant actually occurred
             </label>
+            <p className="muted small" style={{ margin: '4px 0 0' }}>
+              When a transplant occurs, its date is recorded as a readiness
+              label for future model training (training is manual).
+            </p>
             <details className="disclosure">
               <summary>More options</summary>
               <div className="grid-2" style={{ marginTop: 10 }}>
@@ -837,15 +844,30 @@ export default function FeedbackPage() {
           </p>
           <div className="field">
             <label className="label" htmlFor="upload-species">Species</label>
-            <input
+            <select
               id="upload-species"
-              className="input"
+              className="select"
               value={uploadSpecies}
               onChange={e => setUploadSpecies(e.target.value)}
-              placeholder={selectedSpecies || 'e.g. Sunflower (SuperOrange)'}
-            />
+            >
+              <option value="">Use selected species ({selectedSpecies || 'none'})</option>
+              {species.map(sp => (
+                <option key={sp} value={sp}>{sp}</option>
+              ))}
+              <option value="__new__">New species (type below)</option>
+            </select>
+            {uploadSpecies === '__new__' && (
+              <div className="field" style={{ marginTop: 8 }}>
+                <input
+                  className="input"
+                  value={newSpeciesName}
+                  onChange={e => setNewSpeciesName(e.target.value)}
+                  placeholder="New species name, e.g. Sunflower (SuperOrange)"
+                />
+              </div>
+            )}
             <p className="muted small" style={{ marginTop: 6 }}>
-              Required. Defaults to the selected species above if left blank.
+              Pick an existing species to feed it, or create a new one.
             </p>
           </div>
           <div className="field">

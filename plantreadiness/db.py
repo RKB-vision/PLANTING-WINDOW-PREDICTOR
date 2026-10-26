@@ -229,6 +229,15 @@ CREATE TABLE IF NOT EXISTS camera_captures (
     data_source       TEXT    NOT NULL
                               CHECK (data_source IN ('real', 'synthetic')),
     recorded_at       TEXT    NOT NULL DEFAULT (datetime('now')),
+    -- Human review gate: a capture is staged as 'pending' by the camera
+    -- refresh and only folded into the daily observations once accepted.
+    review_status     TEXT    NOT NULL DEFAULT 'accepted'
+                              CHECK (review_status IN ('pending', 'accepted', 'discarded')),
+    reviewed_at       TEXT,
+    -- Optional thumbnail URL for the gallery (derived from public_id when not
+    -- recorded). Stored so the gallery works even if Cloudinary naming
+    -- changes.
+    image_url         TEXT,
     -- capture identity is the public id, NOT (plant, date)
     UNIQUE (public_id)
 );
@@ -491,6 +500,34 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     # COALESCE-based unique index instead of a table-level constraint.
     _migrate_plants_unique_constraint(conn)
 
+    # Forward migration: camera_captures gained a human review gate so that
+    # OpenCV readings are staged, reviewed, and only then folded into the
+    # daily observations used for prediction. Existing rows are treated as
+    # accepted (they predate the gate and were already in use).
+    cc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(camera_captures)")}
+    if "review_status" not in cc_cols:
+        conn.execute(
+            "ALTER TABLE camera_captures ADD COLUMN review_status TEXT "
+            "NOT NULL DEFAULT 'accepted' "
+            "CHECK (review_status IN ('pending', 'accepted', 'discarded'))"
+        )
+        conn.execute(
+            "UPDATE camera_captures SET review_status = 'accepted' "
+            "WHERE review_status IS NULL"
+        )
+    if "reviewed_at" not in cc_cols:
+        conn.execute(
+            "ALTER TABLE camera_captures ADD COLUMN reviewed_at TEXT"
+        )
+    if "image_url" not in cc_cols:
+        conn.execute(
+            "ALTER TABLE camera_captures ADD COLUMN image_url TEXT"
+        )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_camera_captures_review "
+        "ON camera_captures (review_status, plant_id, observation_date)"
+    )
+
     conn.commit()
     return conn
 
@@ -709,7 +746,10 @@ def add_capture(conn: sqlite3.Connection, *,
                 cm_per_pixel: Optional[float] = None,
                 confidence: Optional[float] = None,
                 problem: Optional[str] = None,
-                data_source: str = "real") -> dict:
+                data_source: str = "real",
+                review_status: str = "accepted",
+                reviewed_at: Optional[str] = None,
+                image_url: Optional[str] = None) -> dict:
     """Record (or revise) one image capture, keyed by ``public_id``.
 
     Idempotent by design: processing the same image twice never creates a second
@@ -750,6 +790,9 @@ def add_capture(conn: sqlite3.Connection, *,
         "rod_length_cm": float(rod_length_cm),
         "calibration_source": calibration_source,
         "calibration_verified": 1 if calibration_verified else 0,
+        "review_status": review_status,
+        "reviewed_at": reviewed_at,
+        "image_url": image_url,
     }
 
     existing = conn.execute(
@@ -762,12 +805,14 @@ def add_capture(conn: sqlite3.Connection, *,
                (plant_id, observation_date, public_id, capture_timestamp,
                 height_cm, stem_width_cm, visible_true_leaf_count, cm_per_pixel,
                 confidence, validity, problem, rod_length_cm, calibration_source,
-                calibration_verified, data_source)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                calibration_verified, data_source, review_status, reviewed_at,
+                image_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plant_id, obs_date, public_id, capture_timestamp, height_cm,
              stem_width_cm, visible_true_leaf_count, cm_per_pixel, confidence,
              validity, problem, float(rod_length_cm), calibration_source,
-             values["calibration_verified"], data_source),
+             values["calibration_verified"], data_source,
+             review_status, reviewed_at, image_url),
         )
         capture_id = int(cur.lastrowid)
         record_capture_revision(
@@ -782,6 +827,7 @@ def add_capture(conn: sqlite3.Connection, *,
     # Normalise the stored 0/1 back to int for comparison.
     comparable["calibration_verified"] = int(
         comparable.get("calibration_verified") or 0)
+    comparable["review_status"] = comparable.get("review_status") or "accepted"
     if comparable == values:
         return {"capture_id": int(existing["capture_id"]), "created": False,
                 "changed": False, "previous": previous}
@@ -792,12 +838,12 @@ def add_capture(conn: sqlite3.Connection, *,
                height_cm = ?, stem_width_cm = ?, visible_true_leaf_count = ?,
                cm_per_pixel = ?, confidence = ?, validity = ?, problem = ?,
                rod_length_cm = ?, calibration_source = ?, calibration_verified = ?,
-               data_source = ?
+               data_source = ?, review_status = ?, reviewed_at = ?, image_url = ?
            WHERE public_id = ?""",
         (plant_id, obs_date, capture_timestamp, height_cm, stem_width_cm,
          visible_true_leaf_count, cm_per_pixel, confidence, validity, problem,
          float(rod_length_cm), calibration_source, values["calibration_verified"],
-         data_source, public_id),
+         data_source, review_status, reviewed_at, image_url, public_id),
     )
     record_capture_revision(
         conn, capture_id=int(existing["capture_id"]), public_id=public_id,
@@ -810,7 +856,8 @@ def add_capture(conn: sqlite3.Connection, *,
 def list_captures(conn: sqlite3.Connection,
                   plant_id: int,
                   observation_date: Optional[str] = None,
-                  data_source: Optional[str] = None) -> list[dict]:
+                  data_source: Optional[str] = None,
+                  review_status: Optional[str] = None) -> list[dict]:
     """Captures for a plant, optionally restricted to one observation date."""
     sql = "SELECT * FROM camera_captures WHERE plant_id = ?"
     args: list = [plant_id]
@@ -821,8 +868,77 @@ def list_captures(conn: sqlite3.Connection,
     if data_source:
         sql += " AND data_source = ?"
         args.append(data_source)
+    if review_status:
+        sql += " AND review_status = ?"
+        args.append(review_status)
     sql += " ORDER BY capture_timestamp, public_id, capture_id"
     return [dict(r) for r in conn.execute(sql, args)]
+
+
+def review_captures(conn: sqlite3.Connection,
+                      capture_ids: list[int],
+                      action: str,
+                      reviewed_at: Optional[str] = None) -> list[dict]:
+    """Accept or discard a batch of staged captures.
+
+    Returns the list of affected capture rows (after update). Accepted rows
+    keep their validity; discarded rows are retained for the audit trail and
+    never folded into a daily observation.
+    """
+    if action not in ("accepted", "discarded"):
+        raise ValidationError(
+            f"review action must be 'accepted' or 'discarded', got {action!r}.")
+    reviewed_at = reviewed_at or datetime.now(timezone.utc).isoformat()
+    out = []
+    for cid in capture_ids:
+        row = conn.execute(
+            "SELECT * FROM camera_captures WHERE capture_id = ?", (cid,)
+        ).fetchone()
+        if row is None:
+            continue
+        conn.execute(
+            "UPDATE camera_captures SET review_status = ?, reviewed_at = ? "
+            "WHERE capture_id = ?",
+            (action, reviewed_at, cid),
+        )
+        out.append(dict(conn.execute(
+            "SELECT * FROM camera_captures WHERE capture_id = ?", (cid,)
+        ).fetchone()))
+    conn.commit()
+    return out
+
+
+def pending_capture_groups(conn: sqlite3.Connection,
+                          species: Optional[str] = None,
+                          variety: Optional[str] = None,
+                          data_source: str = "real") -> list[dict]:
+    """Group pending captures by (plant, observation_date) for the gallery."""
+    sql = """SELECT cc.*, p.species, p.variety, p.external_ref, p.data_source
+             FROM camera_captures cc
+             JOIN plants p ON p.plant_id = cc.plant_id
+             WHERE cc.review_status = 'pending' AND cc.data_source = ?"""
+    args: list = [data_source]
+    if species:
+        sql += " AND p.species = ?"
+        args.append(species)
+    if variety:
+        sql += " AND (p.variety = ? OR p.variety IS NULL)"
+        args.append(variety)
+    sql += " ORDER BY p.external_ref, cc.observation_date, cc.capture_timestamp"
+    rows = [dict(r) for r in conn.execute(sql, args)]
+    groups: dict[tuple, dict] = {}
+    for r in rows:
+        key = (r["plant_id"], r["observation_date"])
+        g = groups.setdefault(key, {
+            "plant_id": r["plant_id"],
+            "species": r["species"],
+            "variety": r["variety"],
+            "external_ref": r["external_ref"],
+            "observation_date": r["observation_date"],
+            "captures": [],
+        })
+        g["captures"].append(r)
+    return list(groups.values())
 
 
 def captures_on_date(conn: sqlite3.Connection,
@@ -1533,6 +1649,40 @@ def record_transplant(conn: sqlite3.Connection,
             f"Transplant already recorded for plant {plant_id} on {tdate}."
         ) from exc
     conn.commit()
+
+    # A transplant that actually occurred is an observed readiness event: the
+    # grower decided the plant was ready on that date. Record it as a
+    # training label (idempotent - never overwrites an existing event for the
+    # same definition version) so the model can later train on it. A deferral
+    # (transplant_occurred=False) never creates a label.
+    readiness_event_id = None
+    if transplant_occurred:
+        age_days = None
+        try:
+            if plant["date_started"]:
+                delta = days_between(plant["date_started"], tdate.isoformat())
+                if delta >= 0:
+                    age_days = delta
+        except Exception:
+            age_days = None
+        try:
+            readiness_event_id = record_readiness_event(
+                conn,
+                plant_id=plant_id,
+                readiness_observed_date=tdate.isoformat(),
+                readiness_observed_age_days=age_days,
+                readiness_definition_version="feedback_transplant_v1",
+                assessment_source="transplant_feedback",
+                data_source=source,
+                notes=transplant_notes,
+            )
+        except (DuplicateRecordError, ValidationError):
+            # Already labelled for this definition version - keep the first.
+            existing = get_readiness_event(
+                conn, plant_id, "feedback_transplant_v1")
+            readiness_event_id = (
+                existing["readiness_event_id"] if existing is not None else None)
+
     return {
         "feedback_id": int(cur.lastrowid),
         "plant_id": plant_id,
@@ -1543,6 +1693,8 @@ def record_transplant(conn: sqlite3.Connection,
         "condition_at_transplant": condition_at_transplant,
         "transplant_notes": transplant_notes,
         "data_source": source,
+        "readiness_event_id": readiness_event_id,
+        "training_label_recorded": readiness_event_id is not None,
     }
 
 

@@ -245,6 +245,60 @@ def camera_refresh():
         conn.close()
 
 
+@app.route('/api/captures', methods=['GET'])
+def list_captures():
+    """Staged OpenCV readings awaiting (or filtered by) human review."""
+    species = _clean_variety(request.args.get('species'))
+    variety = _clean_variety(request.args.get('variety'))
+    status = (request.args.get('status') or '').strip().lower() or None
+    data_source = (request.args.get('data_source') or 'real').strip().lower()
+    conn = dbm.connect(DB_PATH)
+    try:
+        repo = SQLiteRepository(conn)
+        groups = svc.list_pending_captures(
+            repo, species=species, variety=variety, data_source=data_source)
+        # Optional status filter: 'pending' (default gallery view) or 'all'.
+        if status and status != 'pending':
+            # Re-query all captures for the filters when not pending.
+            groups = repo.pending_capture_groups(
+                species=species, variety=variety, data_source=data_source) \
+                if status == 'all' else groups
+        return jsonify({'groups': groups,
+                        'pending_count': sum(
+                            len(g.get('captures', [])) for g in groups)})
+    except Exception as e:
+        return _error_response(e)
+    finally:
+        conn.close()
+
+
+@app.route('/api/captures/review', methods=['POST'])
+def review_captures():
+    """Accept or discard staged OpenCV readings."""
+    data = request.get_json() or {}
+    ids = data.get('ids') or []
+    action = str(data.get('action', '')).strip().lower()
+    if not isinstance(ids, list) or not ids:
+        return jsonify({'error': 'ids (list) is required'}), 400
+    if action not in ('accept', 'discard'):
+        return jsonify({'error': "action must be 'accept' or 'discard'"}), 400
+    try:
+        ids = [int(i) for i in ids]
+    except (TypeError, ValueError):
+        return jsonify({'error': 'ids must be integers'}), 400
+    reason = data.get('reason')
+    conn = dbm.connect(DB_PATH)
+    try:
+        repo = SQLiteRepository(conn)
+        result = svc.review_captures(
+            repo, capture_ids=ids, action=action, reason=reason)
+        return jsonify(result)
+    except Exception as e:
+        return _error_response(e)
+    finally:
+        conn.close()
+
+
 @app.route('/api/reference', methods=['GET'])
 def reference_baseline():
     """Successful-cohort reference baseline (built on demand with ?build=1)."""
@@ -355,6 +409,20 @@ def import_dataset():
         return jsonify({'error': 'csv text is required (field "file" or "csv_text")'}), 400
     if not species:
         return jsonify({'error': 'species is required'}), 400
+
+    # Canonicalise the species against existing records so a slightly different
+    # spelling (e.g. "Sunflower (Super Orange)") feeds the existing species
+    # instead of silently creating a new one.
+    conn0 = dbm.connect(DB_PATH)
+    try:
+        existing = [r[0] for r in conn0.execute(
+            "SELECT DISTINCT species FROM plants WHERE species IS NOT NULL").fetchall()]
+    finally:
+        conn0.close()
+    for cand in existing:
+        if cand.strip().lower() == species.strip().lower():
+            species = cand
+            break
 
     conn = dbm.connect(DB_PATH)
     try:

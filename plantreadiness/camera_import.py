@@ -40,7 +40,7 @@ from typing import Any, Optional, Union
 from . import calibration
 from . import config
 from . import db as dbm
-from .repository import BaseRepository, DuplicateRecordError, ValidationError
+from .repository import BaseRepository, DuplicateRecordError, NotFoundError, ValidationError
 
 CAMERA_REQUIRED_COLUMNS = (
     "plant_id",
@@ -162,6 +162,7 @@ def import_camera_measurements(
     default_variety: Optional[str] = None,
     auto_register: bool = True,
     data_source: str = "real",
+    stage_only: bool = False,
 ) -> dict:
     """Import measurements from an ESP32-CAM output CSV into the repository.
 
@@ -191,6 +192,7 @@ def import_camera_measurements(
     report: dict[str, Any] = {
         "rows_read": 0,
         "observations_inserted": 0,
+        "staged_captures": 0,
         "observations_updated": 0,
         "observations_skipped_duplicate": 0,
         "captures_recorded": 0,
@@ -452,6 +454,7 @@ def import_camera_measurements(
                         confidence=_safe_float(capture.get("confidence")),
                         problem=capture.get("problem"),
                         data_source=data_source,
+                        review_status="pending" if stage_only else "accepted",
                     )
                 except (ValidationError, DuplicateRecordError) as exc:
                     report["issues"].append(
@@ -462,6 +465,8 @@ def import_camera_measurements(
                 if outcome.get("created"):
                     report["captures_recorded"] += 1
                     captures_recorded += 1
+                    if stage_only:
+                        report["staged_captures"] += 1
                 else:
                     report["captures_unchanged"] += 1
                 if validity == FAILED_CAPTURE:
@@ -476,9 +481,14 @@ def import_camera_measurements(
             #    day's record instead of being discarded. Otherwise the row's
             #    own aggregate is used.
             # ------------------------------------------------------------------
+            if stage_only:
+                # Staged only: captures recorded above, no daily observation.
+                report["observations_skipped_duplicate"] += 0
+                continue
             stored_valid = [
                 capture for capture in repo.captures_on_date(plant_id, obs_date_iso)
                 if capture.get("validity") == VALID_CAPTURE
+                and capture.get("review_status") == "accepted"
             ]
 
             if stored_valid:
@@ -563,3 +573,77 @@ def import_camera_measurements(
             fh.close()
 
     return report
+
+
+def rebuild_daily_observation_from_captures(
+    repo: BaseRepository,
+    plant_id: int,
+    observation_date: str,
+    *,
+    data_source: str = "real",
+    reason: str = "reviewed camera capture",
+) -> dict:
+    """Recompute (or create) the daily observation for a (plant, date) from
+    the accepted captures stored for that day. Returns the upsert result."""
+    plant = repo.get_plant(plant_id)
+    if plant is None:
+        raise NotFoundError(f"No plant with plant_id={plant_id}.")
+    obs_date_iso = dbm.parse_iso_date(observation_date, "observation_date").isoformat()
+
+    accepted = [
+        c for c in repo.captures_on_date(plant_id, obs_date_iso)
+        if c.get("review_status") == "accepted"
+        and c.get("validity") == VALID_CAPTURE
+    ]
+    if not accepted:
+        # No accepted valid captures: leave any existing daily row untouched
+        # rather than deleting data.
+        return {"action": "none", "reason": "no accepted valid captures"}
+
+    height = _median(c.get("height_cm") for c in accepted)
+    stem_width = _median(c.get("stem_width_cm") for c in accepted)
+    leaves = _median(c.get("visible_true_leaf_count") for c in accepted)
+    if height is None:
+        return {"action": "none", "reason": "no usable height in accepted captures"}
+
+    rod_length_cm = accepted[0].get("rod_length_cm")
+    calibration_verified = all(
+        bool(c.get("calibration_verified")) for c in accepted)
+    calibration_source = accepted[0].get("calibration_source") \
+        or config.CALIBRATION_SOURCE_CAMERA
+
+    age_days = None
+    if plant.get("date_started"):
+        try:
+            delta = dbm.days_between(plant["date_started"], obs_date_iso)
+            if delta >= 0:
+                age_days = delta
+        except Exception:
+            pass
+
+    growth_rate = None
+    previous = _previous_observation(repo, plant_id, obs_date_iso)
+    if (previous and previous.get("height_cm") is not None
+            and previous.get("observation_date")):
+        span = dbm.days_between(previous["observation_date"], obs_date_iso)
+        if span > 0:
+            growth_rate = round(
+                (float(height) - float(previous["height_cm"])) / span, 4)
+
+    result = repo.upsert_daily_observation(
+        plant_id=plant_id,
+        observation_date=obs_date_iso,
+        age_days=age_days,
+        height_cm=height,
+        growth_rate_cm_per_day=growth_rate,
+        canopy_width_cm=None,
+        stem_width_cm=stem_width,
+        visible_true_leaf_count=(
+            None if leaves is None else int(round(leaves))),
+        rod_length_cm=rod_length_cm,
+        calibration_source=calibration_source,
+        calibration_verified=calibration_verified,
+        data_source=data_source,
+        reason=reason,
+    )
+    return result

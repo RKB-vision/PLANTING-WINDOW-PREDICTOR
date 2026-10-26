@@ -81,6 +81,10 @@ species reference.
 User feedback enters the data layer as a separate type of information. It is
 later used to evaluate prediction quality and inform controlled improvements.
 
+Camera readings are staged for human review before they enter the daily
+observations used for prediction; accepted readings only. A recorded transplant
+creates a readiness label for future (manual) training.
+
 The image-measurement process, historical reference data, prediction inputs,
 prediction outputs, and feedback should remain distinguishable rather than being
 treated as interchangeable records.
@@ -144,7 +148,6 @@ The system must distinguish between:
 
 - A prediction from a sufficiently validated model.
 - A provisional estimate based on the historical reference.
-- A synthetic demonstration prediction.
 - An unavailable prediction caused by insufficient evidence.
 
 Growth rate requires measurements at multiple times. In the initial days, when

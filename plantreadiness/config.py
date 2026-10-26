@@ -291,6 +291,9 @@ def camera_credentials_present() -> bool:
     )
 
 
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+
+
 def camera_sources() -> list[tuple[str, str]]:
     """Configured Cloudinary prefix -> registered plant external_ref mapping.
 

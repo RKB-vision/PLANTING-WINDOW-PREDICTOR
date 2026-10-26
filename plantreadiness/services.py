@@ -27,7 +27,7 @@ from __future__ import annotations
 import csv
 import io
 import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -38,6 +38,7 @@ from .db import (DuplicateRecordError, NotFoundError, ValidationError,
                  compute_growth, days_between, feedback_due_date,
                  parse_iso_date)
 from .repository import BaseRepository
+from . import camera_import
 from .camera_refresh import refresh_camera_observations
 
 # Re-exported so front-ends import workflow errors from one place.
@@ -47,6 +48,7 @@ __all__ = [
     "submit_feedback", "correct_feedback", "feedback_state",
     "record_readiness_event", "list_readiness_events",
     "import_camera_measurements", "refresh_camera_observations",
+    "list_pending_captures", "review_captures",
     "predict_for_plant", "predict_ad_hoc", "predict_species_cohort",
     "model_status",
     "species_model_plan", "preview_csv_import", "run_csv_import",
@@ -54,7 +56,6 @@ __all__ = [
     "build_reference_baseline", "load_reference_baseline",
     "save_prediction_snapshot", "list_prediction_history",
     "record_readiness_assessment", "list_readiness_assessments",
-    "evaluate_predictions",
 ]
 
 
@@ -581,12 +582,88 @@ def predict_species_cohort(repo: BaseRepository, species: str,
         result["prediction_scope"] = "species_cohort"
     result.setdefault("provisional", False)
     result.setdefault("method", _method_for(result))
+    # How many staged OpenCV readings still await human review for this
+    # species. They were deliberately NOT folded into the prediction above.
+    try:
+        groups = repo.pending_capture_groups(species=species, variety=variety)
+        result["pending_review_count"] = sum(
+            len(g.get("captures", [])) for g in groups)
+    except Exception:
+        result["pending_review_count"] = 0
     return result
 
 
 # --------------------------------------------------------------------------- #
 # Model / species status (dashboard + species page)
 # --------------------------------------------------------------------------- #
+
+
+def list_pending_captures(repo: BaseRepository, *, species=None, variety=None,
+                         data_source: str = "real") -> list[dict]:
+    """Staged OpenCV readings awaiting human review, grouped by plant/date."""
+    groups = repo.pending_capture_groups(species=species, variety=variety,
+                                        data_source=data_source)
+    # Attach a proposed daily median for each group (accepted-valid captures).
+    for g in groups:
+        valid = [c for c in g["captures"]
+                 if c.get("validity") == "valid"
+                 and c.get("review_status") == "pending"]
+        heights = [c.get("height_cm") for c in valid]
+        stems = [c.get("stem_width_cm") for c in valid]
+        leaves = [c.get("visible_true_leaf_count") for c in valid]
+        g["proposed"] = {
+            "median_height_cm": _rounded(heights) if False else _median_num(heights),
+            "median_stem_width_cm": _median_num(stems),
+            "median_visible_true_leaf_count": _median_int(leaves),
+            "n_valid": len(valid),
+            "n_total": len(g["captures"]),
+        }
+        for c in g["captures"]:
+            c["image_url"] = c.get("image_url") or _capture_image_url(c.get("public_id"))
+    return groups
+
+
+def _median_num(values):
+    vals = sorted(float(v) for v in values if v is not None)
+    if not vals:
+        return None
+    mid = len(vals) // 2
+    if len(vals) % 2:
+        return round(vals[mid], 4)
+    return round((vals[mid - 1] + vals[mid]) / 2, 4)
+
+
+def review_captures(repo: BaseRepository, *, capture_ids: list[int],
+                    action: str, reason: Optional[str] = None) -> dict:
+    """Accept or discard staged captures; accepted ones rebuild daily obs."""
+    if action not in ("accept", "discard"):
+        raise ValidationError(f"review action must be 'accept' or 'discard', got {action!r}.")
+    db_action = "accepted" if action == "accept" else "discarded"
+    reviewed_at = datetime.now(timezone.utc).isoformat()
+    rows = repo.review_captures(capture_ids, db_action, reviewed_at=reviewed_at)
+    rebuilt = []
+    if db_action == "accepted":
+        groups = {}
+        for r in rows:
+            groups.setdefault((r["plant_id"], r["observation_date"]), True)
+        for (plant_id, obs_date) in groups:
+            try:
+                rebuilt.append(camera_import.rebuild_daily_observation_from_captures(
+                    repo, plant_id, obs_date, reason=reason or "reviewed accept"))
+            except Exception as exc:
+                rebuilt.append({"plant_id": plant_id, "observation_date": obs_date,
+                                "error": str(exc)})
+    return {"reviewed": len(rows), "action": db_action,
+            "rebuilt": rebuilt, "capture_ids": [r["capture_id"] for r in rows]}
+
+
+def _capture_image_url(public_id):
+    if not public_id:
+        return None
+    cloud = getattr(config, "CLOUDINARY_CLOUD_NAME", None) or __import__("os").getenv("CLOUDINARY_CLOUD_NAME")
+    if not cloud:
+        return None
+    return f"https://res.cloudinary.com/{cloud}/image/upload/w_320,c_fill/{public_id}.jpg"
 
 
 def model_status(models_dir: Path) -> dict:
@@ -838,199 +915,6 @@ def list_readiness_assessments(repo: BaseRepository, *,
                                data_source: Optional[str] = None) -> list[dict]:
     return repo.list_readiness_assessments(
         plant_id=plant_id, species=species, data_source=data_source)
-
-
-def _summarise_evaluation(rows: list[dict]) -> dict:
-    """Aggregate prediction-vs-actual errors for one group of rows."""
-    n = len(rows)
-    if not n:
-        return {"n_predictions": 0, "n_independent_plants": 0,
-                "mean_abs_error_days": None, "median_abs_error_days": None,
-                "mean_error_days": None, "n_matched_observed_date": 0,
-                "match_rate": None, "n_with_14d_outcome": 0,
-                "survival_rate_14d": None, "n_incomplete_feedback": 0}
-    abs_errs = [r["abs_error_days"] for r in rows]
-    signed = [r["error_days"] for r in rows]
-    plants = {r["plant_id"] for r in rows}
-    matched = sum(1 for r in rows if r["matched"])
-    outcomes = [r for r in rows if r["survived"] is not None]
-    survived = sum(1 for r in outcomes if r["survived"])
-    return {
-        "n_predictions": n,
-        "n_independent_plants": len(plants),
-        "mean_abs_error_days": round(sum(abs_errs) / n, 2),
-        "median_abs_error_days": round(sorted(abs_errs)[n // 2]
-                                       if n % 2 else
-                                       (sorted(abs_errs)[n // 2 - 1]
-                                        + sorted(abs_errs)[n // 2]) / 2, 2),
-        "mean_error_days": round(sum(signed) / n, 2),
-        "n_matched_observed_date": matched,
-        "match_rate": round(matched / n, 3),
-        "n_with_14d_outcome": len(outcomes),
-        "survival_rate_14d": (round(survived / len(outcomes), 3)
-                              if outcomes else None),
-        "n_incomplete_feedback": sum(1 for r in rows
-                                     if r["survived"] is None),
-    }
-
-
-def evaluate_predictions(repo: BaseRepository, *,
-                         species: Optional[str] = None,
-                         variety: Optional[str] = None,
-                         tolerance: Optional[float] = None,
-                         data_source: str = "real") -> dict:
-    """Compare recorded predictions against the actual transplants.
-
-    Two questions are kept apart:
-
-    * *did the prediction match the observed transplant date?* - measured as
-      the absolute error in days (and a within-tolerance match rate);
-    * *was that date optimal?* - this cohort has only successful transplants,
-      so optimality is **not** evaluable from it. Survival after 14 days is
-      reported descriptively only.
-
-    Predictions made after the transplant date are excluded to avoid using
-    future data.
-    """
-    tolerance = (config.EVALUATION_MATCH_TOLERANCE_DAYS
-                 if tolerance is None else float(tolerance))
-
-    feedback = repo.all_feedback(data_source=data_source)
-    transplant_by_plant: dict[int, dict] = {}
-    for row in feedback:
-        if row.get("transplant_occurred", 1) is False:
-            continue
-        tx = row.get("transplant_date")
-        if not tx:
-            continue
-        pid = row["plant_id"]
-        current = transplant_by_plant.get(pid)
-        if current is None or tx < current["transplant_date"]:
-            transplant_by_plant[pid] = row
-
-    predictions = repo.list_prediction_history(
-        species=species, data_source=data_source)
-
-    rows: list[dict] = []
-    skipped_after_transplant = 0
-    for pred in predictions:
-        pid = pred.get("plant_id")
-        if pid is None or not pred.get("available"):
-            continue
-        fb = transplant_by_plant.get(pid)
-        if fb is None:
-            continue
-        if variety and fb.get("variety") and fb.get("variety") != variety:
-            continue
-        tx = fb["transplant_date"]
-        obs_date = pred.get("observation_date")
-        if obs_date and obs_date > tx:
-            skipped_after_transplant += 1
-            continue
-        pred_date = pred.get("predicted_readiness_date")
-        if not pred_date and obs_date and pred.get("days_remaining") is not None:
-            pred_date = (parse_iso_date(obs_date)
-                         + timedelta(days=int(round(
-                             pred["days_remaining"])))).isoformat()
-        if not pred_date:
-            continue
-        # signed error: predicted readiness date minus actual transplant date
-        error_days = days_between(tx, pred_date)
-        survived = fb.get("survived_after_14d")
-        survived = None if survived is None else bool(survived)
-        rows.append({
-            "prediction_id": pred.get("prediction_id"),
-            "plant_id": pid,
-            "species": pred.get("species"),
-            "variety": pred.get("variety"),
-            "method": pred.get("method"),
-            "provisional": bool(pred.get("provisional")),
-            "prediction_scope": pred.get("prediction_scope"),
-            "observation_date": obs_date,
-            "predicted_readiness_date": pred_date,
-            "actual_transplant_date": tx,
-            "error_days": error_days,
-            "abs_error_days": abs(error_days),
-            "matched": abs(error_days) <= tolerance,
-            "survived": survived,
-            "feedback_submitted": fb.get("feedback_submitted_date") is not None,
-        })
-
-    by_method: dict[str, dict] = {}
-    for row in rows:
-        by_method.setdefault(row["method"] or "unknown", []).append(row)
-    by_method_summary = {m: _summarise_evaluation(rs)
-                         for m, rs in by_method.items()}
-
-    by_species: dict[str, list[dict]] = {}
-    for row in rows:
-        by_species.setdefault(row["species"] or "unknown", []).append(row)
-    by_species_summary = [
-        {"species": s, **_summarise_evaluation(rs)}
-        for s, rs in sorted(by_species.items())
-    ]
-
-    overall = _summarise_evaluation(rows)
-    sufficient = (overall["n_independent_plants"] >= config.MIN_INDEPENDENT_PLANTS
-                  and overall["n_predictions"] >= config.MIN_READINESS_EVENTS)
-
-    # A comparison is only offered between methods that each have enough
-    # independent plants; it is NEVER auto-applied.
-    methods_with_evidence = {
-        m: s for m, s in by_method_summary.items()
-        if s["n_independent_plants"] >= config.MIN_PROVISIONAL_PLANTS}
-    better_method = None
-    if len(methods_with_evidence) >= 2:
-        ranked = sorted(
-            methods_with_evidence.items(),
-            key=lambda kv: kv[1]["mean_abs_error_days"])
-        better_method = ranked[0][0]
-    comparison = {
-        "methods_compared": sorted(methods_with_evidence.keys()),
-        "better_method": better_method,
-        "auto_applied": False,
-        "recommendation": (
-            "Not enough independent plants across methods to compare; keep "
-            "collecting feedback."
-            if better_method is None else
-            f"'{better_method}' has the lower mean absolute error on recorded "
-            "transplants. Review before changing anything - this does not "
-            "retrain or promote a model."),
-    }
-
-    return {
-        "species": species,
-        "variety": variety,
-        "tolerance_days": tolerance,
-        "n_predictions_evaluated": overall["n_predictions"],
-        "n_independent_plants": overall["n_independent_plants"],
-        "skipped_after_transplant": skipped_after_transplant,
-        "overall": overall,
-        "by_method": by_method_summary,
-        "by_species": by_species_summary,
-        "comparison": comparison,
-        "sufficient_evidence": sufficient,
-        "min_requirements": {
-            "independent_plants": config.MIN_INDEPENDENT_PLANTS,
-            "predictions_with_outcomes": config.MIN_READINESS_EVENTS,
-            "plants_per_method": config.MIN_PROVISIONAL_PLANTS,
-        },
-        "notes": [
-            "Error is predicted_readiness_date minus actual transplant_date "
-            "in calendar days (negative = predicted earlier than transplant).",
-            "Matching the observed transplant date is not the same as that "
-            "date being optimal: the historical cohort contains only "
-            "successful transplants and cannot show what would have failed.",
-            "Feedback not yet submitted is reported as incomplete, never as "
-            "death or failure.",
-            "Nothing here retrains or replaces a model automatically.",
-        ],
-    }
-
-
-# --------------------------------------------------------------------------- #
-# CSV import (preview -> validate -> import) and export
-# --------------------------------------------------------------------------- #
 
 
 def _parse_csv_text(csv_text: str) -> tuple[list[str], list[dict], list[dict]]:
