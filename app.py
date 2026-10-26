@@ -52,8 +52,11 @@ if use_latest:
     else:
         obs_date = date.today()
     st.caption(f"Using date: {obs_date}")
-else:
-    obs_date = st.date_input("Observation date", value=date.today(), key="obs_date")
+
+# Calendar always visible
+manual_date = st.date_input("Observation date", value=date.today(), key="obs_date")
+if not use_latest:
+    obs_date = manual_date
     st.caption(f"Using date: {obs_date}")
 
 # --- Check existing measurements ---
