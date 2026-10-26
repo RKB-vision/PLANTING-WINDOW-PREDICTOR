@@ -6,7 +6,7 @@ Supports:
   python cli.py measure <image_path> [--rod-cm 12.0]
   python cli.py train [--species "Sunflower(SuperOrange)"]
   python cli.py predict --species "Sunflower(SuperOrange)" [--height 3.5] [--age 15]
-  python cli.py evaluate
+
 """
 
 from __future__ import annotations
@@ -60,8 +60,7 @@ def main() -> None:
     p_pred.add_argument("--growth-rate", type=float, default=None, help="Growth rate cm/day")
     p_pred.add_argument("--plant-id", default=None, help="Use this plant's saved observation")
 
-    # Evaluate
-    subparsers.add_parser("evaluate", help="Evaluate historical predictions against actual feedback")
+
 
     # Refresh (Cloudinary)
     p_refresh = subparsers.add_parser("refresh", help="Pull and measure new images from Cloudinary")
@@ -155,10 +154,7 @@ def main() -> None:
             print(f"Prediction Unavailable: {res.summary_message}")
             print(f"Method: {res.method}")
 
-    elif args.command == "evaluate":
-        res = ml.evaluate_predictions(db.DEFAULT_DB_PATH)
-        print("--- Historical Prediction Evaluation ---")
-        print(json.dumps(res, indent=2))
+
 
     elif args.command == "refresh":
         report = cr.refresh(db.DEFAULT_DB_PATH, species=args.species, captures=args.captures)

@@ -278,15 +278,6 @@ def _render_feedback(species: str) -> None:
                 "Feedback saved. The original prediction is unchanged (append-only)."
             )
 
-        evaluation = ml.evaluate_predictions(db.DEFAULT_DB_PATH)
-        if evaluation.get("evaluations_count"):
-            st.caption(
-                f"Evaluated {evaluation['evaluations_count']} prediction(s): "
-                f"MAE {evaluation['mae_days']} d, bias {evaluation['mean_bias_days']} d."
-            )
-        else:
-            st.caption("No prediction has an actual transplant date yet, so error cannot be measured.")
-
 
 # --- Sidebar -----------------------------------------------------------------
 species_list = db.get_species_list()

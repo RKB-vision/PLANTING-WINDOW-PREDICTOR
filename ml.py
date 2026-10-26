@@ -473,38 +473,4 @@ def predict_species_readiness(
     )
 
 
-def evaluate_predictions(db_path: Path | str = db.DEFAULT_DB_PATH) -> Dict[str, Any]:
-    """
-    Evaluates historical predictions against recorded actual transplantation feedback.
-    """
-    with db.get_connection(db_path) as conn:
-        rows = conn.execute("""
-            SELECT
-                p.id as prediction_id,
-                p.species,
-                p.prediction_date,
-                p.predicted_days_remaining,
-                f.actual_transplant_date,
-                CAST(JULIANDAY(f.actual_transplant_date) - JULIANDAY(p.prediction_date) AS REAL) as actual_days_taken
-            FROM predictions p
-            JOIN feedback f ON p.id = f.prediction_id
-            WHERE f.actual_transplant_date IS NOT NULL
-              AND p.predicted_days_remaining IS NOT NULL
-        """).fetchall()
 
-    if not rows:
-        return {"evaluations_count": 0, "message": "No evaluated feedback records with actual transplant dates yet."}
-
-    errors = []
-    for r in rows:
-        err = r["predicted_days_remaining"] - r["actual_days_taken"]
-        errors.append(err)
-
-    mae = float(np.mean(np.abs(errors)))
-    bias = float(np.mean(errors))
-    return {
-        "evaluations_count": len(rows),
-        "mae_days": round(mae, 2),
-        "mean_bias_days": round(bias, 2),
-        "records": [dict(r) for r in rows],
-    }

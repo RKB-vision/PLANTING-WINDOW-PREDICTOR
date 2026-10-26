@@ -248,7 +248,7 @@ def record_observation(
         cols = [c[1] for c in conn.execute("PRAGMA table_info(observations)").fetchall()]
         has_source = "source" in cols
         src_col = "source" if has_source else "data_source"
-        src_val = "real" if (not has_source and source not in ("real", "synthetic")) else source
+        src_val = "real" if (not has_source and source != "real") else source
 
         cols = [c[1] for c in conn.execute("PRAGMA table_info(observations)").fetchall()]
         has_calib = "calibration_source" in cols

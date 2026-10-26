@@ -137,7 +137,7 @@ def test_prediction_fallback_ladder(temp_db):
     assert p3.confidence == "none"
 
 
-def test_feedback_and_evaluation_cycle(temp_db):
+def test_feedback_cycle(temp_db):
     # Save a prediction
     pred_id = db.save_prediction(
         temp_db,
@@ -159,10 +159,3 @@ def test_feedback_and_evaluation_cycle(temp_db):
         condition="healthy",
     )
     assert fb_id > 0
-
-    # Evaluate predictions
-    eval_res = ml.evaluate_predictions(temp_db)
-    assert eval_res["evaluations_count"] == 1
-    # Predicted 5 days, actual was 4 days -> error = +1 day
-    assert eval_res["mae_days"] == 1.0
-    assert eval_res["mean_bias_days"] == 1.0
