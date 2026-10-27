@@ -105,7 +105,8 @@ export default function Home() {
   const [loadingPrediction, setLoadingPrediction] = useState(false)
   const [result, setResult] = useState<PredictionResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [showModal, setShowModal] = useState(false)
+  const [showReviewModal, setShowReviewModal] = useState(false)
+  const [showResultModal, setShowResultModal] = useState(false)
   const [modalStep, setModalStep] = useState<'loading' | 'review' | 'result'>('loading')
   const [pendingGroups, setPendingGroups] = useState<any[]>([])
   const [pendingCount, setPendingCount] = useState(0)
@@ -150,7 +151,7 @@ export default function Home() {
     setLoadingPrediction(true)
     setError(null)
     setResult(null)
-    setShowModal(true)
+    setShowReviewModal(true)
     setModalStep('loading')
     setPendingGroups([])
     setReviewSelected(new Set())
@@ -173,13 +174,21 @@ export default function Home() {
         const hasPending = groups.some((g: any) =>
           (g.captures || []).some((c: any) => c.review_status === 'pending')
         )
-        setModalStep(hasPending ? 'review' : 'result')
+        if (hasPending) {
+          setModalStep('review')
+        } else {
+          setShowReviewModal(false)
+          setShowResultModal(true)
+          setModalStep('result')
+        }
       } catch {
         setModalStep('result')
       }
     } catch (e: any) {
       const msg = e?.response?.data?.error || 'Prediction request failed.'
       setError(msg)
+      setShowReviewModal(false)
+      setShowResultModal(true)
       setModalStep('result')
     } finally {
       setLoadingPrediction(false)
@@ -196,16 +205,22 @@ export default function Home() {
   }
 
   const reviewAction = async (action: 'accept' | 'discard') => {
-    if (!reviewSelected.size) return
+    let ids = Array.from(reviewSelected)
+    if (!ids.length && action === 'accept') {
+      ids = pendingGroups.flatMap((g: any) =>
+        (g.captures || []).filter((c: any) => c.review_status === 'pending').map((c: any) => c.capture_id)
+      )
+    }
+    if (!ids.length) return
     setReviewBusy(true)
     setReviewMessage(null)
     try {
       await axios.post('/api/captures/review', {
-        ids: Array.from(reviewSelected),
+        ids,
         action,
       })
       setReviewMessage(
-        `${reviewSelected.size} reading(s) ${action === 'accept' ? 'accepted' : 'discarded'}.`
+        `${ids.length} reading(s) ${action === 'accept' ? 'accepted' : 'discarded'}.`
       )
       // Refresh pending list.
       const capResp = await axios.get('/api/captures', {
@@ -219,7 +234,6 @@ export default function Home() {
         (g.captures || []).some((c: any) => c.review_status === 'pending')
       )
       if (!hasPending) {
-        // Re-run prediction now that readings are accepted.
         setModalStep('loading')
         try {
           const resp = await axios.post('/api/predict/species', {
@@ -231,6 +245,8 @@ export default function Home() {
         } catch (e: any) {
           setError(e?.response?.data?.error || 'Prediction request failed.')
         }
+        setShowReviewModal(false)
+        setShowResultModal(true)
         setModalStep('result')
       }
     } catch (e: any) {
@@ -241,7 +257,7 @@ export default function Home() {
   }
 
   const closeModal = () => {
-    setShowModal(false)
+    setShowReviewModal(false)
     setModalStep('loading')
   }
 
@@ -375,7 +391,7 @@ export default function Home() {
         </div>
       )}
 
-      {showModal && (
+      {showReviewModal && (
         <div
           className="modal-overlay"
           style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }}
@@ -383,7 +399,7 @@ export default function Home() {
         >
           <div className="card" style={{ maxWidth: 720, width: '100%', maxHeight: '85vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
             <div className="row-between" style={{ marginBottom: 12 }}>
-              <h2 className="card-title" style={{ margin: 0 }}>Prediction</h2>
+              <h2 className="card-title" style={{ margin: 0 }}>Verify readings</h2>
               <button className="btn btn-secondary btn-sm" onClick={closeModal}>Close</button>
             </div>
 
@@ -422,13 +438,25 @@ export default function Home() {
                   </div>
                 ))}
                 <div className="btn-row" style={{ marginTop: 8 }}>
-                  <button className="btn" disabled={reviewBusy || !reviewSelected.size} onClick={() => reviewAction('accept')}>Accept selected</button>
+                  <button className="btn" disabled={reviewBusy} onClick={() => reviewAction('accept')}>Verify &amp; predict</button>
                   <button className="btn btn-secondary" disabled={reviewBusy || !reviewSelected.size} onClick={() => reviewAction('discard')}>Discard selected</button>
                 </div>
               </>
             )}
 
-            {modalStep === 'result' && result && (
+          </div>
+        </div>
+      )}
+
+      {showResultModal && (
+        <div className="modal-overlay" style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }} onClick={() => setShowResultModal(false)}>
+          <div className="card" style={{ maxWidth: 720, width: '100%', maxHeight: '85vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
+            <div className="row-between" style={{ marginBottom: 12 }}>
+              <h2 className="card-title" style={{ margin: 0 }}>Prediction result</h2>
+              <button className="btn btn-secondary btn-sm" onClick={() => setShowResultModal(false)}>Close</button>
+            </div>
+
+            {result && (
               <>
                 <div className={'answer ' + (result.available ? 'answer-ok' : 'answer-muted')}>
                   {result.available && result.days_remaining !== undefined ? (
@@ -455,51 +483,33 @@ export default function Home() {
                     <p className="small" style={{ margin: 0, fontWeight: 600 }}>Model score (validation)</p>
                     <p className="small" style={{ margin: '4px 0 0' }}>
                       MAE {formatValue(result.mae_days)} days
-                      {result.mae_days_std != null ? ` \u00b1 ${formatValue(result.mae_days_std)}` : ''}{' '}
-                      \u00b7 baseline {formatValue(result.baseline_mae_days)} days (lower is better)
+                      {result.mae_days_std != null ? ` \\u00b1 ${formatValue(result.mae_days_std)}` : ''}{' '}
+                      \\u00b7 baseline {formatValue(result.baseline_mae_days)} days (lower is better)
                     </p>
                     <p className="muted small" style={{ margin: '2px 0 0' }}>
-                      {result.model_name ?? 'validated model'} \u00b7{' '}
-                      {formatValue(result.n_independent_plants)} independent plants \u00b7{' '}
+                      {result.model_name ?? 'validated model'} \\u00b7{' '}
+                      {formatValue(result.n_independent_plants)} independent plants \\u00b7{' '}
                       {formatValue(result.n_labelled_readiness_events)} readiness events
                     </p>
                     {result.model_candidates && Object.keys(result.model_candidates).length > 0 && (
                       <p className="muted small" style={{ margin: '2px 0 0' }}>
                         Candidates:{' '}
-                        {Object.entries(result.model_candidates).map(([k, v]) => `${k} ${formatValue(v)} d`).join(' \u00b7 ')}
+                        {Object.entries(result.model_candidates).map(([k, v]) => `${k} ${formatValue(v)} d`).join(' \\u00b7 ')}
                       </p>
                     )}
-                  </div>
-                )}
-
-                {result.provisional && (
-                  <div className="card" style={{ marginTop: 12, padding: 14 }}>
-                    <p className="small" style={{ margin: 0, fontWeight: 600 }}>Provisional baseline</p>
-                    {result.days_remaining_uncertainty_days != null && result.days_remaining_uncertainty_days !== undefined && (
-                      <p className="small" style={{ margin: '4px 0 0' }}>
-                        Reference spread \u00b1{result.days_remaining_uncertainty_days} days
-                      </p>
-                    )}
-                    <p className="muted small" style={{ margin: '2px 0 0' }}>
-                      {formatValue(result.n_independent_plants)} independent plants \u00b7 transplant date
-                      {result.reference_transplant_is_assumption ? ' assumed (not verified)' : ' recorded'}
-                    </p>
                   </div>
                 )}
 
                 {cohort && (
                   <div className="card" style={{ marginTop: 12, padding: 14 }}>
-                    <p className="small" style={{ margin: 0, fontWeight: 600 }}>
-                      Values used (cohort medians, {formatValue(cohort.plants_represented)} plants)
-                    </p>
+                    <p className="small" style={{ margin: 0, fontWeight: 600 }}>Values used</p>
                     <div className="grid" style={{ marginTop: 6 }}>
                       <p className="small" style={{ margin: 0 }}>Height: {formatValue(cohort.median_height_cm)} cm</p>
                       <p className="small" style={{ margin: 0 }}>Growth rate:{' '}
                         {cohort.median_growth_rate_cm_per_day != null
                           ? `${formatValue(cohort.median_growth_rate_cm_per_day)} cm/day`
-                          : 'needs \u22652 measurements'}
+                          : 'needs \\u22652 measurements'}
                       </p>
-                      <p className="small" style={{ margin: 0 }}>Canopy width: {formatValue(cohort.median_canopy_width_cm)} cm</p>
                       <p className="small" style={{ margin: 0 }}>Stem width: {formatValue(cohort.median_stem_width_cm)} cm</p>
                       <p className="small" style={{ margin: 0 }}>True leaves: {formatValue(cohort.median_visible_true_leaf_count)}</p>
                       <p className="small" style={{ margin: 0 }}>Age: {formatValue(cohort.median_age_days)} days</p>
@@ -508,21 +518,12 @@ export default function Home() {
                   </div>
                 )}
 
-                {result.limitations && (
-                  <p className="muted small" style={{ margin: '8px 0 0' }}>Limitations: {result.limitations}</p>
-                )}
-
                 {!result.available && (
                   <p className="muted small" style={{ margin: '8px 0 0' }}>
-                    Readings from the camera are stored even when prediction is unavailable.
-                    Record a transplant in Feedback to create a training label.
+                    Readings are stored even when prediction is unavailable. Record a transplant in Feedback to create a training label.
                   </p>
                 )}
               </>
-            )}
-
-            {modalStep === 'result' && !result && error && (
-              <p className="muted">{error}</p>
             )}
           </div>
         </div>
