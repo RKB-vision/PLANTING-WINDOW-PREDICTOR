@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
+import { useRouter } from 'next/router'
 import Layout from '../components/Layout'
 import Stat from '../components/Stat'
 
@@ -35,9 +36,26 @@ interface SpeciesOption {
   readiness_event_counts: ReadinessCounts
 }
 
+interface CameraRefreshReport {
+  enabled: boolean
+  ran: boolean
+  reason: string | null
+  errors: string[]
+  captures_staged?: number
+  sources: Array<{
+    prefix: string
+    external_ref: string
+    status: string
+    message: string | null
+    error_step?: string
+    error_type?: string
+  }>
+}
+
 interface PredictionResult {
   available: boolean
   message: string
+  model_warning?: string
   species: string
   variety: string | null
   observation_date: string | null
@@ -64,6 +82,7 @@ interface PredictionResult {
   limitations?: string | null
   pending_review_count?: number
   status_note?: string | null
+  camera_refresh?: CameraRefreshReport
   cohort_snapshot: CohortSnapshot
   readiness_event_counts: ReadinessCounts
 }
@@ -74,10 +93,64 @@ function formatValue(value: number | string | null | undefined): string {
 }
 
 /**
- * A countdown is only shown while the plant is still growing. Once readiness
- * has arrived (or already passed) the honest, non-alarming label is
- * "Plantable now" rather than a zero or negative number of days.
+ * Shows what happened when the app checked Cloudinary for new camera images.
+ *
+ * A camera/network failure is reported separately from "prediction
+ * unavailable": the refresh is fail-open, so stored readings are still used.
+ * Only the first failure is shown, because repeating the same message for
+ * every source reads like several unrelated errors.
  */
+function CameraRefreshNotice({ report }: { report: CameraRefreshReport }) {
+  if (!report.enabled) {
+    return (
+      <p className="muted small" style={{ margin: '12px 0 0' }}>
+        Camera check is off{report.reason ? `: ${report.reason}` : '.'}
+      </p>
+    )
+  }
+
+  const failures = report.sources.filter(
+    source => source.status === 'error' || source.status === 'import_error'
+  )
+
+  if (failures.length > 0) {
+    const first = failures[0]
+    const connectionProblem = /^(OSError|URLError|TimeoutError|ConnectionError|HTTPException)$/.test(
+      first.error_type || ''
+    )
+    return (
+      <div className="alert alert-warning" role="status" style={{ marginTop: 12 }}>
+        <p className="alert-title">Couldn&apos;t check for new camera images</p>
+        <p className="small" style={{ margin: 0 }}>
+          {connectionProblem
+            ? 'The camera service could not be reached.'
+            : 'A new camera reading could not be checked.'}
+        </p>
+        <p className="muted small" style={{ margin: '4px 0 0' }}>
+          {first.error_step === 'import_measurements'
+            ? 'The image was measured, but the reading could not be saved.'
+            : 'The prediction used readings that were already saved. This is usually temporary; retry in a moment.'}
+        </p>
+        <details className="muted small" style={{ marginTop: 6 }}>
+          <summary>Technical detail</summary>
+          <p style={{ margin: '4px 0 0' }}>
+            {[first.error_type, first.message].filter(Boolean).join(': ') || first.status}
+          </p>
+        </details>
+      </div>
+    )
+  }
+
+  const staged = report.captures_staged ?? 0
+  return (
+    <p className="muted small" style={{ margin: '12px 0 0' }}>
+      {staged > 0
+        ? `${staged} new camera reading(s) were found and are waiting for verification.`
+        : 'No new camera images were found.'}
+    </p>
+  )
+}
+
 function isPlantable(result: PredictionResult): boolean {
   if (!result.available) return false
   if (result.past_readiness) return true
@@ -97,6 +170,7 @@ function methodLabel(result: PredictionResult): string {
 }
 
 export default function Home() {
+  const router = useRouter()
   const [speciesList, setSpeciesList] = useState<SpeciesOption[]>([])
   const [selectedSpecies, setSelectedSpecies] = useState('')
   const [selectedVariety, setSelectedVariety] = useState('All varieties')
@@ -105,14 +179,7 @@ export default function Home() {
   const [loadingPrediction, setLoadingPrediction] = useState(false)
   const [result, setResult] = useState<PredictionResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [showReviewModal, setShowReviewModal] = useState(false)
   const [showResultModal, setShowResultModal] = useState(false)
-  const [modalStep, setModalStep] = useState<'loading' | 'review' | 'result'>('loading')
-  const [pendingGroups, setPendingGroups] = useState<any[]>([])
-  const [pendingCount, setPendingCount] = useState(0)
-  const [reviewSelected, setReviewSelected] = useState<Set<number>>(new Set())
-  const [reviewBusy, setReviewBusy] = useState(false)
-  const [reviewMessage, setReviewMessage] = useState<string | null>(null)
 
   const fetchSpecies = async () => {
     setLoadingSpecies(true)
@@ -151,114 +218,53 @@ export default function Home() {
     setLoadingPrediction(true)
     setError(null)
     setResult(null)
-    setShowReviewModal(true)
-    setModalStep('loading')
-    setPendingGroups([])
-    setReviewSelected(new Set())
-    setReviewMessage(null)
+    setShowResultModal(false)
     try {
-      const resp = await axios.post('/api/predict/species', {
+      // Refresh and stage camera readings first. The prediction endpoint is
+      // intentionally called only after the user has accepted/discarded every
+      // pending reading for this species.
+      const refreshResp = await axios.post('/api/camera/refresh', {
         species: selectedSpecies,
-        variety: selectedVariety,
-        observation_date: selectedDate || null,
       })
-      setResult(resp.data)
-      // Fetch staged readings for review.
-      try {
-        const capResp = await axios.get('/api/captures', {
-          params: { status: 'pending', species: selectedSpecies },
-        })
-        const groups = capResp.data.groups || []
-        setPendingGroups(groups)
-        setPendingCount(capResp.data.pending_count || 0)
-        const hasPending = groups.some((g: any) =>
-          (g.captures || []).some((c: any) => c.review_status === 'pending')
-        )
-        if (hasPending) {
-          setModalStep('review')
-        } else {
-          setShowReviewModal(false)
-          setShowResultModal(true)
-          setModalStep('result')
-        }
-      } catch {
-        setModalStep('result')
-      }
-    } catch (e: any) {
-      const msg = e?.response?.data?.error || 'Prediction request failed.'
-      setError(msg)
-      setShowReviewModal(false)
-      setShowResultModal(true)
-      setModalStep('result')
-    } finally {
-      setLoadingPrediction(false)
-    }
-  }
-
-  const toggleReview = (id: number) => {
-    setReviewSelected(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) next.delete(id)
-      else next.add(id)
-      return next
-    })
-  }
-
-  const reviewAction = async (action: 'accept' | 'discard') => {
-    let ids = Array.from(reviewSelected)
-    if (!ids.length && action === 'accept') {
-      ids = pendingGroups.flatMap((g: any) =>
-        (g.captures || []).filter((c: any) => c.review_status === 'pending').map((c: any) => c.capture_id)
-      )
-    }
-    if (!ids.length) return
-    setReviewBusy(true)
-    setReviewMessage(null)
-    try {
-      await axios.post('/api/captures/review', {
-        ids,
-        action,
-      })
-      setReviewMessage(
-        `${ids.length} reading(s) ${action === 'accept' ? 'accepted' : 'discarded'}.`
-      )
-      // Refresh pending list.
+      const refreshReport: CameraRefreshReport = refreshResp.data
       const capResp = await axios.get('/api/captures', {
         params: { status: 'pending', species: selectedSpecies },
       })
       const groups = capResp.data.groups || []
-      setPendingGroups(groups)
-      setPendingCount(capResp.data.pending_count || 0)
-      setReviewSelected(new Set())
-      const hasPending = groups.some((g: any) =>
-        (g.captures || []).some((c: any) => c.review_status === 'pending')
+      const hasPending = groups.some((group: any) =>
+        (group.captures || []).some((capture: any) => capture.review_status === 'pending')
       )
-      if (!hasPending) {
-        setModalStep('loading')
-        try {
-          const resp = await axios.post('/api/predict/species', {
+      if (hasPending) {
+        const workflowId = String(Date.now())
+        window.sessionStorage.setItem(`plant-review:${workflowId}`, '0')
+        await router.push({
+          pathname: '/verify-readings',
+          query: {
             species: selectedSpecies,
             variety: selectedVariety,
-            observation_date: selectedDate || null,
-          })
-          setResult(resp.data)
-        } catch (e: any) {
-          setError(e?.response?.data?.error || 'Prediction request failed.')
-        }
-        setShowReviewModal(false)
-        setShowResultModal(true)
-        setModalStep('result')
+            date: selectedDate,
+            workflow: workflowId,
+          },
+        })
+        return
       }
-    } catch (e: any) {
-      setReviewMessage(e?.response?.data?.error || 'Review failed.')
-    } finally {
-      setReviewBusy(false)
-    }
-  }
 
-  const closeModal = () => {
-    setShowReviewModal(false)
-    setModalStep('loading')
+      const resp = await axios.post('/api/predict/species', {
+        species: selectedSpecies,
+        variety: selectedVariety,
+        observation_date: selectedDate || null,
+        refresh_camera: false,
+      })
+      setResult({ ...resp.data, camera_refresh: refreshReport })
+      setShowResultModal(true)
+    } catch (e: any) {
+      const msg = e?.response?.data?.error || 'Could not refresh camera readings.'
+      setError(msg)
+      setResult(null)
+      setShowResultModal(true)
+    } finally {
+      setLoadingPrediction(false)
+    }
   }
 
   const useLatestDate = () => {
@@ -283,6 +289,12 @@ export default function Home() {
 
         {loadingSpecies ? (
           <p className="muted">Loading species…</p>
+        ) : error && speciesList.length === 0 ? (
+          <div className="alert alert-danger" role="alert">
+            <p className="alert-title">Could not load the species catalog</p>
+            <p>{error}</p>
+            <p>Check that the Flask backend is running, then reload this page.</p>
+          </div>
         ) : speciesList.length === 0 ? (
           <div className="alert alert-warning">
             No species data has been imported yet.
@@ -384,67 +396,10 @@ export default function Home() {
         )}
       </section>
 
-      {error && (
+      {error && speciesList.length > 0 && (
         <div className="alert alert-danger">
           <p className="alert-title">Error</p>
           <p>{error}</p>
-        </div>
-      )}
-
-      {showReviewModal && (
-        <div
-          className="modal-overlay"
-          style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.45)', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 1000, padding: 16 }}
-          onClick={closeModal}
-        >
-          <div className="card" style={{ maxWidth: 720, width: '100%', maxHeight: '85vh', overflow: 'auto' }} onClick={e => e.stopPropagation()}>
-            <div className="row-between" style={{ marginBottom: 12 }}>
-              <h2 className="card-title" style={{ margin: 0 }}>Verify readings</h2>
-              <button className="btn btn-secondary btn-sm" onClick={closeModal}>Close</button>
-            </div>
-
-            {modalStep === 'loading' && <p className="muted">Working…</p>}
-
-            {modalStep === 'review' && (
-              <>
-                <div className="alert alert-warning">
-                  <p className="alert-title">Review pending readings</p>
-                  <p>{pendingCount} new OpenCV reading(s) are staged and were not used. Accept or discard them; prediction will re-run.</p>
-                </div>
-                {reviewMessage && <p className="small">{reviewMessage}</p>}
-                {pendingGroups.map((g: any) => (
-                  <div key={`${g.plant_id}-${g.observation_date}`} className="card" style={{ marginBottom: 12, padding: 12 }}>
-                    <p className="small" style={{ margin: 0, fontWeight: 600 }}>
-                      {g.external_ref || `Plant ${g.plant_id}`} · {g.species} · {g.observation_date}
-                    </p>
-                    <div className="grid" style={{ marginTop: 8 }}>
-                      {(g.captures || []).map((c: any) => (
-                        c.review_status === 'pending' && (
-                          <div key={c.capture_id} className="card" style={{ padding: 8 }}>
-                            {c.image_url && (
-                              <img src={c.image_url} alt={c.public_id} style={{ width: '100%', height: 120, objectFit: 'cover', borderRadius: 6 }} />
-                            )}
-                            <p className="small" style={{ margin: '4px 0 0' }}>
-                              H {c.height_cm ?? '—'} cm · Stem {c.stem_width_cm ?? '—'} cm · Leaves {c.visible_true_leaf_count ?? '—'}
-                            </p>
-                            <label className="checkbox-row" style={{ marginTop: 4 }}>
-                              <input type="checkbox" checked={reviewSelected.has(c.capture_id)} onChange={() => toggleReview(c.capture_id)} />
-                              Select
-                            </label>
-                          </div>
-                        )
-                      ))}
-                    </div>
-                  </div>
-                ))}
-                <div className="btn-row" style={{ marginTop: 8 }}>
-                  <button className="btn" disabled={reviewBusy} onClick={() => reviewAction('accept')}>Verify &amp; predict</button>
-                  <button className="btn btn-secondary" disabled={reviewBusy || !reviewSelected.size} onClick={() => reviewAction('discard')}>Discard selected</button>
-                </div>
-              </>
-            )}
-
-          </div>
         </div>
       )}
 
@@ -456,13 +411,19 @@ export default function Home() {
               <button className="btn btn-secondary btn-sm" onClick={() => setShowResultModal(false)}>Close</button>
             </div>
 
+            {!result && error && (
+              <div className="alert alert-danger" role="alert">{error}</div>
+            )}
             {result && (
               <>
                 <div className={'answer ' + (result.available ? 'answer-ok' : 'answer-muted')}>
                   {result.available && result.days_remaining !== undefined ? (
                     <>
                       <div className="stat-label">{isPlantable(result) ? 'Transplant readiness' : 'Estimated days remaining'}</div>
-                      <div className="hero-metric">{isPlantable(result) ? 'Plantable now' : `${result.days_remaining} days`}</div>
+                      <div className="hero-metric">{isPlantable(result) ? 'Plantable now' : `${Math.ceil(result.days_remaining)} days`}</div>
+                      {!isPlantable(result) && (
+                        <div className="answer-precision">Exact estimate: {result.days_remaining} days</div>
+                      )}
                       {result.predicted_readiness_date && (
                         <p className="answer-date">Readiness date: <strong>{result.predicted_readiness_date}</strong></p>
                       )}
@@ -476,26 +437,51 @@ export default function Home() {
                   {result.provisional && (
                     <p className="small" style={{ margin: '10px 0 0' }}>Provisional estimate from the reference baseline.</p>
                   )}
+                  {result.model_warning && (
+                    <p className="small muted" role="status" style={{ margin: '6px 0 0' }}>
+                      {result.model_warning}
+                    </p>
+                  )}
                 </div>
 
                 {result.available && !result.provisional && result.mae_days != null && (
-                  <div className="card" style={{ marginTop: 12, padding: 14 }}>
-                    <p className="small" style={{ margin: 0, fontWeight: 600 }}>Model score (validation)</p>
-                    <p className="small" style={{ margin: '4px 0 0' }}>
-                      MAE {formatValue(result.mae_days)} days
-                      {result.mae_days_std != null ? ` \\u00b1 ${formatValue(result.mae_days_std)}` : ''}{' '}
-                      \\u00b7 baseline {formatValue(result.baseline_mae_days)} days (lower is better)
-                    </p>
-                    <p className="muted small" style={{ margin: '2px 0 0' }}>
-                      {result.model_name ?? 'validated model'} \\u00b7{' '}
-                      {formatValue(result.n_independent_plants)} independent plants \\u00b7{' '}
-                      {formatValue(result.n_labelled_readiness_events)} readiness events
+                  <div className="card model-validation" aria-label="Model validation results">
+                    <div className="model-validation-heading">
+                      <div>
+                        <p className="verification-eyebrow">How this estimate performed</p>
+                        <h3>Validation summary</h3>
+                      </div>
+                      <span className="badge badge-success">Validated</span>
+                    </div>
+                    <div className="model-validation-stats">
+                      <div className="model-validation-stat model-validation-primary">
+                        <span>Average prediction error</span>
+                        <strong>{formatValue(result.mae_days)} days</strong>
+                        {result.mae_days_std != null && <small>Variation across tests: ±{formatValue(result.mae_days_std)} days</small>}
+                      </div>
+                      <div className="model-validation-stat">
+                        <span>Simple baseline error</span>
+                        <strong>{formatValue(result.baseline_mae_days)} days</strong>
+                        <small>Lower error is better</small>
+                      </div>
+                    </div>
+                    <p className="model-validation-evidence">
+                      <strong>{String(result.model_name ?? 'Validated model').replaceAll('_', ' ')}</strong>
+                      <span>{formatValue(result.n_independent_plants)} plants</span>
+                      <span>{formatValue(result.n_labelled_readiness_events)} readiness records</span>
                     </p>
                     {result.model_candidates && Object.keys(result.model_candidates).length > 0 && (
-                      <p className="muted small" style={{ margin: '2px 0 0' }}>
-                        Candidates:{' '}
-                        {Object.entries(result.model_candidates).map(([k, v]) => `${k} ${formatValue(v)} d`).join(' \\u00b7 ')}
-                      </p>
+                      <div className="model-candidate-list">
+                        <span className="model-candidate-title">Compared models</span>
+                        <div>
+                          {Object.entries(result.model_candidates).map(([name, value]) => (
+                            <span className="model-candidate" key={name}>
+                              <span>{name.replaceAll('_', ' ')}</span>
+                              <strong>{formatValue(value)} d</strong>
+                            </span>
+                          ))}
+                        </div>
+                      </div>
                     )}
                   </div>
                 )}
@@ -508,20 +494,27 @@ export default function Home() {
                       <p className="small" style={{ margin: 0 }}>Growth rate:{' '}
                         {cohort.median_growth_rate_cm_per_day != null
                           ? `${formatValue(cohort.median_growth_rate_cm_per_day)} cm/day`
-                          : 'needs \\u22652 measurements'}
+                          : 'not available; needs measurements on 2 different dates for the same plant'}
                       </p>
-                      <p className="small" style={{ margin: 0 }}>Stem width: {formatValue(cohort.median_stem_width_cm)} cm</p>
+                      <p className="small" style={{ margin: 0 }}>Stem width: {cohort.median_stem_width_cm != null && cohort.median_stem_width_cm > 0 ? `${formatValue(cohort.median_stem_width_cm)} cm` : 'not measured'}</p>
                       <p className="small" style={{ margin: 0 }}>True leaves: {formatValue(cohort.median_visible_true_leaf_count)}</p>
-                      <p className="small" style={{ margin: 0 }}>Age: {formatValue(cohort.median_age_days)} days</p>
+                      <p className="small" style={{ margin: 0 }}>Age: {cohort.median_age_days == null ? 'not recorded' : `${cohort.median_age_days} days`}</p>
                       <p className="small" style={{ margin: 0 }}>Observation date: {formatValue(cohort.observation_date)}</p>
                     </div>
                   </div>
                 )}
 
                 {!result.available && (
-                  <p className="muted small" style={{ margin: '8px 0 0' }}>
-                    Readings are stored even when prediction is unavailable. Record a transplant in Feedback to create a training label.
-                  </p>
+                  <>
+                    {result.camera_refresh && (
+                      <CameraRefreshNotice report={result.camera_refresh} />
+                    )}
+                    <p className="muted small" style={{ margin: '8px 0 0' }}>
+                      Verified camera readings are saved even when a prediction
+                      is not possible yet. Record a transplant in Feedback to
+                      create a training label.
+                    </p>
+                  </>
                 )}
               </>
             )}

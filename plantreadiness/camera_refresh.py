@@ -28,7 +28,9 @@ from __future__ import annotations
 
 import csv
 import io
+import sys
 import time
+import traceback
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Union
@@ -63,6 +65,23 @@ _last_refresh: dict[str, float] = {}
 def reset_refresh_throttle() -> None:
     """Clear the in-process throttle (used by tests)."""
     _last_refresh.clear()
+
+
+def _log_failure(prefix: str, step: str, error: BaseException) -> None:
+    """Write the full traceback to stderr; the report keeps a short version.
+
+    The UI only receives the step, exception type and message. The traceback
+    stays in the server log so an operator can find the failing frame without
+    leaking filesystem paths or credentials into the browser.
+    """
+    print(
+        f"Camera refresh failed for {prefix} while trying to {step}: "
+        f"{type(error).__name__}: {error}",
+        file=sys.stderr,
+    )
+    traceback.print_exception(
+        type(error), error, error.__traceback__, file=sys.stderr
+    )
 
 
 def refresh_camera_observations(
@@ -218,8 +237,13 @@ def refresh_camera_observations(
             ) or []
         except Exception as exc:  # fail-open: report, do not raise
             entry["status"] = "error"
+            entry["error_step"] = "read_camera"
+            entry["error_type"] = type(exc).__name__
             entry["message"] = str(exc)
-            report["errors"].append(f"{prefix}: {exc}")
+            report["errors"].append(
+                f"{prefix} (read camera): {type(exc).__name__}: {exc}"
+            )
+            _log_failure(prefix, "read camera", exc)
             report["sources"].append(entry)
             continue
 
@@ -232,8 +256,14 @@ def refresh_camera_observations(
             result = _write_and_import(repo, rows, csv_path)
         except Exception as exc:  # fail-open: report, do not raise
             entry["status"] = "import_error"
+            entry["error_step"] = "import_measurements"
+            entry["error_type"] = type(exc).__name__
             entry["message"] = str(exc)
-            report["errors"].append(f"{prefix}: {exc}")
+            report["errors"].append(
+                f"{prefix} (import measurements): "
+                f"{type(exc).__name__}: {exc}"
+            )
+            _log_failure(prefix, "import measurements", exc)
             report["sources"].append(entry)
             continue
 

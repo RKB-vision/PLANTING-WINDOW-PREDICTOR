@@ -344,8 +344,16 @@ def select_model(species: str,
     species_l = (species or "").strip().lower()
     variety_l = (variety or "").strip().lower() or None
 
-    real_entries = [e for e in list_artifacts(models_dir, "real")
-                    if e.get("active", True)]
+    registered_entries = [entry for entry in list_artifacts(models_dir, "real")
+                          if entry.get("active", True)]
+    real_entries = []
+    missing_entries = []
+    for entry in registered_entries:
+        artifact_file = entry.get("file")
+        if artifact_file and (Path(models_dir) / "real" / artifact_file).is_file():
+            real_entries.append(entry)
+        else:
+            missing_entries.append(entry)
 
     def _validated(entry) -> bool:
         return bool(entry["metadata"].get("validated"))
@@ -393,17 +401,41 @@ def select_model(species: str,
                             "uncertainty and limitations apply.")}
 
     # ---- Level 3: insufficient evidence -----------------------------------
-    return {"level": 3, "data_source": None, "entry": None, "artifact": None,
-            "message": config.UNAVAILABLE_MESSAGE}
+    missing_for_species = [entry for entry in missing_entries
+                           if _species_covered(entry, species_l)]
+    result = {"level": 3, "data_source": None, "entry": None,
+              "artifact": None, "message": config.UNAVAILABLE_MESSAGE}
+    if missing_for_species:
+        result["model_warning"] = (
+            f"A registered model file for {species} is missing; using the "
+            "reference baseline if available."
+        )
+    return result
 
 
 def load_selection(selection: dict, models_dir: Path) -> dict:
-    """Load the model for a selection result (no-op for level 4)."""
+    """Load the selected model, degrading safely if its artifact is unusable."""
     if selection["level"] == 3 or selection["entry"] is None:
         selection["artifact"] = None
         return selection
-    selection["artifact"] = load_artifact(
-        selection["entry"], models_dir, selection["data_source"])
+    try:
+        selection["artifact"] = load_artifact(
+            selection["entry"], models_dir, selection["data_source"])
+    except Exception as exc:
+        # A registry can outlive a manually deleted/corrupted model file.
+        # Treat that as no usable model so callers can use their explicit
+        # provisional-baseline fallback instead of returning a server error.
+        selection.update({
+            "level": 3,
+            "data_source": None,
+            "entry": None,
+            "artifact": None,
+            "message": config.UNAVAILABLE_MESSAGE,
+            "model_warning": (
+                "The registered real model could not be loaded "
+                f"({type(exc).__name__}); using the reference baseline if available."
+            ),
+        })
     return selection
 
 
@@ -431,6 +463,8 @@ def predict_days_remaining(selection: dict, observation: dict) -> dict:
             "available": False,
             "message": selection.get("message") or config.UNAVAILABLE_MESSAGE,
             "predicted_readiness_date": None,
+            **({"model_warning": selection["model_warning"]}
+               if selection.get("model_warning") else {}),
         }
 
     meta = selection["artifact"]["metadata"]

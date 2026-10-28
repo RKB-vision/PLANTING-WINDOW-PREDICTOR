@@ -11,6 +11,7 @@ network access and no OpenCV work. They verify the operational contract:
 """
 
 import os
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -129,6 +130,31 @@ class TestRegistration(CameraRefreshBase):
         # No prior measurement -> growth rate must not be invented.
         self.assertIsNone(obs[0]["growth_rate_cm_per_day"])
 
+    def test_growth_rate_uses_two_accepted_camera_dates(self):
+        plant_id = self._register()
+        rows = [_row(day="2026-10-15", height="8.0")]
+        kwargs = dict(
+            sources=[("Plant01_", "Plant-01")],
+            puller=lambda source, captures: rows,
+            min_interval=0,
+        )
+
+        svc.refresh_camera_observations(self.repo, **kwargs)
+        pending = svc.list_pending_captures(self.repo, species="Super Orange")
+        first_id = pending[0]["captures"][0]["capture_id"]
+        svc.review_captures(self.repo, capture_ids=[first_id], action="accept")
+
+        rows[:] = [_row(day="2026-10-16", height="10.0")]
+        svc.refresh_camera_observations(self.repo, **kwargs)
+        pending = svc.list_pending_captures(self.repo, species="Super Orange")
+        second_id = pending[0]["captures"][0]["capture_id"]
+        svc.review_captures(self.repo, capture_ids=[second_id], action="accept")
+
+        observations = self.repo.get_observations(plant_id)
+        self.assertEqual(len(observations), 2)
+        self.assertIsNone(observations[0]["growth_rate_cm_per_day"])
+        self.assertEqual(observations[1]["growth_rate_cm_per_day"], 2.0)
+
     def test_species_filter_skips_other_species(self):
         self._register(species="Super Orange")
         report = svc.refresh_camera_observations(
@@ -139,6 +165,49 @@ class TestRegistration(CameraRefreshBase):
         )
         self.assertEqual(report["sources"][0]["status"], "other_species")
         self.assertEqual(report["observations_inserted"], 0)
+
+    def test_zero_stem_width_is_imported_as_missing(self):
+        self._register()
+        row = _row()
+        captures = json.loads(row["captures_json"])
+        captures[0]["width_cm"] = 0.0
+        row["captures_json"] = json.dumps(captures)
+        row["average_width_cm"] = "0"
+
+        report = svc.refresh_camera_observations(
+            self.repo,
+            sources=[("Plant01_", "Plant-01")],
+            puller=lambda source, captures: [row],
+        )
+
+        self.assertEqual(report["sources"][0]["status"], "imported")
+        pending = svc.list_pending_captures(self.repo)
+        self.assertIsNone(pending[0]["captures"][0]["stem_width_cm"])
+
+    def test_growth_rate_uses_two_accepted_camera_dates(self):
+        plant_id = self._register()
+        rows = [_row(day="2026-10-15", height="8.0")]
+        kwargs = dict(
+            sources=[("Plant01_", "Plant-01")],
+            puller=lambda source, captures: rows,
+            min_interval=0,
+        )
+
+        svc.refresh_camera_observations(self.repo, **kwargs)
+        pending = svc.list_pending_captures(self.repo, species="Super Orange")
+        first_id = pending[0]["captures"][0]["capture_id"]
+        svc.review_captures(self.repo, capture_ids=[first_id], action="accept")
+
+        rows[:] = [_row(day="2026-10-16", height="10.0")]
+        svc.refresh_camera_observations(self.repo, **kwargs)
+        pending = svc.list_pending_captures(self.repo, species="Super Orange")
+        second_id = pending[0]["captures"][0]["capture_id"]
+        svc.review_captures(self.repo, capture_ids=[second_id], action="accept")
+
+        observations = self.repo.get_observations(plant_id)
+        self.assertEqual(len(observations), 2)
+        self.assertIsNone(observations[0]["growth_rate_cm_per_day"])
+        self.assertEqual(observations[1]["growth_rate_cm_per_day"], 2.0)
 
 
 class TestIdempotency(CameraRefreshBase):
@@ -183,6 +252,27 @@ class TestFailOpen(CameraRefreshBase):
         self.assertEqual(report["sources"][0]["status"], "error")
         self.assertTrue(report["errors"])
         self.assertIn("Cloudinary unreachable", report["errors"][0])
+
+    def test_puller_oserror_names_the_step_and_exception_type(self):
+        self._register()
+
+        def boom(source, captures):
+            raise OSError(5, "Input/output error")
+
+        report = svc.refresh_camera_observations(
+            self.repo,
+            sources=[("Plant01_", "Plant-01")],
+            puller=boom,
+        )
+
+        entry = report["sources"][0]
+        self.assertEqual(entry["status"], "error")
+        self.assertEqual(entry["error_step"], "read_camera")
+        self.assertEqual(entry["error_type"], "OSError")
+        self.assertIn("Input/output error", entry["message"])
+        # One actionable line, not the same message twice.
+        self.assertEqual(len(report["errors"]), 1)
+        self.assertIn("OSError", report["errors"][0])
 
     def test_import_error_is_reported_not_raised(self):
         self._register()

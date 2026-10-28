@@ -7,13 +7,12 @@ feedback loop.
 
 > **Honesty rules built into this code**
 >
-> - The real Super Orange CSV has **no verified readiness dates**, so no
->   readiness countdown model is trained from it. The real-data path shows
->   growth trends and prints
->   `Readiness prediction unavailable: verified readiness-event data is not yet sufficient.`
-> - Synthetic data and synthetic-trained models always carry a persistent
->   **`SYNTHETIC DEMO`** indicator. Synthetic models are never used for a
->   real plant unless you explicitly pass `--allow-synthetic`.
+> - The historical Super Orange growth CSV has **no verified readiness dates**
+>   and is not used as supervised countdown training data. Real models are
+>   trained from recorded transplant/readiness events, such as the Marigold
+>   feedback labels stored in the database.
+> - Production predictions select validated real-data models only. The
+>   synthetic demo workflow is separate from the production API and UI.
 > - The old workflow (Grok API criteria -> hardcoded rule labels ->
 >   classifier "accuracy" against its own rules) has been removed.
 
@@ -21,8 +20,8 @@ feedback loop.
 
 | File | Purpose |
 |---|---|
-| `model_train.py` | Training entry point. Two explicit modes: `--mode demo` (synthetic) and `--mode real` (CSV import + quality/growth analysis + honest refusal). `--retrain` adds a synthetic cohort and compares old vs new models. |
-| `prediction.py` | Prediction entry point: species-aware fallback (Level 1..4), `--allow-synthetic`, `--json`. |
+| `model_train.py` | Training entry point for real species data; `--retrain` evaluates and conditionally promotes a new real candidate. `--mode demo` remains isolated for development. |
+| `prediction.py` | Real-data prediction entry point: species-aware model selection and `--json`. |
 | `plant_feedback.py` | CLI workflow: register, observe, predict, transplant, due reminders, submit feedback, history, species-status, list. |
 | `demo_workflow.py` | Scripted end-to-end SYNTHETIC demonstration (steps 0-6, including retrain comparison). |
 | `plantreadiness/db.py` | SQLite schema + validation + duplicate protection + date/growth arithmetic. |
@@ -148,13 +147,32 @@ simulated plants into the real database or churn the committed `models/`
 artefacts. Real mode uses `plant_readiness.db` and `models/`. Pass `--db` /
 `--models-dir` to override either.
 
-### Mode B - real data (Super Orange CSV)
+### Mode B - real data (species scoped)
 
 ```bash
-# imports the CSV, runs quality checks + growth analysis,
-# then honestly reports that no readiness model can be trained yet
+# Train the configured default species and import its default CSV
 python model_train.py --mode real --csv data/super_orange_growth_data.csv
+
+# Train Marigold from readiness events already stored in plant_readiness.db
+# (does not import the Super Orange CSV into Marigold)
+python model_train.py --mode real --species "Marigold (Apsara Yellow)"
+
+# Refit the deployed Marigold model from all accumulated real readiness labels
+# and promote only if the grouped-CV checks support the update
+python model_train.py --mode real --species "Marigold (Apsara Yellow)" --retrain
 ```
+
+Only an **actual transplant** recorded in Feedback creates a readiness-date
+training label. A readiness assessment and the later 14-day follow-up are
+stored separately. Training remains manual; the command requires enough
+independent labelled plants and uses grouped validation. `--retrain` fits a
+fresh candidate from all accumulated labels and compares the old model type
+and candidate on the same plant-grouped CV folds. A same-type refresh is
+promoted only with additional evidence, a validated candidate, and no increase
+in CV error. A different model type must strictly lower CV error. Older model
+files remain available in the registry; the previous species-scoped artifact
+is retired only after promotion. Predictions use a real model only when its
+validation metadata marks it as validated.
 
 ### 14-day feedback workflow
 
@@ -166,10 +184,8 @@ python plant_feedback.py list
 python plant_feedback.py observe --plant 1 --date 2083-05-20 \
     --age-days 26 --height 5.5 --growth-rate 0.3
 
-# prediction (level 4 message until real readiness labels exist;
-# add --allow-synthetic to explicitly see the labelled demo model)
+# real-data prediction (reports insufficient evidence when no validated model exists)
 python plant_feedback.py predict --plant 1
-python plant_feedback.py predict --plant 1 --allow-synthetic
 
 # transplant -> feedback becomes due 14 days later
 python plant_feedback.py transplant --plant 1 --date 2083-05-25 --height 6.4
@@ -190,7 +206,6 @@ python plant_feedback.py species-status --species "Super Orange"
 
 ```bash
 python prediction.py --plant 1                      # refuses honestly today
-python prediction.py --plant 1 --allow-synthetic    # labelled demo model
 python prediction.py --species "Super Orange" --variety Early \
     --age-days 20 --height-cm 4.2 --growth-rate 0.3 --json
 ```
@@ -199,9 +214,7 @@ python prediction.py --species "Super Orange" --variety Early \
 
 1. **Validated species/variety model** (real labelled data),
 2. **Broader real model** for the species (uncertainty + limitations shown),
-3. **SYNTHETIC DEMO model** - only with explicit `--allow-synthetic`, always
-   labelled, with a warning if applied to a real plant,
-4. Otherwise: `Readiness prediction unavailable: verified readiness-event
+3. Otherwise: `Readiness prediction unavailable: verified readiness-event
    data is not yet sufficient.` (the system is collecting data).
 
 A model is only eligible if it is marked `validated`: minimum
@@ -358,8 +371,13 @@ worse-model safeguard) and the Flask feedback/reference API are covered by
 ## Retraining policy
 
 Feedback is **saved and validated first**; it is not automatically turned
-into readiness labels. Retraining only happens when minimum data
-requirements are met, the candidate is trained **excluding** the holdout
-plants, and the candidate must score a strictly lower holdout MAE than the
-deployed model on the **same held-out plants** - otherwise the current model
-is kept.
+into readiness labels. Retraining only happens when minimum data requirements
+are met and the candidate passes grouped validation. Real retraining compares
+the current model type and candidate with the same grouped-CV folds; see Mode B
+above for the promotion rules. Synthetic demo retraining retains its isolated
+holdout workflow.
+
+The real training command accepts `--species` to select which species' stored
+readiness events are evaluated. Real retraining is opt-in with `--retrain` and
+uses only real readiness-event data. Synthetic demo tools remain isolated from
+the real database and are not part of the production prediction interface.

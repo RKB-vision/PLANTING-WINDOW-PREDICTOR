@@ -527,7 +527,11 @@ def predict_species_cohort(repo: BaseRepository, species: str,
     ages = [r.get("age_days") for r in rows]
     rates = [r.get("growth_rate_cm_per_day") for r in rows]
     canopy = [r.get("canopy_width_cm") for r in rows]
-    stem = [r.get("stem_width_cm") for r in rows]
+    stem = [
+        r.get("stem_width_cm") for r in rows
+        if r.get("stem_width_cm") is not None
+        and float(r["stem_width_cm"]) > 0
+    ]
     leaves = [r.get("visible_true_leaf_count") for r in rows]
 
     cohort_snapshot = {
@@ -609,7 +613,11 @@ def list_pending_captures(repo: BaseRepository, *, species=None, variety=None,
                  if c.get("validity") == "valid"
                  and c.get("review_status") == "pending"]
         heights = [c.get("height_cm") for c in valid]
-        stems = [c.get("stem_width_cm") for c in valid]
+        stems = [
+            c.get("stem_width_cm") for c in valid
+            if c.get("stem_width_cm") is not None
+            and float(c["stem_width_cm"]) > 0
+        ]
         leaves = [c.get("visible_true_leaf_count") for c in valid]
         g["proposed"] = {
             "median_height_cm": _rounded(heights) if False else _median_num(heights),

@@ -18,6 +18,7 @@ import json
 from pathlib import Path
 
 from . import calibration
+from . import camera_import
 from . import config
 from . import db as dbm
 from .repository import SQLiteRepository
@@ -141,6 +142,7 @@ def main(argv=None) -> int:
                     confidence=cap.get("confidence"),
                     problem="raw_image_unavailable",
                     data_source=cap.get("data_source", "real"),
+                    review_status=cap.get("review_status", "pending"),
                 )
                 affected[(cap["plant_id"], cap["observation_date"])] = cap.get("data_source", "real")
                 continue
@@ -172,42 +174,22 @@ def main(argv=None) -> int:
                 confidence=result.confidence,
                 problem=None,
                 data_source=cap.get("data_source", "real"),
+                review_status=cap.get("review_status", "pending"),
             )
             affected[(cap["plant_id"], cap["observation_date"])] = cap.get("data_source", "real")
             print(f"  revised {public_id}: {outcome.get('action', outcome)}")
 
-        # Recompute daily observations from stored captures.
+        # Rebuild only from accepted captures. This preserves the review gate
+        # and recalculates growth from the previous dated observation.
         for (plant_id, obs_date), data_source in affected.items():
-            stored_valid = [c for c in repo.captures_on_date(plant_id, obs_date)
-                            if c.get("validity") == "valid"]
-            if not stored_valid:
-                continue
-            height = None
-            import statistics
-            hs = [c.get("height_cm") for c in stored_valid
-                  if c.get("height_cm") is not None]
-            if hs:
-                height = float(statistics.median(hs))
-            if height is None:
-                continue
-            sw = [c.get("stem_width_cm") for c in stored_valid
-                  if c.get("stem_width_cm") is not None]
-            lvs = [c.get("visible_true_leaf_count") for c in stored_valid
-                   if c.get("visible_true_leaf_count") is not None]
-            stem_width = float(statistics.median(sw)) if sw else None
-            leaves = (int(round(statistics.median(lvs))) if lvs else None)
-            repo.upsert_daily_observation(
-                plant_id=plant_id,
-                observation_date=obs_date,
-                height_cm=height,
-                stem_width_cm=stem_width,
-                visible_true_leaf_count=leaves,
-                rod_length_cm=rod,
-                calibration_source=config.CALIBRATION_SOURCE_CAMERA,
-                calibration_verified=verified,
+            rebuilt = camera_import.rebuild_daily_observation_from_captures(
+                repo,
+                plant_id,
+                obs_date,
                 data_source=data_source,
                 reason="reprocess_captures",
             )
+            print(f"  daily {plant_id} {obs_date}: {rebuilt.get('action')}")
         print("Done.")
         return 0
     finally:

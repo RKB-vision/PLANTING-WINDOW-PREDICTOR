@@ -51,6 +51,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import http.client
 import json
 import os
 import re
@@ -197,7 +198,7 @@ class PlantMeasurement:
 class CaptureResult:
     timestamp: str
     height_cm: float
-    width_cm: float
+    width_cm: float | None
     leaf_count: int
     cm_per_pixel: float
     confidence: float
@@ -326,6 +327,12 @@ def capture_record_from_result(result: CaptureResult) -> CaptureRecord:
     """Turn a measurement into an auditable capture record."""
 
     valid, problem = validate_capture(result)
+    width = result.width_cm
+    # The OpenCV axis detector uses zero pixels when it cannot find the stem
+    # cross-section. A zero-width stem is not a real measurement; preserve it
+    # as missing so it cannot appear as a confident 0 cm reading.
+    if width is not None and (not np.isfinite(width) or width <= 0):
+        width = None
 
     return CaptureRecord(
         public_id=result.public_id,
@@ -334,7 +341,7 @@ def capture_record_from_result(result: CaptureResult) -> CaptureRecord:
         validity="valid" if valid else "failed",
         problem=problem,
         height_cm=result.height_cm,
-        width_cm=result.width_cm,
+        width_cm=width,
         leaf_count=result.leaf_count,
         cm_per_pixel=result.cm_per_pixel,
         confidence=result.confidence,
@@ -502,36 +509,54 @@ def get_cloudinary_images(
         },
     )
 
-    try:
-        with urllib.request.urlopen(
-            request,
-            timeout=30,
-        ) as response:
+    # Cloudinary occasionally drops the first connection (surfacing as a bare
+    # ``[Errno 5] Input/output error`` on macOS). One short retry keeps a
+    # transient socket failure from hiding new readings; a second failure is
+    # reported with context.
+    data: dict[str, Any] | None = None
+    last_error: BaseException | None = None
 
-            data = json.loads(
-                response.read().decode("utf-8")
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(
+                request,
+                timeout=30,
+            ) as response:
+
+                data = json.loads(
+                    response.read().decode("utf-8")
+                )
+            break
+
+        except urllib.error.HTTPError as error:
+
+            body = error.read().decode(
+                "utf-8",
+                errors="replace",
             )
 
-    except urllib.error.HTTPError as error:
+            raise RuntimeError(
+                f"Cloudinary API error "
+                f"{error.code}: {body}"
+            ) from error
 
-        body = error.read().decode(
-            "utf-8",
-            errors="replace",
-        )
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.HTTPException,
+        ) as error:
 
+            last_error = error
+            if attempt == 0:
+                time.sleep(0.5)
+                continue
+
+    if data is None:
         raise RuntimeError(
-            f"Cloudinary API error "
-            f"{error.code}: {body}"
-        ) from error
-
-    except (
-        urllib.error.URLError,
-        TimeoutError,
-    ) as error:
-
-        raise RuntimeError(
-            f"Could not contact Cloudinary: {error}"
-        ) from error
+            f"Could not contact Cloudinary after 2 attempts: "
+            f"{type(last_error).__name__}: {last_error}"
+        ) from last_error
 
     resources = data.get(
         "resources",
@@ -549,29 +574,47 @@ def get_processed_ids() -> set[str]:
 
     processed: set[str] = set()
 
-    with PROCESSED_IDS_FILE.open(
-        "r",
-        encoding="utf-8",
-    ) as file:
+    try:
+        with PROCESSED_IDS_FILE.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
 
-        for line in file:
-            value = line.strip()
+            for line in file:
+                value = line.strip()
 
-            if value:
-                processed.add(value)
+                if value:
+                    processed.add(value)
+    except OSError as error:
+        raise RuntimeError(
+            f"Could not read the processed-capture ledger "
+            f"({PROCESSED_IDS_FILE}): {type(error).__name__}: {error}"
+        ) from error
 
     return processed
 
 
 def mark_processed(public_id: str) -> None:
-    """Remember that a Cloudinary image has been processed."""
+    """Remember that a Cloudinary image has been processed.
 
-    with PROCESSED_IDS_FILE.open(
-        "a",
-        encoding="utf-8",
-    ) as file:
+    The measurement has already succeeded at this point, so a ledger write
+    failure must not turn a valid reading into a failed capture. It is logged
+    instead; the capture is de-duplicated by ``public_id`` on the next refresh.
+    """
 
-        file.write(public_id + "\n")
+    try:
+        with PROCESSED_IDS_FILE.open(
+            "a",
+            encoding="utf-8",
+        ) as file:
+
+            file.write(public_id + "\n")
+    except OSError as error:
+        print(
+            f"Warning: could not record processed id {public_id}: "
+            f"{type(error).__name__}: {error}",
+            file=sys.stderr,
+        )
 
 
 def find_new_cloudinary_images(
@@ -1377,7 +1420,7 @@ def calculate_measurements(
     plant: PlantMeasurement,
     reference: Rectangle,
     rod_length_cm: float,
-) -> tuple[float, float, float]:
+) -> tuple[float, float, float | None]:
 
     if rod_length_cm <= 0:
         raise ValueError(
@@ -1402,8 +1445,8 @@ def calculate_measurements(
             + 1
         )
         * cm_per_pixel,
-        plant.stem_width_pixels
-        * cm_per_pixel,
+        (plant.stem_width_pixels * cm_per_pixel
+         if plant.stem_width_pixels > 0 else None),
     )
 
 
@@ -1418,7 +1461,7 @@ def draw_results(
     measurements: tuple[
         float,
         float,
-        float,
+        float | None,
     ],
     capture_number: int,
 ) -> np.ndarray:
@@ -1573,28 +1616,24 @@ def draw_results(
         2,
         cv2.LINE_AA,
     )
-    stem_clearance = max(1, int(round(plant.bounds.height * 0.10)))
-    stem_width_y = max(
-        plant.height_top_y, plant.height_base_y - stem_clearance
-    )
-    stem_width_left = plant.height_x - (plant.stem_width_pixels - 1) // 2
-    stem_width_right = stem_width_left + max(0, plant.stem_width_pixels - 1)
-    cv2.line(
-        output,
-        (
-            stem_width_left,
-            stem_width_y,
-        ),
-        (
-            stem_width_right,
-            stem_width_y,
-        ),
-        (255, 0, 255),
-        3,
-    )
+    stem_width_y = max(plant.height_top_y,
+                       plant.height_base_y - max(
+                           1, int(round(plant.bounds.height * 0.10))))
+    if plant.stem_width_pixels > 0:
+        stem_width_left = plant.height_x - (plant.stem_width_pixels - 1) // 2
+        stem_width_right = stem_width_left + plant.stem_width_pixels - 1
+        cv2.line(
+            output,
+            (stem_width_left, stem_width_y),
+            (stem_width_right, stem_width_y),
+            (255, 0, 255),
+            3,
+        )
+    stem_label = ("stem width: not detected" if width_cm is None
+                  else "stem width")
     cv2.putText(
         output,
-        "stem width",
+        stem_label,
         (
             min(
                 image.shape[1] - 110,
@@ -1620,11 +1659,8 @@ def draw_results(
             f"{plant.height_base_y - plant.height_top_y + 1}px "
             f"({height_cm:.2f} cm)"
         ),
-        (
-            f"Stem width: "
-            f"{plant.stem_width_pixels}px "
-            f"({width_cm:.2f} cm)"
-        ),
+        ("Stem width: not detected" if width_cm is None else
+         f"Stem width: {plant.stem_width_pixels}px ({width_cm:.2f} cm)"),
         (
             f"Scale: "
             f"{cm_per_pixel:.5f} cm/pixel"
@@ -1788,11 +1824,11 @@ def process_image(
         f"x={plant.height_x}"
     )
 
-    print(
-        f"  Stem width: "
-        f"{plant.stem_width_pixels} pixels = "
-        f"{width_cm:.2f} cm"
-    )
+    if width_cm is None:
+        print("  Stem width: not detected")
+    else:
+        print(f"  Stem width: {plant.stem_width_pixels} pixels = "
+              f"{width_cm:.2f} cm")
 
     print(
         f"  Reference rod: "

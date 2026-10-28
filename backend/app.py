@@ -209,8 +209,21 @@ def predict_species():
         # Pull any new ESP32-CAM images for this species first, so the
         # prediction reflects the latest cloud measurements. Bounded and
         # fail-open: on any problem the prediction proceeds on stored data.
-        camera_refresh_report = svc.refresh_camera_observations(
-            repo, species=species)
+        if data.get('refresh_camera', True):
+            camera_refresh_report = svc.refresh_camera_observations(
+                repo, species=species)
+        else:
+            camera_refresh_report = {
+                'enabled': True,
+                'ran': False,
+                'reason': 'Camera readings were refreshed before verification.',
+                'sources': [],
+                'rows_written': 0,
+                'observations_inserted': 0,
+                'observations_skipped_duplicate': 0,
+                'captures_staged': 0,
+                'errors': [],
+            }
         result = svc.predict_species_cohort(
             repo,
             species,

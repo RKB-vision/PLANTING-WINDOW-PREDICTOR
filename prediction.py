@@ -9,12 +9,7 @@ species-aware fallback order:
 
   1. validated species/variety model (real labelled data),
   2. broader real model for the species (with uncertainty + limitations),
-  3. SYNTHETIC DEMO prediction - only with --allow-synthetic, always labelled,
-  4. otherwise: "Readiness prediction unavailable: ..."
-
-Synthetic-trained models are NEVER used for a real plant unless the user
-explicitly enables them, and any synthetic output carries a persistent
-SYNTHETIC DEMO indicator.
+  3. otherwise: "Readiness prediction unavailable: ..."
 
 Examples
 --------
@@ -27,9 +22,6 @@ Ad-hoc observation:
     python prediction.py --species "Super Orange" --variety Early \
         --age-days 20 --height-cm 4.2 --growth-rate 0.3
 
-Explicitly enable the synthetic demonstration model:
-
-    python prediction.py --plant 3 --allow-synthetic
 """
 
 from __future__ import annotations
@@ -71,12 +63,6 @@ def predict_ad_hoc(species: str, variety: str | None,
 
 def format_result(result: dict) -> str:
     lines = []
-    synthetic_used = bool(result.get("synthetic"))
-    if synthetic_used:
-        lines.append("=" * 68)
-        lines.append(f" {config.SYNTHETIC_BANNER}")
-        lines.append("=" * 68)
-
     if "plant_id" in result:
         lines.append(f"Plant #{result['plant_id']}: "
                      f"{result.get('species')}"
@@ -105,8 +91,7 @@ def format_result(result: dict) -> str:
 
     lines.append("")
     lines.append(f"Model level        : {result['level']}")
-    lines.append(f"Prediction source  : "
-                 f"{'SYNTHETIC DEMO' if synthetic_used else result.get('data_source')}")
+    lines.append(f"Prediction source  : {result.get('data_source')}")
     lines.append(result.get("message", ""))
     days = result.get("days_remaining")
     if result.get("past_readiness") or (

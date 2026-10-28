@@ -12,6 +12,8 @@ import unittest
 from pathlib import Path
 
 from plantreadiness import db as dbm
+from plantreadiness import config
+from plantreadiness import reference
 from plantreadiness import reset
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -134,6 +136,27 @@ class TestReset(unittest.TestCase):
         report = self._reset()
         self.assertFalse(report["before"]["exists"])
         self.assertEqual(report["after"]["plants"], CSV_PLANTS)
+
+    def test_reset_removes_stale_species_baselines_and_rebuilds_csv_baseline(self):
+        reference_dir = self.models / "reference"
+        reference_dir.mkdir(parents=True)
+        stale_baseline = reference_dir / (
+            "baseline_Marigold(ApsaraYellow)_ANY.json")
+        stale_baseline.write_text('{"species":"Marigold (Apsara Yellow)"}')
+        default_baseline = reference.baseline_path(
+            self.models, config.DEFAULT_SPECIES)
+        default_baseline.write_text('{"species":"stale default"}')
+
+        report = self._reset()
+
+        self.assertFalse(stale_baseline.exists())
+        self.assertTrue(default_baseline.exists())
+        self.assertIn(stale_baseline.name,
+                      report["removed_reference_baselines"])
+        rebuilt = reference.load_baseline(
+            self.models, config.DEFAULT_SPECIES)
+        self.assertEqual(rebuilt["species"], config.DEFAULT_SPECIES)
+        self.assertEqual(rebuilt["n_plants"], CSV_PLANTS)
 
     def test_reset_is_idempotent(self):
         if not CSV_PATH.exists():

@@ -33,6 +33,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import math
 import statistics
 from pathlib import Path
 from typing import Any, Optional, Union
@@ -106,6 +107,14 @@ def _safe_float(value: Any) -> Optional[float]:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _positive_stem_width(value: Any) -> Optional[float]:
+    """Treat zero/non-finite OpenCV widths as not measured, never as 0 cm."""
+    width = _safe_float(value)
+    if width is None or not math.isfinite(width) or width <= 0:
+        return None
+    return width
 
 
 def _safe_int(value: Any) -> Optional[int]:
@@ -346,6 +355,10 @@ def import_camera_measurements(
                     {"line": line_no, "problem": f"Bad stem width: {exc}"}
                 )
                 continue
+            if stem_width is not None and (
+                not math.isfinite(stem_width) or stem_width <= 0
+            ):
+                stem_width = None
 
             # Effective calibration for this row. Recorded, never guessed: a
             # missing value falls back to the configured rod length because the
@@ -448,7 +461,8 @@ def import_camera_measurements(
                         calibration_verified=rod_verified,
                         capture_timestamp=capture.get("capture_timestamp"),
                         height_cm=_safe_float(capture.get("height_cm")),
-                        stem_width_cm=_safe_float(capture.get("width_cm")),
+                        stem_width_cm=_positive_stem_width(
+                            capture.get("width_cm")),
                         visible_true_leaf_count=_safe_int(capture.get("leaf_count")),
                         cm_per_pixel=_safe_float(capture.get("cm_per_pixel")),
                         confidence=_safe_float(capture.get("confidence")),
@@ -493,7 +507,9 @@ def import_camera_measurements(
 
             if stored_valid:
                 height = _median(c.get("height_cm") for c in stored_valid)
-                stem_width = _median(c.get("stem_width_cm") for c in stored_valid)
+                stem_width = _median(
+                    _positive_stem_width(c.get("stem_width_cm"))
+                    for c in stored_valid)
                 leaves = _median(c.get("visible_true_leaf_count")
                                  for c in stored_valid)
                 if height is None:
@@ -601,7 +617,8 @@ def rebuild_daily_observation_from_captures(
         return {"action": "none", "reason": "no accepted valid captures"}
 
     height = _median(c.get("height_cm") for c in accepted)
-    stem_width = _median(c.get("stem_width_cm") for c in accepted)
+    stem_width = _median(
+        _positive_stem_width(c.get("stem_width_cm")) for c in accepted)
     leaves = _median(c.get("visible_true_leaf_count") for c in accepted)
     if height is None:
         return {"action": "none", "reason": "no usable height in accepted captures"}

@@ -166,8 +166,7 @@ def cmd_import_camera(conn, args) -> int:
 def cmd_predict(conn, args) -> int:
     from prediction import predict_for_plant, format_result
     _banner(conn, args.plant)
-    result = predict_for_plant(conn, args.plant, Path(args.models_dir),
-                               allow_synthetic=args.allow_synthetic)
+    result = predict_for_plant(conn, args.plant, Path(args.models_dir))
     print(format_result(result))
     return 0
 
@@ -420,7 +419,6 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("predict", parents=[common],
                        help="view countdown prediction")
     p.add_argument("--plant", type=int, required=True)
-    p.add_argument("--allow-synthetic", action="store_true")
     p.set_defaults(func=cmd_predict)
 
     p = sub.add_parser("transplant", parents=[common],

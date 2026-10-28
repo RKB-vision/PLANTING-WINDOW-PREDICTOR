@@ -13,7 +13,8 @@ baseline the repository ships with:
 3. rebuild it from ``data/super_orange_growth_data.csv`` via
    :func:`plantreadiness.seed.seed_database` - ``data_source='real'``,
    ``cohort='reference'``, ``calibration_source='csv_import_no_calibration'``,
-4. ensure the successful-cohort reference baseline exists.
+4. remove cached reference baselines from the old database, then rebuild the
+   default-species baseline from the committed CSV.
 5. clear the Cloudinary processed-ID ledger so a later refresh can backfill
    camera observations after the database rebuild.
 
@@ -25,7 +26,7 @@ Usage::
 
     ./reset                      # back up, wipe, reseed from the CSV
     ./reset --no-backup          # skip the safety backup
-    ./reset --rebuild-baseline   # force-rebuild the reference baseline
+    ./reset --rebuild-baseline   # deprecated; reset always rebuilds baselines
     ./reset --camera             # also clear untracked camera artefacts
     python -m plantreadiness.reset --json
 """
@@ -111,6 +112,25 @@ def _clear_processed_cloudinary_ids(base_dir: Path) -> bool:
     return True
 
 
+def _remove_reference_baselines(models_dir: Path) -> list[str]:
+    """Remove baseline snapshots derived from the pre-reset database.
+
+    Baselines are persisted outside SQLite, so deleting only the database can
+    leave historical species predictions available after their source rows
+    have been reset. The seed step immediately rebuilds the default species
+    baseline from the committed CSV.
+    """
+    reference_dir = Path(models_dir) / "reference"
+    removed: list[str] = []
+    if not reference_dir.is_dir():
+        return removed
+    for path in reference_dir.glob("baseline_*.json"):
+        if path.is_file():
+            path.unlink()
+            removed.append(path.name)
+    return removed
+
+
 def _counts(db_path: Path) -> dict:
     """Read-only snapshot of the row counts that describe the reset state."""
     if not db_path.exists():
@@ -168,6 +188,7 @@ def reset_database(*, db_path=None, csv_path=None, models_dir=None,
         backup_path = _backup_database(db_path, backup_dir)
 
     removed = _remove_database_files(db_path)
+    removed_baselines = _remove_reference_baselines(models_dir)
 
     seed_report = seed.seed_database(
         db_path=db_path, csv_path=csv_path, models_dir=models_dir,
@@ -189,6 +210,7 @@ def reset_database(*, db_path=None, csv_path=None, models_dir=None,
         "models_dir": str(models_dir),
         "backup": str(backup_path) if backup_path else None,
         "removed_db_files": removed,
+        "removed_reference_baselines": removed_baselines,
         "before": before,
         "after": after,
         "import": seed_report.get("import"),
@@ -244,6 +266,11 @@ def _print_report(report: dict) -> None:
     print(f"  plants       : {after.get('plants')}")
     print(f"  observations : {after.get('observations')}")
     print(f"  captures     : {after.get('captures')}")
+
+    if report["removed_reference_baselines"]:
+        print("\nold reference baselines removed:")
+        for name in report["removed_reference_baselines"]:
+            print(f"  {name}")
     print("\nCloudinary processed-ID ledger: "
           f"{'cleared' if report['processed_cloudinary_ids_cleared'] else 'not present'}")
 
@@ -268,7 +295,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--no-backup", action="store_true",
                         help="do not keep a timestamped copy of the old DB")
     parser.add_argument("--rebuild-baseline", action="store_true",
-                        help="rebuild the reference baseline even if present")
+                        help="deprecated; reset always rebuilds baselines")
     parser.add_argument("--camera", action="store_true",
                         help="also clear downloaded camera images and captures/")
     parser.add_argument("--json", action="store_true",

@@ -131,13 +131,14 @@ emoji).
 - `predict_for_plant(conn, plant_id, models_dir, …)` — single-plant prediction.
 - CLI (`--plant`, `--species`, `--variety`, `--age-days`, `--height-cm`,
   `--growth-rate`, `--stem-width-cm`, `--true-leaves`, `--db`, `--models-dir`,
-  `--allow-synthetic`, `--json`).
+  `--json`).
 - **Fallback order (honest):**
   1. Validated model (real, evidence-backed)
   2. Provisional historical baseline (species medians from the reference cohort)
-  3. Synthetic demo model — **only** if explicitly enabled (`--allow-synthetic`),
-     always labelled `SYNTHETIC DEMO`
-  4. Insufficient evidence — prediction unavailable, no fabrication
+  3. Insufficient evidence — prediction unavailable, no fabrication
+
+Production prediction endpoints select real artifacts only. Synthetic models
+and generators are confined to the separate development/demo workflow.
 
 ### 3.6 Feedback CLI — `plant_feedback.py`
 

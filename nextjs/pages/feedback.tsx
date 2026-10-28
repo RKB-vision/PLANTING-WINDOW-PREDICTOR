@@ -334,10 +334,14 @@ export default function FeedbackPage() {
     }
   }
 
-  const plantLabel = (p: Plant) =>
-    `#${p.plant_id} ${p.species}${p.variety ? ` / ${p.variety}` : ''}${
+  const plantLabel = (p: Plant) => {
+    const recordType = p.cohort === 'manual_upload'
+      ? 'CSV import'
+      : p.cohort || 'monitored plant'
+    return `#${p.plant_id} ${p.species}${p.variety ? ` / ${p.variety}` : ''}${
       p.external_ref ? ` (${p.external_ref})` : ''
-    }`
+    } · ${recordType}`
+  }
 
   return (
     <Layout active="feedback">

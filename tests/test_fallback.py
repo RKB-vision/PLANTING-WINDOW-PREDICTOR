@@ -42,6 +42,8 @@ def _register(models_dir, data_source, entries):
                               "active": True}
                              for i, m in enumerate(entries)]}
     (d / "registry.json").write_text(json.dumps(payload))
+    for i in range(len(entries)):
+        (d / f"{i}.joblib").touch()
 
 
 class TestFallbackOrder(unittest.TestCase):
@@ -113,6 +115,43 @@ class TestFallbackOrder(unittest.TestCase):
                             "active": False}]}))
         sel = mdl.select_model("Super Orange", "Early", self.models)
         self.assertEqual(sel["level"], 3)
+
+    def test_deleted_latest_artifact_falls_back_to_older_model(self):
+        _register(self.models, "real", [
+            _make_artifact("Super Orange", "Early", "real")["metadata"],
+            _make_artifact("Super Orange", "Early", "real",
+                           mae=1.0)["metadata"],
+        ])
+        (self.models / "real" / "1.joblib").unlink()
+
+        sel = mdl.select_model("Super Orange", "Early", self.models)
+
+        self.assertEqual(sel["level"], 1)
+        self.assertEqual(sel["entry"]["file"], "0.joblib")
+
+    def test_no_existing_artifact_is_treated_as_no_model(self):
+        _register(self.models, "real", [
+            _make_artifact("Super Orange", "Early", "real")["metadata"],
+        ])
+        (self.models / "real" / "0.joblib").unlink()
+
+        sel = mdl.select_model("Super Orange", "Early", self.models)
+
+        self.assertEqual(sel["level"], 3)
+        self.assertIsNone(sel["entry"])
+
+    def test_corrupt_selected_artifact_degrades_to_no_model(self):
+        _register(self.models, "real", [
+            _make_artifact("Super Orange", "Early", "real")["metadata"],
+        ])
+        (self.models / "real" / "0.joblib").write_text("not a joblib artifact")
+        sel = mdl.select_model("Super Orange", "Early", self.models)
+
+        loaded = mdl.load_selection(sel, self.models)
+
+        self.assertEqual(loaded["level"], 3)
+        self.assertIsNone(loaded["artifact"])
+        self.assertIn("could not be loaded", loaded["model_warning"])
 
 
 

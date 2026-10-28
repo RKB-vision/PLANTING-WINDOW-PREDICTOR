@@ -13,10 +13,9 @@ NOW: two explicit modes.
       events, plant-grouped validation, artifacts labelled SYNTHETIC DEMO.
 
   Mode B - real data                     `python model_train.py --mode real`
-      Imports the Super Orange CSV, runs data-quality checks and growth
-      analysis, then reports - honestly - that no verified readiness events
-      exist, so NO readiness countdown model is trained. No synthetic
-      fallback is used for real plants.
+      Uses readiness events for the selected real species, optionally imports
+      a CSV into that species, validates the countdown model, and never falls
+      back to synthetic data for a real plant.
 
 The supervised learning target is always:
 
@@ -296,19 +295,27 @@ def run_demo_retrain(db_path: Path, models_dir: Path,
 
 
 def run_real_training(db_path: Path, models_dir: Path,
-                      csv_path: Path) -> dict:
-    """Import real CSV, analyse quality/growth, attempt (and usually refuse)
-    readiness-model training because no verified readiness events exist."""
+                     csv_path: Path | None,
+                     species: str = config.DEFAULT_SPECIES,
+                     retrain: bool = False) -> dict:
+    """Train a real candidate, optionally comparing it with the deployed model.
+
+    Retraining compares the current model's algorithm and the candidate with
+    grouped cross-validation on the same real plant rows. A refreshed model of
+    the same algorithm may replace the current model when new labelled evidence
+    exists, it remains validated, and its CV MAE does not regress. A different
+    algorithm must strictly improve CV MAE. Older artifacts remain on disk.
+    """
     print("=" * 68)
-    print(" REAL DATA MODE - Super Orange measurements")
+    print(f" REAL DATA MODE - {species}")
     print("=" * 68)
 
     conn = dbm.init_db(db_path)
     try:
         # --- import --------------------------------------------------------
-        if csv_path.exists():
+        if csv_path is not None and csv_path.exists():
             report = csv_import.import_csv(
-                conn, csv_path, species=config.DEFAULT_SPECIES,
+                conn, csv_path, species=species,
                 date_started=None)
             print(f"\nCSV import report ({csv_path.name}):")
             print(json.dumps({k: v for k, v in report.items() if k != 'issues'},
@@ -317,12 +324,15 @@ def run_real_training(db_path: Path, models_dir: Path,
                 print(f"row issues ({len(report['issues'])}):")
                 for issue in report["issues"][:10]:
                     print(f"  line {issue['line']}: {issue['problem']}")
-        else:
+        elif csv_path is not None:
             print(f"\nCSV not found at {csv_path} - skipping import.")
+        else:
+            print("\nNo CSV import requested; using observations and readiness "
+                  "events already stored for this species.")
 
         # --- quality checks + growth analysis ------------------------------
         analysis = csv_import.analyse_real_data(
-            conn, species=config.DEFAULT_SPECIES, data_source="real")
+            conn, species=species, data_source="real")
         print("\n--- data-quality & growth analysis (real) ---")
         print(f"plants                : {analysis['n_plants']}")
         print(f"observations           : {analysis['n_observations']}")
@@ -344,13 +354,34 @@ def run_real_training(db_path: Path, models_dir: Path,
                   f"linear slope {p['linear_slope_cm_per_day']} cm/day, "
                   f"readiness events={p['n_readiness_events']}")
 
-        # --- readiness model attempt (expected to refuse) -------------------
+        # --- fit a model candidate using recorded readiness labels ----------
         rows = dbm.readiness_training_rows(
-            conn, data_source="real", species=config.DEFAULT_SPECIES)
+            conn, data_source="real", species=species)
         df = mdl.build_training_frame(rows)
+
+        current_selection = mdl.select_model(species, None, models_dir)
+        current_entry = current_selection.get("entry")
+        current_artifact = None
+        if retrain:
+            if current_entry is None:
+                print("\nNo validated real model is deployed for this species. "
+                      "Run without --retrain to create the first model.")
+                return {"trained": False, "promoted": False,
+                        "reason": "no deployed validated model",
+                        "analysis": analysis}
+            current_artifact = mdl.load_selection(current_selection, models_dir)["artifact"]
+        elif current_entry is not None:
+            print("\nA validated real model already exists for this species. "
+                  "Use --retrain to compare a refreshed candidate before "
+                  "replacing it.")
+            return {"trained": False, "promoted": False,
+                    "reason": "model already deployed; use --retrain",
+                    "analysis": analysis}
+
         try:
             artifact = mdl.train_countdown_model(
                 df, data_source="real",
+                species=species,
                 source_label="real readiness-event data")
         except mdl.InsufficientDataError as exc:
             print(f"\n{config.UNAVAILABLE_MESSAGE}")
@@ -367,11 +398,96 @@ def run_real_training(db_path: Path, models_dir: Path,
                     "message": config.UNAVAILABLE_MESSAGE,
                     "analysis": analysis}
 
+        if retrain and current_artifact is not None:
+            current_meta = current_artifact["metadata"]
+            current_name = current_meta.get("model_name")
+            candidates = mdl.make_pipelines()
+            if current_name not in candidates:
+                print(f"\nCannot compare deployed model type {current_name!r}; "
+                      "keeping the current model.")
+                return {"trained": True, "promoted": False,
+                        "reason": "unknown deployed model type",
+                        "analysis": analysis}
+
+            current_cv = mdl.grouped_cv_mae(
+                candidates[current_name], df,
+                n_splits=min(5, int(artifact["metadata"]["n_independent_plants"])),
+            )["mae_days"]
+            candidate_meta = artifact["metadata"]
+            candidate_cv = mdl.grouped_cv_mae(
+                candidates[candidate_meta["model_name"]], df,
+                n_splits=min(5, int(candidate_meta["n_independent_plants"])),
+            )["mae_days"]
+            decision = real_retrain_decision(
+                current_meta, candidate_meta, current_cv, candidate_cv)
+
+            print("\n--- Real model retraining comparison (grouped CV) ---")
+            print(f"Current artifact   : {current_entry['file']}")
+            print(f"Current model type : {current_name}")
+            print(f"Candidate type     : {candidate_meta['model_name']}")
+            print(f"Current type MAE   : {current_cv:.4f} days")
+            print(f"Candidate MAE      : {candidate_cv:.4f} days")
+            print(f"Decision           : "
+                  f"{'PROMOTE' if decision['promote'] else 'KEEP CURRENT'} - "
+                  f"{decision['reason']}")
+
+            if not decision["promote"]:
+                return {"trained": True, "promoted": False,
+                        "decision": decision, "analysis": analysis}
+
+            candidate_meta["retrain_comparison"] = {
+                "current_model_file": current_entry["file"],
+                "current_model_type": current_name,
+                "current_type_cv_mae_days": round(current_cv, 4),
+                "candidate_cv_mae_days": round(candidate_cv, 4),
+                "decision": decision,
+            }
+            mdl.retire_artifacts(
+                models_dir, "real", species, candidate_meta.get("scope_variety"))
+
         saved = mdl.save_artifact(artifact, models_dir)
-        print(f"\nTrained real readiness model: {saved['file']}")
-        return {"trained": True, "saved": saved, "analysis": analysis}
+        print(f"\n{'Promoted retrained' if retrain else 'Trained'} real "
+              f"readiness model: {saved['file']}")
+        return {"trained": True, "promoted": True, "saved": saved,
+                "analysis": analysis}
     finally:
         conn.close()
+
+
+def real_retrain_decision(current_meta: dict, candidate_meta: dict,
+                          current_cv_mae: float,
+                          candidate_cv_mae: float) -> dict:
+    """Decide whether a validated real candidate can replace the current one."""
+    current_ids = set(current_meta.get("training_plant_ids", []))
+    candidate_ids = set(candidate_meta.get("training_plant_ids", []))
+    current_rows = int(current_meta.get("n_training_rows", 0))
+    candidate_rows = int(candidate_meta.get("n_training_rows", 0))
+    current_events = int(current_meta.get("n_labelled_readiness_events", 0))
+    candidate_events = int(candidate_meta.get("n_labelled_readiness_events", 0))
+    new_evidence = (
+        current_ids.issubset(candidate_ids)
+        and candidate_rows >= current_rows
+        and candidate_events >= current_events
+        and (candidate_ids != current_ids
+             or candidate_rows > current_rows
+             or candidate_events > current_events)
+    )
+    if not new_evidence:
+        return {"promote": False,
+                "reason": "no additional labelled plants or training rows"}
+    if not candidate_meta.get("validated"):
+        return {"promote": False,
+                "reason": "candidate did not pass validation"}
+
+    same_model_type = current_meta.get("model_name") == candidate_meta.get("model_name")
+    if same_model_type and candidate_cv_mae <= current_cv_mae:
+        return {"promote": True,
+                "reason": "same model type, more evidence, and no CV error regression"}
+    if not same_model_type and candidate_cv_mae < current_cv_mae:
+        return {"promote": True,
+                "reason": "candidate model type has lower grouped-CV error"}
+    return {"promote": False,
+            "reason": "candidate did not improve grouped-CV error"}
 
 
 # --------------------------------------------------------------------------- #
@@ -384,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
         description="Plant readiness countdown training (two explicit modes).")
     parser.add_argument("--mode", choices=["demo", "real"], required=True,
                         help="demo = synthetic demonstration; "
-                             "real = Super Orange CSV import + analysis")
+                             "real = recorded real-data analysis/training")
     parser.add_argument("--db", default=None,
                         help="SQLite database path (default: "
                              "plant_readiness.db for real mode, "
@@ -392,13 +508,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--models-dir", default=None,
                         help="model artefact directory (default: models/ for "
                              "real mode, models_demo/ for demo mode)")
-    parser.add_argument("--csv", default=str(config.DEFAULT_REAL_CSV),
-                        help="real CSV to import (real mode)")
+    parser.add_argument("--species", default=config.DEFAULT_SPECIES,
+                        help="real species scope (defaults to the configured "
+                             "Sunflower species)")
+    parser.add_argument("--csv", default=None,
+                        help="optional real CSV to import; omitted CSVs are "
+                             "not imported for non-default species")
     parser.add_argument("--seed", type=int, default=42,
                         help="synthetic generator seed (demo mode)")
     parser.add_argument("--retrain", action="store_true",
-                        help="demo mode: add a new synthetic cohort, retrain "
-                             "and compare with the deployed model on holdout")
+                        help="demo: compare on its synthetic holdout; real: "
+                             "fit from accumulated real labels and promote "
+                             "only after grouped-CV comparison")
     return parser
 
 
@@ -420,7 +541,13 @@ def main(argv: list[str] | None = None) -> int:
             result = run_demo_training(db_path, models_dir, seed=args.seed)
         return 0 if result.get("trained") or result.get("compared") else 1
 
-    result = run_real_training(db_path, models_dir, Path(args.csv))
+    csv_path = Path(args.csv) if args.csv else (
+        config.DEFAULT_REAL_CSV
+        if args.species == config.DEFAULT_SPECIES else None
+    )
+    result = run_real_training(
+        db_path, models_dir, csv_path, species=args.species,
+        retrain=args.retrain)
     # Real mode "succeeds" even when no model could be trained: an honest
     # refusal is the correct outcome until readiness labels exist.
     return 0
