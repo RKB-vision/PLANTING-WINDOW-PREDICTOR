@@ -196,8 +196,12 @@ ALLOWED_DATASET_ENCODINGS = ("utf-8", "utf-8-sig", "latin-1")
 # --------------------------------------------------------------------------- #
 # Constants
 # --------------------------------------------------------------------------- #
-GROWTH_RATE_ADJUSTMENT_MIN_FACTOR = 0.5
-GROWTH_RATE_ADJUSTMENT_MAX_FACTOR = 2.0
+# How a provisional estimate reacts to the plant's own growth rate. A narrow
+# band is deliberate: one slow week must not double the estimate. The
+# adjustment only applies when enough readings exist to call it a trend.
+GROWTH_RATE_ADJUSTMENT_MIN_FACTOR = 0.8
+GROWTH_RATE_ADJUSTMENT_MAX_FACTOR = 1.25
+GROWTH_RATE_ADJUSTMENT_MIN_READINGS = 3
 
 FEEDBACK_WINDOW_DAYS = 14
 
@@ -235,6 +239,21 @@ MIN_PROVISIONAL_PLANTS = 3
 PROVISIONAL_AGE_TOLERANCE_DAYS = 3
 PROVISIONAL_HEIGHT_TOLERANCE_CM = 1.5
 
+# Growth-trajectory fallback (used when a plant has no reliable age).
+# Theil-Sen (median pairwise slope) resists a single bad reading; projection
+# stops at the historical median transplant height. Never extrapolated beyond
+# a year and never presented as a validated model.
+TRAJECTORY_MIN_READINGS = 3
+TRAJECTORY_MAX_HORIZON_DAYS = 365
+TRAJECTORY_MIN_SPAN_DAYS = 2
+
+# A single reading whose height differs from the previous accepted reading by
+# more than this fraction is flagged as suspect and excluded from rates/medians.
+# It stays visible for human review - being flagged is not the same as being
+# deleted. Comparing with the previous reading (not a multi-day median) avoids
+# flagging a steadily growing seedling just because it grew fast.
+HEIGHT_JUMP_SUSPECT_RATIO = 0.5
+
 # How the historical transplant reference is derived when no verified
 # transplant date is recorded for a plant.
 TRANSPLANT_ASSUMPTION_RULE = (
@@ -252,6 +271,13 @@ PROVISIONAL_BASELINE_MESSAGE = (
     "Provisional estimate from the successful-cohort reference baseline. "
     "This is descriptive historical timing, NOT a validated readiness model, "
     "and the reference transplant date is assumed rather than verified."
+)
+
+TRAJECTORY_BASELINE_MESSAGE = (
+    "Provisional estimate from the successful-cohort reference baseline: the "
+    "plant's recent median growth rate is projected to the cohort's median "
+    "transplant height. This assumes the recent trend continues; it is NOT a "
+    "validated readiness model."
 )
 
 # --------------------------------------------------------------------------- #

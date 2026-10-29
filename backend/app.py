@@ -69,6 +69,10 @@ def list_plants():
                 'variety': r['variety'],
                 'external_ref': r['external_ref'],
                 'cohort': r['cohort'],
+                'date_started': r['date_started'],
+                'initial_age_days': r['initial_age_days'],
+                'initial_age_measured_on': r['initial_age_measured_on'],
+                'age_source': dbm.age_source_for_plant(dict(r)),
                 'data_source': r['data_source']
             })
         return jsonify(plants)
@@ -87,6 +91,8 @@ def register_plant():
     species = data.get('species')
     variety = data.get('variety')
     date_started = data.get('date_started')
+    initial_age_days = data.get('initial_age_days')
+    initial_age_measured_on = data.get('initial_age_measured_on')
     data_source = data.get('data_source', 'real')
     growing_conditions = data.get('growing_conditions')
     external_ref = data.get('external_ref')
@@ -103,6 +109,8 @@ def register_plant():
             growing_conditions=growing_conditions,
             external_ref=external_ref,
             cohort=cohort,
+            initial_age_days=initial_age_days,
+            initial_age_measured_on=initial_age_measured_on,
         )
         return jsonify({'plant_id': plant_id}), 201
     except Exception as e:

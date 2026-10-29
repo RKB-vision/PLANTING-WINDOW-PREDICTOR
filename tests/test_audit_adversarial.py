@@ -99,8 +99,10 @@ def test_growth_adjustment_is_clamped(tmp_path):
 
     raw = est(0.1)["days_remaining"]
     assert est(0.1)["days_remaining"] == raw                       # equal -> 1.0x
-    assert est(0.001)["days_remaining"] == raw * 2.0               # clamp max 2.0
-    assert est(100.0)["days_remaining"] == raw * 0.5               # clamp min 0.5
+    assert est(0.001)["days_remaining"] == round(
+        raw * config.GROWTH_RATE_ADJUSTMENT_MAX_FACTOR, 1)
+    assert est(100.0)["days_remaining"] == round(
+        raw * config.GROWTH_RATE_ADJUSTMENT_MIN_FACTOR, 1)
     for bad in (0.0, -0.1, float("nan"), float("inf"), None):
         assert est(bad)["days_remaining"] == raw                   # skipped
 

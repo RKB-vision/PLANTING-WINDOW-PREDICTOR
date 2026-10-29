@@ -24,6 +24,9 @@ interface CohortSnapshot {
   median_visible_true_leaf_count: number | null
   missing_height_count?: number
   missing_age_count?: number
+  age_source?: string
+  rows_total?: number
+  suspect_rows_excluded?: number
 }
 
 interface SpeciesOption {
@@ -74,6 +77,21 @@ interface PredictionResult {
   past_readiness?: boolean
   readiness_status?: string | null
   predicted_readiness_date?: string | null
+  age_source?: string
+  estimate_basis?: string
+  target_height_cm?: number | null
+  current_height_cm?: number | null
+  remaining_growth_cm?: number | null
+  robust_growth_rate_cm_per_day?: number | null
+  n_history_readings?: number | null
+  history_span_days?: number | null
+  horizon_capped?: boolean
+  suspect_rows_excluded?: number
+  date_stability?: string | null
+  date_capped_to_previous?: boolean
+  previous_predicted_readiness_date?: string | null
+  plant_grew_since_previous?: boolean
+  stability_note?: string | null
   level?: string
   mae_days?: number | null
   mae_days_std?: number | null
@@ -164,9 +182,20 @@ function methodBadgeClass(result: PredictionResult): string {
 }
 
 function methodLabel(result: PredictionResult): string {
-  if (result.provisional) return 'Provisional baseline'
+  if (result.provisional) {
+    return result.estimate_basis === 'growth_trajectory'
+      ? 'Trend projection'
+      : 'Historical timing'
+  }
   if (result.available) return 'Validated model'
   return 'Insufficient evidence'
+}
+
+function ageSourceLabel(source?: string): string {
+  if (source === 'planted_on') return 'from planting date'
+  if (source === 'user_estimated_initial_age') return 'user-provided estimate'
+  if (source === 'mixed') return 'mixed sources across plants'
+  return 'not recorded'
 }
 
 export default function Home() {
@@ -427,6 +456,11 @@ export default function Home() {
                       {result.predicted_readiness_date && (
                         <p className="answer-date">Readiness date: <strong>{result.predicted_readiness_date}</strong></p>
                       )}
+                      {result.provisional && (
+                        <p className="small" style={{ margin: '4px 0 0' }}>
+                          <span className={methodBadgeClass(result)}>{methodLabel(result)}</span>
+                        </p>
+                      )}
                     </>
                   ) : (
                     <>
@@ -435,7 +469,21 @@ export default function Home() {
                     </>
                   )}
                   {result.provisional && (
-                    <p className="small" style={{ margin: '10px 0 0' }}>Provisional estimate from the reference baseline.</p>
+                    <p className="small" style={{ margin: '10px 0 0' }}>Provisional estimate from the reference baseline, not a validated model.</p>
+                  )}
+                  {result.date_capped_to_previous && (
+                    <p className="small" style={{ margin: '6px 0 0', color: 'var(--muted, #5b6b5b)' }}>
+                      The plant grew since the previous reading, so the date was held at{' '}
+                      {result.previous_predicted_readiness_date || 'the previous estimate'} instead of moving later.
+                    </p>
+                  )}
+                  {result.date_stability === 'later_after_stall' && (
+                    <p className="small" style={{ margin: '6px 0 0' }}>
+                      Height did not increase since the previous reading, so a later date is allowed.
+                    </p>
+                  )}
+                  {result.date_stability === 'method_changed' && result.stability_note && (
+                    <p className="small" style={{ margin: '6px 0 0' }}>{result.stability_note}</p>
                   )}
                   {result.model_warning && (
                     <p className="small muted" role="status" style={{ margin: '6px 0 0' }}>
@@ -498,8 +546,20 @@ export default function Home() {
                       </p>
                       <p className="small" style={{ margin: 0 }}>Stem width: {cohort.median_stem_width_cm != null && cohort.median_stem_width_cm > 0 ? `${formatValue(cohort.median_stem_width_cm)} cm` : 'not measured'}</p>
                       <p className="small" style={{ margin: 0 }}>True leaves: {formatValue(cohort.median_visible_true_leaf_count)}</p>
-                      <p className="small" style={{ margin: 0 }}>Age: {cohort.median_age_days == null ? 'not recorded' : `${cohort.median_age_days} days`}</p>
+                      <p className="small" style={{ margin: 0 }}>Age: {cohort.median_age_days == null ? 'not recorded' : `${cohort.median_age_days} days`}{cohort.median_age_days != null ? ` (${ageSourceLabel(result.age_source || cohort.age_source)})` : ''}</p>
                       <p className="small" style={{ margin: 0 }}>Observation date: {formatValue(cohort.observation_date)}</p>
+                      {result.estimate_basis === 'growth_trajectory' && (
+                        <>
+                          <p className="small" style={{ margin: 0 }}>Target height: {formatValue(result.target_height_cm)} cm (historical transplant median)</p>
+                          <p className="small" style={{ margin: 0 }}>Projected growth: {result.robust_growth_rate_cm_per_day != null ? `${formatValue(result.robust_growth_rate_cm_per_day)} cm/day` : 'not available'}</p>
+                          <p className="small" style={{ margin: 0 }}>Readings used: {formatValue(result.n_history_readings)}{result.history_span_days != null ? ` over ${result.history_span_days} days` : ''}</p>
+                        </>
+                      )}
+                      {(result.suspect_rows_excluded ?? cohort.suspect_rows_excluded ?? 0) > 0 && (
+                        <p className="small" style={{ margin: 0 }}>
+                          Suspect readings excluded: {result.suspect_rows_excluded ?? cohort.suspect_rows_excluded} (&gt;50% height jump; kept for review)
+                        </p>
+                      )}
                     </div>
                   </div>
                 )}

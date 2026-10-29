@@ -4,10 +4,12 @@
   "variety": null,
   "data_source": "real",
   "source_label": "Marigold (Apsara Yellow) successful cohort",
-  "generated_at": "2026-10-28T04:58:39.844867+00:00",
+  "generated_at": "2026-10-29T03:09:20.345664+00:00",
   "n_plants": 12,
   "n_points": 381,
   "n_plants_contributing_to_medians": 12,
+  "median_transplant_height_cm": 16.36,
+  "transplant_height_iqr_cm": 1.2175,
   "transplant_reference": {
     "assumption": true,
     "rule": "transplant_date = day after the plant's final monitoring day (assumed for the successful cohort; not an independently verified transplant date)",
@@ -798,6 +800,7 @@
       "transplant_date": "2026-10-06",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 16.75,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.46
     },
@@ -810,6 +813,7 @@
       "transplant_date": "2026-10-04",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 15.42,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.43
     },
@@ -822,6 +826,7 @@
       "transplant_date": "2026-09-30",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 14.86,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.505
     },
@@ -834,6 +839,7 @@
       "transplant_date": "2026-10-07",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 16.81,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.44
     },
@@ -846,6 +852,7 @@
       "transplant_date": "2026-10-05",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 16.71,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.45
     },
@@ -858,6 +865,7 @@
       "transplant_date": "2026-10-04",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 16.1,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.465
     },
@@ -870,6 +878,7 @@
       "transplant_date": "2026-10-01",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 15.53,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.51
     },
@@ -882,6 +891,7 @@
       "transplant_date": "2026-10-06",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 17.44,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.52
     },
@@ -894,6 +904,7 @@
       "transplant_date": "2026-10-01",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 15.39,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.47
     },
@@ -906,6 +917,7 @@
       "transplant_date": "2026-10-07",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 16.62,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.45
     },
@@ -918,6 +930,7 @@
       "transplant_date": "2026-10-02",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 15.55,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.45
     },
@@ -930,6 +943,7 @@
       "transplant_date": "2026-10-02",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 16.71,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.53
     }

@@ -279,6 +279,13 @@ def build_reference_baseline(plants: list[dict],
 
         rates = [p["growth_rate_cm_per_day"] for p in points
                  if p["growth_rate_cm_per_day"] is not None]
+        # Height reached at the (recorded or assumed) transplant reference.
+        # Missing heights stay missing; the last measured one is used.
+        final_height = None
+        for point in reversed(points):
+            if point.get("height_cm") is not None:
+                final_height = point["height_cm"]
+                break
         per_plant.append({
             "plant_id": pid,
             "external_ref": ref,
@@ -288,6 +295,7 @@ def build_reference_baseline(plants: list[dict],
             "transplant_date": transplant_date,
             "transplant_source": transplant["source"],
             "transplant_is_assumption": transplant["is_assumption"],
+            "final_height_cm": _round(final_height),
             "n_growth_rates_derived": sum(
                 1 for p in points if p["growth_rate_derived"]),
             "median_growth_rate_cm_per_day": _round(median(rates)),
@@ -298,6 +306,8 @@ def build_reference_baseline(plants: list[dict],
     by_days_before = _groups(all_points, "days_until_transplant")
     contributing = max(
         [g["n_plants"] for g in by_age + by_days_before] or [0])
+    transplant_heights = [p["final_height_cm"] for p in per_plant
+                          if p["final_height_cm"] is not None]
 
     return {
         "baseline_version": 1,
@@ -309,6 +319,8 @@ def build_reference_baseline(plants: list[dict],
         "n_plants": n_plants,
         "n_points": len(all_points),
         "n_plants_contributing_to_medians": contributing,
+        "median_transplant_height_cm": _round(median(transplant_heights)),
+        "transplant_height_iqr_cm": _round(_iqr(transplant_heights)),
         "transplant_reference": {
             "assumption": n_assumed > 0,
             "rule": config.TRANSPLANT_ASSUMPTION_RULE,
@@ -426,7 +438,261 @@ def _nearest_group(groups: list[dict], key: str, value: float,
     return best
 
 
-def provisional_estimate(baseline: dict, observation: dict) -> dict:
+def reference_transplant_height(baseline: dict) -> Optional[float]:
+    """Historical median height at the transplant reference.
+
+    New baselines store ``median_transplant_height_cm`` directly. Older
+    baselines fall back to the tallest age-group median, which is the last
+    measured height of the cohort (the transplant reference is the day after
+    the final observation). Returns ``None`` when nothing was measured.
+    """
+    if not baseline:
+        return None
+    height = baseline.get("median_transplant_height_cm")
+    if height is not None:
+        return float(height)
+    groups = baseline.get("by_age_days") or []
+    heights = [g.get("median_height_cm") for g in groups
+               if g.get("median_height_cm") is not None]
+    return float(max(heights)) if heights else None
+
+
+def _theil_sen(points: list[dict]) -> dict:
+    """Theil-Sen slope for one plant's dated height readings."""
+    by_date: dict[date, list[float]] = {}
+    for point in points:
+        raw_date = point.get("observation_date")
+        raw_height = point.get("height_cm")
+        if not raw_date or raw_height is None:
+            continue
+        try:
+            day = dbm.parse_iso_date(raw_date, "observation_date")
+            value = float(raw_height)
+        except (dbm.ValidationError, TypeError, ValueError):
+            continue
+        if not math.isfinite(value):
+            continue
+        by_date.setdefault(day, []).append(value)
+
+    dated = sorted((day, median(values)) for day, values in by_date.items())
+    if len(dated) < config.TRAJECTORY_MIN_READINGS:
+        return {
+            "available": False,
+            "reason": (f"only {len(dated)} usable reading(s); at least "
+                       f"{config.TRAJECTORY_MIN_READINGS} are needed for a "
+                       "growth trend"),
+            "n_readings": len(dated),
+        }
+    span_days = (dated[-1][0] - dated[0][0]).days
+    if span_days < config.TRAJECTORY_MIN_SPAN_DAYS:
+        return {
+            "available": False,
+            "reason": (f"readings span only {span_days} day(s)"),
+            "n_readings": len(dated),
+        }
+
+    slopes: list[float] = []
+    for i in range(len(dated)):
+        for j in range(i + 1, len(dated)):
+            dt = (dated[j][0] - dated[i][0]).days
+            if dt > 0:
+                slopes.append((dated[j][1] - dated[i][1]) / dt)
+    if not slopes:
+        return {"available": False, "reason": "no distinct dates",
+                "n_readings": len(dated)}
+
+    return {
+        "available": True,
+        "slope_cm_per_day": statistics.median(slopes),
+        "n_readings": len(dated),
+        "n_pairs": len(slopes),
+        "span_days": span_days,
+        "first_date": dated[0][0].isoformat(),
+        "last_date": dated[-1][0].isoformat(),
+    }
+
+
+def robust_growth_rate(points: list[dict]) -> dict:
+    """Robust growth rate (cm/day) from dated height readings.
+
+    Read ings are grouped by plant so a multi-plant cohort is never treated as
+    one continuous trajectory. Each plant gets a Theil-Sen median slope (the
+    median of all pairwise slopes, which resists one atypical reading); the
+    cohort rate is the median of those per-plant slopes. Returns
+    ``available=False`` - never a guessed slope - when no plant has enough
+    readings or a long enough span.
+    """
+    by_plant: dict[object, list[dict]] = {}
+    for index, point in enumerate(points or []):
+        key = point.get("plant_id")
+        if key is None:
+            key = "__single__"
+        by_plant.setdefault(key, []).append(point)
+
+    results = [_theil_sen(group) for group in by_plant.values()]
+    usable = [r for r in results if r.get("available")]
+    if not usable:
+        reason = results[0].get("reason") if len(results) == 1 else (
+            "no plant had enough dated readings for a trend")
+        return {
+            "available": False,
+            "reason": reason,
+            "n_readings": sum(r.get("n_readings", 0) for r in results),
+            "n_plants": 0,
+        }
+
+    slopes = [r["slope_cm_per_day"] for r in usable]
+    spans = [r.get("span_days", 0) for r in usable]
+    first_dates = sorted(r["first_date"] for r in usable)
+    last_dates = sorted(r["last_date"] for r in usable)
+    return {
+        "available": True,
+        "slope_cm_per_day": statistics.median(slopes),
+        "n_readings": sum(r.get("n_readings", 0) for r in usable),
+        "n_plants": len(usable),
+        "n_pairs": sum(r.get("n_pairs", 0) for r in usable),
+        "span_days": max(spans) if spans else 0,
+        "first_date": first_dates[0] if first_dates else None,
+        "last_date": last_dates[-1] if last_dates else None,
+    }
+
+
+def _trajectory_unavailable(baseline: dict, message: str) -> dict:
+    return {
+        "available": False,
+        "method": config.METHOD_REFERENCE_BASELINE,
+        "provisional": True,
+        "message": message,
+        "limitations": (baseline or {}).get("limitations", []) +
+                       ["A growth-trajectory estimate requires enough dated "
+                        "height readings and a measured historical transplant "
+                        "height."],
+    }
+
+
+def trajectory_estimate(baseline: dict, observation: dict,
+                        history_points: list[dict]) -> dict:
+    """Project the plant's robust growth rate to the cohort's transplant height.
+
+    Used only when age is unknown (a known age anchors the historical timing
+    table directly). The projection is deliberately conservative:
+
+    * growth rate is the Theil-Sen median slope, not the last noisy interval;
+    * the target is the historical median height at transplant;
+    * it never projects beyond ``TRAJECTORY_MAX_HORIZON_DAYS``;
+    * staleness is honest - zero or negative growth means the date cannot be
+      estimated from a trend, so the caller keeps the historical fallback.
+    """
+    if not baseline:
+        return _trajectory_unavailable(
+            {}, "No reference baseline is available.")
+    target_height = reference_transplant_height(baseline)
+    if target_height is None:
+        return _trajectory_unavailable(
+            baseline, "The reference baseline has no measured transplant "
+                      "height, so a growth trajectory cannot be projected.")
+
+    height = observation.get("height_cm")
+    if height is None:
+        return _trajectory_unavailable(
+            baseline, "This observation has no height, so a growth "
+                      "trajectory cannot be projected.")
+    try:
+        current_height = float(height)
+    except (TypeError, ValueError):
+        return _trajectory_unavailable(
+            baseline, "This observation's height is not a usable number.")
+
+    trend = robust_growth_rate(history_points)
+    if not trend.get("available"):
+        return _trajectory_unavailable(
+            baseline, "Growth trend unavailable: " + trend.get("reason", ""))
+    slope = float(trend["slope_cm_per_day"])
+    if not math.isfinite(slope) or slope <= 0:
+        return _trajectory_unavailable(
+            baseline, "Growth has not been positive across these readings, "
+                      "so a readiness date cannot be projected from a trend. "
+                      "The historical timing estimate remains the only "
+                      "provisional option.")
+
+    remaining_cm = target_height - current_height
+    raw_days = 0.0 if remaining_cm <= 0 else remaining_cm / slope
+    horizon_capped = raw_days > config.TRAJECTORY_MAX_HORIZON_DAYS
+    days = min(raw_days, float(config.TRAJECTORY_MAX_HORIZON_DAYS))
+
+    predicted_date = None
+    obs_date = observation.get("observation_date")
+    if obs_date:
+        try:
+            predicted_date = (
+                dbm.parse_iso_date(obs_date, "observation_date")
+                + timedelta(days=int(round(days)))
+            ).isoformat()
+        except dbm.ValidationError:
+            predicted_date = None
+
+    height_iqr = baseline.get("transplant_height_iqr_cm")
+    uncertainty = None
+    if height_iqr is not None and slope > 0:
+        uncertainty = round(float(height_iqr) / slope, 1)
+
+    limitations = list(baseline.get("limitations", [])) + [
+        "The date is a projection of the plant's recent median growth rate to "
+        "the historical median transplant height; it assumes the trend "
+        "continues.",
+        "The historical transplant height is descriptive and was not a "
+        "verified readiness threshold.",
+        "If growth stalls, the projected date moves later - that is a real "
+        "change in evidence, not a model error.",
+    ]
+    if horizon_capped:
+        limitations.append(
+            f"The projection exceeded {config.TRAJECTORY_MAX_HORIZON_DAYS} "
+            "days and was capped; treat it as 'not yet estimable' rather than "
+            "a precise date.")
+
+    return {
+        "available": predicted_date is not None,
+        "method": config.METHOD_REFERENCE_BASELINE,
+        "provisional": True,
+        "synthetic": False,
+        "estimate_basis": "growth_trajectory",
+        "days_remaining": round(days, 1),
+        "days_remaining_raw": round(days, 1),
+        "days_remaining_uncertainty_days": uncertainty,
+        "predicted_readiness_date": predicted_date,
+        "reference_basis": "growth trajectory to historical transplant height",
+        "reference_group": None,
+        "n_independent_plants": baseline.get("n_plants"),
+        "target_height_cm": round(target_height, 4),
+        "current_height_cm": round(current_height, 4),
+        "remaining_growth_cm": round(remaining_cm, 4),
+        "robust_growth_rate_cm_per_day": round(slope, 4),
+        "n_history_readings": trend.get("n_readings"),
+        "history_span_days": trend.get("span_days"),
+        "history_first_date": trend.get("first_date"),
+        "history_last_date": trend.get("last_date"),
+        "horizon_capped": horizon_capped,
+        "reference_transplant_is_assumption":
+            baseline.get("transplant_reference", {}).get("assumption", True),
+        "insufficient_growth_history": False,
+        "history_note": None,
+        "message": config.TRAJECTORY_BASELINE_MESSAGE,
+        "limitations": limitations,
+        "baseline_version": baseline.get("baseline_version"),
+        "hours": None,
+        "cohort_growth_rate_cm_per_day": None,
+        "plant_growth_rate_cm_per_day": round(slope, 4),
+        "growth_rate_adjustment_factor": None,
+        "growth_rate_adjustment_applied": False,
+        "growth_rate_adjustment_reason":
+            "not applicable: trajectory projection used instead of a "
+            "timing-table adjustment",
+    }
+
+
+def provisional_estimate(baseline: dict, observation: dict, *,
+                          growth_history_n: Optional[int] = None) -> dict:
     """Estimate days-until-transplant from the successful-cohort baseline.
 
     Age, height and growth rate are all used as inputs together:
@@ -520,6 +786,12 @@ def provisional_estimate(baseline: dict, observation: dict) -> dict:
                               else "plant growth rate unavailable"))
     elif cr <= 0 or pr <= 0 or not math.isfinite(cr) or not math.isfinite(pr):
         adjustment_reason = "skipped: non-positive or non-finite growth rate"
+    elif (growth_history_n is not None
+          and growth_history_n < config.GROWTH_RATE_ADJUSTMENT_MIN_READINGS):
+        adjustment_reason = (
+            f"skipped: only {growth_history_n} reading(s); at least "
+            f"{config.GROWTH_RATE_ADJUSTMENT_MIN_READINGS} are needed before "
+            "a one-week slowdown adjusts the date")
     else:
         raw_factor = cr / pr
         lo = config.GROWTH_RATE_ADJUSTMENT_MIN_FACTOR
@@ -553,6 +825,7 @@ def provisional_estimate(baseline: dict, observation: dict) -> dict:
         "method": config.METHOD_REFERENCE_BASELINE,
         "provisional": True,
         "synthetic": False,
+        "estimate_basis": "historical_timing",
         "days_remaining": round(adjusted_days, 1),
         "days_remaining_raw": round(base_days, 1),
         "days_remaining_uncertainty_days": _round(uncertainty, 1),

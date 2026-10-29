@@ -35,8 +35,9 @@ from . import config
 from . import model as mdl
 from . import reference as ref
 from .db import (DuplicateRecordError, NotFoundError, ValidationError,
+                 age_days_for_plant, age_source_for_plant,
                  compute_growth, days_between, feedback_due_date,
-                 parse_iso_date)
+                 is_height_outlier, parse_iso_date)
 from .repository import BaseRepository
 from . import camera_import
 from .camera_refresh import refresh_camera_observations
@@ -69,17 +70,30 @@ class ConfigurationError(Exception):
 
 
 def auto_age_days(date_started: Optional[str],
-                  observation_date: str) -> Optional[int]:
-    """Age in days derived from the plant's own start date.
+                  observation_date: str,
+                  *,
+                  initial_age_days: Optional[int] = None,
+                  initial_age_measured_on: Optional[str] = None
+                  ) -> Optional[int]:
+    """Age in days derived from the plant's own recorded evidence.
 
-    Returns ``None`` when no start date exists or the observation predates
-    it - callers must then treat age as "not measurable" rather than
-    guessing (a negative age is never invented).
+    Uses the exact ``date_started`` when present, otherwise a user-supplied
+    initial age observed on a known date (nursery seedlings). Returns ``None``
+    when neither is available or the observation predates the evidence -
+    callers must then treat age as "not measurable" rather than guessing.
     """
-    if not date_started:
-        return None
-    age = days_between(date_started, observation_date)
-    return age if age >= 0 else None
+    return age_days_for_plant(
+        {"date_started": date_started,
+         "initial_age_days": initial_age_days,
+         "initial_age_measured_on": initial_age_measured_on},
+        observation_date)
+
+
+def resolve_age_days(plant: dict, observation_date: str
+                     ) -> tuple[Optional[int], str]:
+    """Return ``(age_days, age_source)`` for a plant on a given date."""
+    return (age_days_for_plant(plant, observation_date),
+            age_source_for_plant(plant))
 
 
 def auto_growth_rate(previous_height_cm: Optional[float],
@@ -145,10 +159,10 @@ def record_observation(repo: BaseRepository, *, plant_id: int,
     derived: dict[str, Optional[str]] = {}
 
     if age_days is None and derive_missing:
-        age = auto_age_days(plant.get("date_started"), observation_date)
+        age, source = resolve_age_days(plant, observation_date)
         if age is not None:
             age_days = age
-            derived["age_days"] = "derived from date_started"
+            derived["age_days"] = f"derived from {source}"
 
     if growth_rate_cm_per_day is None and derive_missing:
         prev = repo.latest_observation(plant_id)
@@ -236,6 +250,8 @@ def import_camera_measurements(
     default_variety: Optional[str] = None,
     auto_register: bool = True,
     data_source: str = "real",
+    initial_age_days: Optional[int] = None,
+    initial_age_measured_on: Optional[str] = None,
 ) -> dict:
     """Import ESP32-CAM / OpenCV daily measurements into the repository."""
     from . import camera_import
@@ -246,6 +262,8 @@ def import_camera_measurements(
         default_variety=default_variety,
         auto_register=auto_register,
         data_source=data_source,
+        initial_age_days=initial_age_days,
+        initial_age_measured_on=initial_age_measured_on,
     )
 
 
@@ -410,6 +428,14 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
     # Real plants use only validated real models.
     mdl.load_selection(selection, models_dir)
 
+    history_by_plant = _accepted_plant_history(
+        repo, [plant_id], obs["observation_date"]).get(plant_id, {})
+    accepted_history = history_by_plant.get("accepted", [])
+    latest_flagged = any(
+        o.get("observation_id") == obs["observation_id"]
+        for o in history_by_plant.get("flagged", []))
+    age_source = age_source_for_plant(plant)
+
     observation = {
         "age_days": obs["age_days"],
         "height_cm": obs["height_cm"],
@@ -428,14 +454,18 @@ def predict_for_plant(repo: BaseRepository, plant_id: int, models_dir: Path,
         "plant_data_source": plant_source,
         "observation_date": obs["observation_date"],
         "observation": dict(obs),
+        "age_source": age_source,
+        "latest_reading_flagged_suspect": latest_flagged,
         "readiness_event_counts": repo.readiness_event_counts(
             species, variety, data_source="real"),
     })
     if not result.get("available") and allow_provisional_baseline:
         result = _apply_provisional_baseline(
-            result, models_dir, species, variety, observation)
+            result, models_dir, species, variety, observation,
+            history=accepted_history, age_source=age_source)
     result.setdefault("provisional", False)
     result.setdefault("method", _method_for(result))
+    result.setdefault("age_source", age_source)
     return result
 
 
@@ -477,67 +507,127 @@ def _rounded(values: Iterable[Optional[float]],
     return None if med is None else round(float(med), digits)
 
 
-def predict_species_cohort(repo: BaseRepository, species: str,
-                           variety: Optional[str] = None,
-                           models_dir: Path = Path("models"),
-                           observation_date: Optional[str] = None,
-                           allow_provisional_baseline: bool = False) -> dict:
-    """Predict readiness for a species using its latest observed cohort.
+def _cohort_age_source(repo: BaseRepository, rows: list[dict]) -> str:
+    """Honest provenance label for the cohort's age information."""
+    sources = set()
+    for plant_id in {r.get("plant_id") for r in rows}:
+        if plant_id is None:
+            continue
+        plant = repo.get_plant(plant_id)
+        if not plant:
+            continue
+        source = age_source_for_plant(plant)
+        if source != "unknown":
+            sources.add(source)
+    if not sources:
+        return "unknown"
+    if len(sources) == 1:
+        return next(iter(sources))
+    return "mixed"
 
-    The UI calls this instead of asking the user to choose an individual
-    plant. The backend selects the newest cloud/data date for the species,
-    aggregates the observations recorded on that date, and passes the
-    representative observation to the existing prediction workflow.
+
+def _accepted_plant_history(repo: BaseRepository, plant_ids: list[int],
+                            up_to: str) -> dict[int, dict]:
+    """Accepted and suspect observations per plant, up to ``up_to``.
+
+    A height more than ``HEIGHT_JUMP_SUSPECT_RATIO`` away from the trailing
+    median is flagged and excluded from the accepted series. It is never
+    deleted and remains available for human review.
     """
-    models_dir = Path(models_dir)
-    snapshot = repo.species_cohort_snapshot(
-        species, variety, observation_date)
-    rows = snapshot.get("rows", [])
+    result: dict[int, dict] = {}
+    for plant_id in plant_ids:
+        try:
+            observations = [dict(o) for o in repo.get_observations(plant_id)]
+        except Exception:
+            observations = []
+        observations = [
+            o for o in observations
+            if o.get("observation_date") and o["observation_date"] <= up_to
+        ]
+        observations.sort(key=lambda o: (o["observation_date"],
+                                         o.get("observation_id") or 0))
+        accepted: list[dict] = []
+        flagged: list[dict] = []
+        for observation in observations:
+            height = observation.get("height_cm")
+            is_camera = (
+                observation.get("calibration_source")
+                == config.CALIBRATION_SOURCE_CAMERA)
+            already_flagged = bool(observation.get("quality_flag"))
+            if already_flagged or (
+                is_camera and height is not None
+                and is_height_outlier(
+                    height, [a.get("height_cm") for a in accepted])):
+                if not observation.get("quality_note"):
+                    observation["quality_note"] = (
+                        "Height differs by more than "
+                        f"{int(config.HEIGHT_JUMP_SUSPECT_RATIO * 100)}% from "
+                        "the previous accepted height. Kept for review; "
+                        "excluded from growth rates and medians.")
+                observation["quality_flag"] = (
+                    observation.get("quality_flag")
+                    or "height_jump_suspect")
+                flagged.append(observation)
+            else:
+                accepted.append(observation)
+        result[plant_id] = {"accepted": accepted, "flagged": flagged}
+    return result
+
+
+def _cohort_context(repo: BaseRepository, species: str,
+                    variety: Optional[str],
+                    observation_date: Optional[str] = None,
+                    plant_ids: Optional[list[int]] = None) -> Optional[dict]:
+    """Aggregate one date's usable observations for a species cohort."""
+    snapshot = repo.species_cohort_snapshot(species, variety, observation_date)
+    rows = [dict(r) for r in snapshot.get("rows", [])]
     target_date = snapshot.get("observation_date")
-
-    event_counts = repo.readiness_event_counts(species, variety,
-                                                data_source="real")
-
-    species_label = f"{species}"
-    if variety:
-        species_label += f" / {variety}"
-
+    if plant_ids is not None:
+        allowed = set(plant_ids)
+        rows = [r for r in rows if r.get("plant_id") in allowed]
     if not rows or not target_date:
-        return {
-            "available": False,
-            "message": (
-                f"No real observations found for {species_label} on the "
-                "latest available date - the system is still collecting data."
-            ),
-            "species": species,
-            "variety": variety,
-            "observation_date": target_date,
-            "cohort_snapshot": {
-                "aggregation": "population_median",
-                "plants_represented": 0,
-                "row_count": 0,
-                "observation_date": target_date,
-            },
-            "readiness_event_counts": event_counts,
-            "provisional": False,
-            "method": config.METHOD_UNAVAILABLE,
-        }
+        return None
 
-    heights = [r.get("height_cm") for r in rows]
-    ages = [r.get("age_days") for r in rows]
-    rates = [r.get("growth_rate_cm_per_day") for r in rows]
-    canopy = [r.get("canopy_width_cm") for r in rows]
+    cohort_plant_ids = sorted({r["plant_id"] for r in rows
+                               if r.get("plant_id") is not None})
+    history_by_plant = _accepted_plant_history(
+        repo, cohort_plant_ids, target_date)
+    accepted_ids = {
+        o.get("observation_id")
+        for group in history_by_plant.values()
+        for o in group["accepted"]
+    }
+    flagged_ids = {
+        o.get("observation_id")
+        for group in history_by_plant.values()
+        for o in group["flagged"]
+    }
+    usable_rows = [r for r in rows if r.get("observation_id") in accepted_ids]
+    suspect_rows_excluded = sum(
+        1 for r in rows if r.get("observation_id") in flagged_ids)
+
+    history = [o for group in history_by_plant.values()
+               for o in group["accepted"]]
+    history_dates = sorted({o["observation_date"] for o in history})
+
+    heights = [r.get("height_cm") for r in usable_rows]
+    ages = [r.get("age_days") for r in usable_rows]
+    rates = [r.get("growth_rate_cm_per_day") for r in usable_rows]
+    canopy = [r.get("canopy_width_cm") for r in usable_rows]
     stem = [
-        r.get("stem_width_cm") for r in rows
+        r.get("stem_width_cm") for r in usable_rows
         if r.get("stem_width_cm") is not None
         and float(r["stem_width_cm"]) > 0
     ]
-    leaves = [r.get("visible_true_leaf_count") for r in rows]
+    leaves = [r.get("visible_true_leaf_count") for r in usable_rows]
+    age_source = _cohort_age_source(repo, rows)
 
     cohort_snapshot = {
         "aggregation": "population_median",
-        "plants_represented": snapshot.get("plants_represented", 0),
-        "row_count": snapshot.get("row_count", len(rows)),
+        "plants_represented": len({r["plant_id"] for r in usable_rows}),
+        "row_count": len(usable_rows),
+        "rows_total": len(rows),
+        "suspect_rows_excluded": suspect_rows_excluded,
         "observation_date": target_date,
         "median_height_cm": _rounded(heights),
         "min_height_cm": round(
@@ -553,6 +643,7 @@ def predict_species_cohort(repo: BaseRepository, species: str,
         "median_visible_true_leaf_count": _median_int(leaves),
         "missing_height_count": sum(1 for h in heights if h is None),
         "missing_age_count": sum(1 for a in ages if a is None),
+        "age_source": age_source,
     }
 
     representative_observation = {
@@ -567,25 +658,213 @@ def predict_species_cohort(repo: BaseRepository, species: str,
         "observation_date": target_date,
     }
 
-    result = predict_ad_hoc(
-        species, variety, representative_observation, models_dir)
-
-    result.update({
+    return {
         "species": species,
         "variety": variety,
-        "observation_date": target_date,
-        "prediction_scope": "species_cohort",
+        "target_date": target_date,
+        "rows": rows,
+        "usable_rows": usable_rows,
+        "plant_ids": cohort_plant_ids,
         "cohort_snapshot": cohort_snapshot,
-        "readiness_event_counts": event_counts,
+        "representative_observation": representative_observation,
+        "history": history,
+        "history_dates": history_dates,
+        "age_source": age_source,
+        "suspect_rows_excluded": suspect_rows_excluded,
+    }
+
+
+def _estimate_context(context: dict, models_dir: Path,
+                      allow_provisional_baseline: bool) -> dict:
+    """Model prediction (or provisional fallback) for one cohort context."""
+    result = predict_ad_hoc(
+        context["species"], context["variety"],
+        context["representative_observation"], models_dir)
+    result.update({
+        "species": context["species"],
+        "variety": context["variety"],
+        "observation_date": context["target_date"],
+        "prediction_scope": "species_cohort",
+        "cohort_snapshot": context["cohort_snapshot"],
     })
     if not result.get("available") and allow_provisional_baseline:
         result = _apply_provisional_baseline(
-            result, Path(models_dir), species, variety,
-            representative_observation)
-        # keep the species context that _apply preserves via **result
+            result, models_dir, context["species"], context["variety"],
+            context["representative_observation"],
+            history=context["history"],
+            age_source=context["age_source"])
         result["prediction_scope"] = "species_cohort"
     result.setdefault("provisional", False)
     result.setdefault("method", _method_for(result))
+    result.setdefault("age_source", context["age_source"])
+    return result
+
+
+def _apply_date_stability(repo: BaseRepository, context: dict, result: dict,
+                          models_dir: Path,
+                          allow_provisional_baseline: bool) -> dict:
+    """Never move readiness later while the plant is still growing.
+
+    Compares with the previous usable observation date. A later date is only
+    allowed when the median height did not increase (a genuine stall or
+    regression). A 1% dead-band keeps measurement noise from counting as
+    growth.
+    """
+    result.setdefault("date_capped_to_previous", False)
+    result.setdefault("date_stability", None)
+    result.setdefault("previous_predicted_readiness_date", None)
+    result.setdefault("stability_note", None)
+
+    # The no-later rule applies to provisional estimates. A validated model
+    # has its own uncertainty handling and is never silently overridden.
+    if not result.get("provisional"):
+        return result
+
+    current_prediction = result.get("predicted_readiness_date")
+    previous_dates = [d for d in context["history_dates"]
+                      if d < context["target_date"]]
+    if not current_prediction or not previous_dates:
+        return result
+    previous_date = previous_dates[-1]
+    previous_context = _cohort_context(
+        repo, context["species"], context["variety"],
+        observation_date=previous_date, plant_ids=context["plant_ids"])
+    if not previous_context or not previous_context["usable_rows"]:
+        return result
+
+    previous_result = _estimate_context(
+        previous_context, models_dir, allow_provisional_baseline)
+    previous_prediction = previous_result.get("predicted_readiness_date")
+    if not previous_prediction:
+        return result
+
+    current_height = context["cohort_snapshot"].get("median_height_cm")
+    previous_height = previous_context["cohort_snapshot"].get(
+        "median_height_cm")
+    growing = (current_height is not None and previous_height is not None
+               and float(current_height) > float(previous_height) * 1.01)
+    growth = None
+    if current_height is not None and previous_height is not None:
+        growth = round(float(current_height) - float(previous_height), 4)
+
+    result["previous_observation_date"] = previous_date
+    result["previous_predicted_readiness_date"] = previous_prediction
+    result["previous_median_height_cm"] = previous_height
+    result["growth_since_previous_cm"] = growth
+    result["plant_grew_since_previous"] = growing
+    result["previous_method"] = previous_result.get("method")
+    result["previous_estimate_basis"] = previous_result.get("estimate_basis")
+
+    current_basis = result.get("estimate_basis")
+    previous_basis = previous_result.get("estimate_basis")
+    if (current_basis and previous_basis
+            and current_basis != previous_basis):
+        result["date_stability"] = "method_changed"
+        result["stability_note"] = (
+            "The estimate basis changed from "
+            f"'{previous_basis}' to '{current_basis}' as more evidence became "
+            "available. The date is re-anchored to the new evidence; later "
+            "movement will be held while the plant keeps growing.")
+        return result
+
+    if growing and current_prediction > previous_prediction:
+        held_days = max(0, days_between(context["target_date"],
+                                        previous_prediction))
+        result["predicted_readiness_date"] = previous_prediction
+        result["days_remaining"] = held_days
+        result["date_capped_to_previous"] = True
+        result["date_stability"] = "held_while_growing"
+        result["stability_note"] = (
+            "The plant grew since the previous reading, so the readiness "
+            "date was held at the previous estimate instead of moving later.")
+    elif not growing and current_prediction > previous_prediction:
+        result["date_stability"] = "later_after_stall"
+        result["stability_note"] = (
+            "Height did not increase since the previous reading; a later "
+            "date is allowed because the evidence indicates a stall.")
+    else:
+        result["date_stability"] = "stable"
+    return result
+
+
+def predict_species_cohort(repo: BaseRepository, species: str,
+                           variety: Optional[str] = None,
+                           models_dir: Path = Path("models"),
+                           observation_date: Optional[str] = None,
+                           allow_provisional_baseline: bool = False) -> dict:
+    """Predict readiness for a species using its latest observed cohort.
+
+    The UI calls this instead of asking the user to choose an individual
+    plant. The backend selects the newest cloud/data date for the species,
+    aggregates the observations recorded on that date, and passes the
+    representative observation to the existing prediction workflow.
+    """
+    models_dir = Path(models_dir)
+    context = _cohort_context(repo, species, variety, observation_date)
+
+    event_counts = repo.readiness_event_counts(species, variety,
+                                                data_source="real")
+
+    species_label = f"{species}"
+    if variety:
+        species_label += f" / {variety}"
+
+    if context is None:
+        return {
+            "available": False,
+            "message": (
+                f"No real observations found for {species_label} on the "
+                "latest available date - the system is still collecting data."
+            ),
+            "species": species,
+            "variety": variety,
+            "observation_date": None,
+            "cohort_snapshot": {
+                "aggregation": "population_median",
+                "plants_represented": 0,
+                "row_count": 0,
+                "observation_date": None,
+            },
+            "readiness_event_counts": event_counts,
+            "provisional": False,
+            "method": config.METHOD_UNAVAILABLE,
+        }
+
+    if not context["usable_rows"]:
+        return {
+            "available": False,
+            "message": (
+                f"The latest {species_label} reading "
+                f"({context['target_date']}) was flagged as a suspect height "
+                "jump (>50% from the previous accepted height). It is kept for review "
+                "but excluded from prediction; record a verified reading or "
+                "wait for the next measurement."
+            ),
+            "species": species,
+            "variety": variety,
+            "observation_date": context["target_date"],
+            "cohort_snapshot": context["cohort_snapshot"],
+            "readiness_event_counts": event_counts,
+            "suspect_rows_excluded": context["suspect_rows_excluded"],
+            "age_source": context["age_source"],
+            "provisional": False,
+            "method": config.METHOD_UNAVAILABLE,
+        }
+
+    result = _estimate_context(
+        context, models_dir, allow_provisional_baseline)
+    result.update({
+        "species": species,
+        "variety": variety,
+        "observation_date": context["target_date"],
+        "prediction_scope": "species_cohort",
+        "cohort_snapshot": context["cohort_snapshot"],
+        "readiness_event_counts": event_counts,
+        "suspect_rows_excluded": context["suspect_rows_excluded"],
+        "age_source": context["age_source"],
+    })
+    result = _apply_date_stability(
+        repo, context, result, models_dir, allow_provisional_baseline)
     # How many staged OpenCV readings still await human review for this
     # species. They were deliberately NOT folded into the prediction above.
     try:
@@ -619,15 +898,38 @@ def list_pending_captures(repo: BaseRepository, *, species=None, variety=None,
             and float(c["stem_width_cm"]) > 0
         ]
         leaves = [c.get("visible_true_leaf_count") for c in valid]
+        proposed_height = _median_num(heights)
+        trailing: list[float] = []
+        try:
+            prior = [
+                o for o in repo.get_observations(g["plant_id"])
+                if o.get("observation_date")
+                and o["observation_date"] < g["observation_date"]
+                and o.get("height_cm") is not None
+            ]
+            prior.sort(key=lambda o: o["observation_date"])
+            trailing = [float(o["height_cm"]) for o in prior[-3:]]
+        except Exception:
+            trailing = []
+        suspect = is_height_outlier(proposed_height, trailing)
         g["proposed"] = {
-            "median_height_cm": _rounded(heights) if False else _median_num(heights),
+            "median_height_cm": proposed_height,
             "median_stem_width_cm": _median_num(stems),
             "median_visible_true_leaf_count": _median_int(leaves),
             "n_valid": len(valid),
             "n_total": len(g["captures"]),
+            "suspect": suspect,
+            "suspect_note": (
+                "Proposed height differs by more than "
+                f"{int(config.HEIGHT_JUMP_SUSPECT_RATIO * 100)}% from the "
+                "previous accepted height. Accepting stores it flagged; it will be "
+                "excluded from growth rates and medians." if suspect else None),
         }
         for c in g["captures"]:
             c["image_url"] = c.get("image_url") or _capture_image_url(c.get("public_id"))
+            c["quality_flag"] = (
+                "height_jump_suspect"
+                if is_height_outlier(c.get("height_cm"), trailing) else None)
     return groups
 
 
@@ -750,9 +1052,40 @@ def _coerce_level(value) -> Optional[int]:
         return None
 
 
+def _choose_provisional_estimate(baseline: dict, observation: dict,
+                                 history: Optional[list[dict]]) -> dict:
+    """Pick trajectory (no age) or historical timing, with honest fallbacks."""
+    history = history or []
+    growth_history_n = len({p.get("observation_date") for p in history
+                            if p.get("observation_date")})
+    trajectory = None
+    if observation.get("age_days") is None:
+        trajectory = ref.trajectory_estimate(baseline, observation, history)
+        if trajectory.get("available"):
+            return trajectory
+    timing = ref.provisional_estimate(
+        baseline, observation, growth_history_n=growth_history_n)
+    if timing.get("available"):
+        if trajectory is not None and not trajectory.get("available"):
+            timing["trajectory_note"] = trajectory.get("message")
+        return timing
+    if trajectory is None:
+        trajectory = ref.trajectory_estimate(baseline, observation, history)
+    if trajectory.get("available"):
+        return trajectory
+    # Neither worked: prefer the timing message when it is specific, otherwise
+    # surface the trajectory explanation.
+    if timing.get("message"):
+        timing["trajectory_note"] = trajectory.get("message")
+        return timing
+    return trajectory
+
+
 def _apply_provisional_baseline(result: dict, models_dir: Path, species: str,
                                 variety: Optional[str],
-                                observation: Optional[dict]) -> dict:
+                                observation: Optional[dict],
+                                history: Optional[list[dict]] = None,
+                                age_source: Optional[str] = None) -> dict:
     """Replace an unavailable result with a provisional baseline estimate.
 
     Only called when the model-based prediction was unavailable, so a working
@@ -760,34 +1093,39 @@ def _apply_provisional_baseline(result: dict, models_dir: Path, species: str,
     provisional and the reference transplant date is flagged as an assumption.
     """
     baseline = ref.load_baseline(Path(models_dir), species, variety)
-    estimate = ref.provisional_estimate(baseline, observation or {})
+    estimate = _choose_provisional_estimate(
+        baseline, observation or {}, history)
     merged = dict(result)
     if not estimate.get("available"):
         merged["provisional"] = False
         merged["baseline_available"] = bool(baseline)
         merged["baseline_note"] = estimate.get("message")
+        merged["trajectory_note"] = estimate.get("trajectory_note")
         return merged
+    passthrough = (
+        "days_remaining", "days_remaining_raw",
+        "days_remaining_uncertainty_days", "predicted_readiness_date",
+        "reference_basis", "reference_group", "n_independent_plants",
+        "reference_transplant_is_assumption", "insufficient_growth_history",
+        "history_note", "baseline_version", "estimate_basis",
+        "target_height_cm", "current_height_cm", "remaining_growth_cm",
+        "robust_growth_rate_cm_per_day", "n_history_readings",
+        "history_span_days", "history_first_date", "history_last_date",
+        "horizon_capped", "cohort_growth_rate_cm_per_day",
+        "plant_growth_rate_cm_per_day", "growth_rate_adjustment_factor",
+        "growth_rate_adjustment_applied", "growth_rate_adjustment_reason",
+        "trajectory_note",
+    )
+    merged.update({key: estimate.get(key) for key in passthrough})
     merged.update({
         "available": True,
         "method": config.METHOD_REFERENCE_BASELINE,
         "provisional": True,
         "data_source": "real",
-        "days_remaining": estimate.get("days_remaining"),
-        "predicted_readiness_date": estimate.get("predicted_readiness_date"),
-        "days_remaining_uncertainty_days":
-            estimate.get("days_remaining_uncertainty_days"),
-        "reference_basis": estimate.get("reference_basis"),
-        "reference_group": estimate.get("reference_group"),
-        "n_independent_plants": estimate.get("n_independent_plants"),
-        "reference_transplant_is_assumption":
-            estimate.get("reference_transplant_is_assumption"),
-        "insufficient_growth_history":
-            estimate.get("insufficient_growth_history"),
-        "history_note": estimate.get("history_note"),
-        "baseline_version": estimate.get("baseline_version"),
         "message": (estimate.get("message")
                     or config.PROVISIONAL_BASELINE_MESSAGE),
         "limitations": estimate.get("limitations", []),
+        "age_source": age_source,
     })
     return merged
 

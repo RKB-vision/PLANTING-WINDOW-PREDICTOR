@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import statistics
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable, Optional
@@ -54,6 +55,12 @@ CREATE TABLE IF NOT EXISTS plants (
     species         TEXT    NOT NULL,
     variety         TEXT,
     date_started    TEXT,                       -- ISO date, nullable
+    -- Nursery/seedling case: the age (days) the plant already had when the
+    -- user started measuring it, plus the date that age was observed. Used
+    -- only when no exact date_started is known.
+    initial_age_days INTEGER
+                     CHECK (initial_age_days IS NULL OR initial_age_days >= 0),
+    initial_age_measured_on TEXT,               -- ISO date, nullable
     data_source     TEXT    NOT NULL CHECK (data_source IN ('real', 'synthetic')),
     growing_conditions TEXT,                    -- free text / JSON, nullable
     external_ref    TEXT,                       -- source-system id (e.g. CSV Plant_ID)
@@ -85,6 +92,10 @@ CREATE TABLE IF NOT EXISTS observations (
     calibration_source   TEXT,
     calibration_verified INTEGER CHECK (calibration_verified IS NULL
                                         OR calibration_verified IN (0, 1)),
+    -- Data-quality flag (e.g. 'height_jump_suspect'). A flagged reading is
+    -- kept and shown, but excluded from growth rates and medians.
+    quality_flag         TEXT,
+    quality_note         TEXT,
     data_source          TEXT    NOT NULL CHECK (data_source IN ('real', 'synthetic')),
     recorded_at          TEXT    NOT NULL DEFAULT (datetime('now')),
     -- duplicate protection: one observation per plant per date
@@ -346,6 +357,73 @@ def days_between(from_date: str | date, to_date: str | date) -> int:
             - parse_iso_date(from_date, "from_date")).days
 
 
+def age_days_for_plant(plant: dict, observation_date: str | date) -> Optional[int]:
+    """Age of a plant on ``observation_date`` using only recorded evidence.
+
+    Two honest sources exist:
+
+    * ``date_started`` - the exact day the plant/seed began growing;
+    * ``initial_age_days`` + ``initial_age_measured_on`` - a user-supplied
+      estimate for a nursery seedling ("about 21 days old on 2026-10-29").
+
+    An exact start date wins. Missing information returns ``None``; age is
+    never guessed from height or from the observation date itself.
+    """
+    start = plant.get("date_started")
+    if start:
+        age = days_between(start, observation_date)
+        return age if age >= 0 else None
+
+    initial = plant.get("initial_age_days")
+    measured_on = plant.get("initial_age_measured_on")
+    if initial is None or not measured_on:
+        return None
+    try:
+        elapsed = days_between(measured_on, observation_date)
+    except ValidationError:
+        return None
+    if elapsed < 0:
+        return None
+    return int(initial) + elapsed
+
+
+def age_source_for_plant(plant: dict) -> str:
+    """Where the plant's age comes from (for honest UI labelling)."""
+    if plant.get("date_started"):
+        return "planted_on"
+    if plant.get("initial_age_days") is not None:
+        return "user_estimated_initial_age"
+    return "unknown"
+
+
+def is_height_outlier(height: float | None,
+                      trailing_heights: Iterable[float | None],
+                      ratio: float | None = None) -> bool:
+    """True when a height jumps far from the previous accepted height.
+
+    The reference is the most recent accepted height. A reading is suspected
+    only when it differs from that value by more than ``ratio`` (default
+    ``HEIGHT_JUMP_SUSPECT_RATIO``, i.e. 50%). The reading is not deleted:
+    callers exclude it from rates/medians but keep it visible.
+    """
+    if height is None:
+        return False
+    try:
+        value = float(height)
+    except (TypeError, ValueError):
+        return False
+    window = [float(h) for h in trailing_heights
+              if h is not None and float(h) > 0]
+    if not window:
+        return False
+    reference = window[-1]
+    if reference <= 0:
+        return False
+    threshold = (config.HEIGHT_JUMP_SUSPECT_RATIO
+                 if ratio is None else float(ratio))
+    return abs(value - reference) / reference > threshold
+
+
 def connect(db_path: str | Path | None = None) -> sqlite3.Connection:
     """Open (and create if needed) the prototype database."""
     path = Path(db_path) if db_path else config.DEFAULT_DB_PATH
@@ -392,6 +470,8 @@ def _migrate_plants_unique_constraint(conn: sqlite3.Connection) -> None:
                 species         TEXT    NOT NULL,
                 variety         TEXT,
                 date_started    TEXT,
+                initial_age_days INTEGER,
+                initial_age_measured_on TEXT,
                 data_source     TEXT    NOT NULL
                     CHECK (data_source IN ('real', 'synthetic')),
                 growing_conditions TEXT,
@@ -403,9 +483,11 @@ def _migrate_plants_unique_constraint(conn: sqlite3.Connection) -> None:
         )
         conn.execute(
             """INSERT INTO plants_new
-               (plant_id, species, variety, date_started, data_source,
+               (plant_id, species, variety, date_started,
+                initial_age_days, initial_age_measured_on, data_source,
                 growing_conditions, external_ref, cohort, created_at)
-               SELECT plant_id, species, variety, date_started, data_source,
+               SELECT plant_id, species, variety, date_started,
+                      initial_age_days, initial_age_measured_on, data_source,
                       growing_conditions, external_ref, cohort, created_at
                FROM plants"""
         )
@@ -435,6 +517,12 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(plants)")}
     if "cohort" not in cols:
         conn.execute("ALTER TABLE plants ADD COLUMN cohort TEXT")
+    # Nursery/seedling age: the age the plant already had when measurement
+    # began. Nullable; existing rows simply have no age information.
+    if "initial_age_days" not in cols:
+        conn.execute("ALTER TABLE plants ADD COLUMN initial_age_days INTEGER")
+    if "initial_age_measured_on" not in cols:
+        conn.execute("ALTER TABLE plants ADD COLUMN initial_age_measured_on TEXT")
     obs_cols = {r["name"] for r in conn.execute("PRAGMA table_info(observations)")}
     if "stem_width_cm" not in obs_cols:
         conn.execute(
@@ -457,6 +545,10 @@ def init_db(db_path: str | Path | None = None) -> sqlite3.Connection:
     if "calibration_verified" not in obs_cols:
         conn.execute(
             "ALTER TABLE observations ADD COLUMN calibration_verified INTEGER")
+    if "quality_flag" not in obs_cols:
+        conn.execute("ALTER TABLE observations ADD COLUMN quality_flag TEXT")
+    if "quality_note" not in obs_cols:
+        conn.execute("ALTER TABLE observations ADD COLUMN quality_note TEXT")
     # One-time provenance tagging for rows that predate the calibration
     # columns. A row with no rod length and no recorded source is a
     # human-recorded dataset row (not a camera capture). Reference-cohort
@@ -544,8 +636,16 @@ def register_plant(conn: sqlite3.Connection,
                    data_source: str = "real",
                    growing_conditions: Optional[str] = None,
                    external_ref: Optional[str] = None,
-                   cohort: Optional[str] = None) -> int:
-    """Register a plant. Returns the new ``plant_id``."""
+                   cohort: Optional[str] = None,
+                   initial_age_days: Optional[int] = None,
+                   initial_age_measured_on: Optional[str] = None) -> int:
+    """Register a plant. Returns the new ``plant_id``.
+
+    ``date_started`` and ``initial_age_days`` are alternative ways to record
+    age: an exact start date, or "how old was it when measurement began" for
+    a nursery seedling. They are mutually exclusive so the age is never
+    ambiguous.
+    """
     species = (species or "").strip()
     if not species:
         raise ValidationError("species is required.")
@@ -555,6 +655,26 @@ def register_plant(conn: sqlite3.Connection,
         )
     if date_started:
         parse_iso_date(date_started, "date_started")
+    if initial_age_days is not None:
+        try:
+            initial_age_days = int(initial_age_days)
+        except (TypeError, ValueError) as exc:
+            raise ValidationError("initial_age_days must be an integer.") from exc
+        if initial_age_days < 0:
+            raise ValidationError("initial_age_days must be >= 0.")
+        if date_started:
+            raise ValidationError(
+                "Use either date_started or initial_age_days, not both."
+            )
+        if initial_age_measured_on:
+            initial_age_measured_on = parse_iso_date(
+                initial_age_measured_on, "initial_age_measured_on").isoformat()
+        else:
+            initial_age_measured_on = date.today().isoformat()
+    elif initial_age_measured_on:
+        raise ValidationError(
+            "initial_age_measured_on requires initial_age_days."
+        )
     variety_norm = variety.strip() if variety else None
 
     # NULL-aware duplicate check: SQLite UNIQUE constraints treat NULLs as
@@ -579,10 +699,12 @@ def register_plant(conn: sqlite3.Connection,
         cur = conn.execute(
             """INSERT INTO plants
                (species, variety, date_started, data_source,
-                growing_conditions, external_ref, cohort)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                growing_conditions, external_ref, cohort,
+                initial_age_days, initial_age_measured_on)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (species, variety_norm, date_started, data_source,
-             growing_conditions, external_ref, cohort),
+             growing_conditions, external_ref, cohort,
+             initial_age_days, initial_age_measured_on),
         )
     except sqlite3.IntegrityError as exc:
         conn.rollback()
@@ -669,13 +791,16 @@ def add_observation(conn: sqlite3.Connection,
         # refuse to *derive* one that was not measured.
         growth_rate_cm_per_day = float(growth_rate_cm_per_day)
 
-    # derive age if not given but the plant has a start date
-    if age_days is None and plant["date_started"]:
-        age_days = days_between(plant["date_started"], obs_date)
-        if age_days < 0:
-            raise ValidationError(
-                "observation_date is before the plant's date_started."
-            )
+    # Derive age from an exact planting date or a user-supplied nursery age.
+    if age_days is None:
+        if plant["date_started"]:
+            age_days = days_between(plant["date_started"], obs_date)
+            if age_days < 0:
+                raise ValidationError(
+                    "observation_date is before the plant's date_started."
+                )
+        else:
+            age_days = age_days_for_plant(dict(plant), obs_date)
 
     if rod_length_cm is not None and float(rod_length_cm) <= 0:
         raise ValidationError("rod_length_cm must be > 0 when provided.")
@@ -1140,6 +1265,8 @@ def upsert_daily_observation(conn: sqlite3.Connection, *,
                              rod_length_cm: Optional[float] = None,
                              calibration_source: Optional[str] = None,
                              calibration_verified: Optional[bool] = None,
+                             quality_flag: Optional[str] = None,
+                             quality_note: Optional[str] = None,
                              data_source: Optional[str] = None,
                              reason: Optional[str] = None) -> dict:
     """Insert *or recompute* the single daily observation for (plant, date).
@@ -1171,13 +1298,16 @@ def upsert_daily_observation(conn: sqlite3.Connection, *,
     if growth_rate_cm_per_day is not None:
         growth_rate_cm_per_day = float(growth_rate_cm_per_day)
 
-    # Derive age only from a real planting date; never from height.
-    if age_days is None and plant["date_started"]:
-        derived = days_between(plant["date_started"], obs_date)
-        if derived < 0:
-            raise ValidationError(
-                "observation_date is before the plant's date_started.")
-        age_days = derived
+    # Derive age from recorded evidence; never from height.
+    if age_days is None:
+        if plant["date_started"]:
+            derived = days_between(plant["date_started"], obs_date)
+            if derived < 0:
+                raise ValidationError(
+                    "observation_date is before the plant's date_started.")
+            age_days = derived
+        else:
+            age_days = age_days_for_plant(dict(plant), obs_date)
 
     desired = {
         "age_days": age_days,
@@ -1190,6 +1320,8 @@ def upsert_daily_observation(conn: sqlite3.Connection, *,
         "calibration_source": calibration_source,
         "calibration_verified": (None if calibration_verified is None
                                  else (1 if calibration_verified else 0)),
+        "quality_flag": quality_flag,
+        "quality_note": quality_note,
     }
 
     existing = conn.execute(
@@ -1202,12 +1334,14 @@ def upsert_daily_observation(conn: sqlite3.Connection, *,
                (plant_id, observation_date, age_days, height_cm,
                 growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
                 visible_true_leaf_count, data_source, rod_length_cm,
-                calibration_source, calibration_verified)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                calibration_source, calibration_verified,
+                quality_flag, quality_note)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (plant_id, obs_date.isoformat(), age_days, height_cm,
              growth_rate_cm_per_day, canopy_width_cm, stem_width_cm,
              visible_true_leaf_count, source, rod_length_cm,
-             calibration_source, desired["calibration_verified"]),
+             calibration_source, desired["calibration_verified"],
+             quality_flag, quality_note),
         )
         observation_id = int(cur.lastrowid)
         record_observation_revision(
@@ -1232,11 +1366,13 @@ def upsert_daily_observation(conn: sqlite3.Connection, *,
         """UPDATE observations
            SET age_days = ?, height_cm = ?, growth_rate_cm_per_day = ?,
                canopy_width_cm = ?, stem_width_cm = ?, visible_true_leaf_count = ?,
-               rod_length_cm = ?, calibration_source = ?, calibration_verified = ?
+               rod_length_cm = ?, calibration_source = ?, calibration_verified = ?,
+               quality_flag = ?, quality_note = ?
            WHERE observation_id = ?""",
         (age_days, height_cm, growth_rate_cm_per_day, canopy_width_cm,
          stem_width_cm, visible_true_leaf_count, rod_length_cm,
          calibration_source, desired["calibration_verified"],
+         quality_flag, quality_note,
          int(existing["observation_id"])),
     )
     record_observation_revision(

@@ -17,6 +17,8 @@ Every command that touches synthetic data prints a SYNTHETIC DEMO banner.
 Examples
 --------
     python plant_feedback.py register --species "Super Orange" --variety Early
+    python plant_feedback.py register --species "Rose (Red)" --ref Plant0x \
+        --age-days 21
     python plant_feedback.py observe --plant 1 --height 4.2 --growth-rate 0.3
     python plant_feedback.py predict --plant 1
     python plant_feedback.py transplant --plant 1 --date 2083-05-20 \
@@ -92,18 +94,40 @@ def _print_reminders(conn, as_of: date | None = None) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _check_age_args(args) -> bool:
+    """--as-of only makes sense together with --age-days."""
+    if getattr(args, "as_of", None) and getattr(args, "age_days", None) is None:
+        print("ERROR: --as-of requires --age-days.", file=sys.stderr)
+        return False
+    if getattr(args, "age_days", None) is not None and args.age_days < 0:
+        print("ERROR: --age-days must be >= 0.", file=sys.stderr)
+        return False
+    return True
+
+
 def cmd_register(conn, args) -> int:
+    if not _check_age_args(args):
+        return 2
     repo = SQLiteRepository(conn)
     pid = svc.register_plant(
         repo, species=args.species, variety=args.variety,
         date_started=args.date_started,
+        initial_age_days=args.age_days,
+        initial_age_measured_on=args.as_of,
         data_source=args.source,
         growing_conditions=args.conditions,
         external_ref=args.ref)
     _banner(conn, pid)
+    plant = dbm.get_plant(conn, pid)
+    age_bits = ""
+    if plant and plant["date_started"]:
+        age_bits = f", planted_on={plant['date_started']}"
+    elif plant and plant["initial_age_days"] is not None:
+        age_bits = (f", initial_age={plant['initial_age_days']}d "
+                    f"on {plant['initial_age_measured_on']} (user-provided)")
     print(f"Registered plant #{pid}: {args.species}"
           f"{' / ' + args.variety if args.variety else ''} "
-          f"(data_source={args.source})")
+          f"(data_source={args.source}{age_bits})")
     return 0
 
 
@@ -139,6 +163,8 @@ def cmd_readiness(conn, args) -> int:
 
 
 def cmd_import_camera(conn, args) -> int:
+    if not _check_age_args(args):
+        return 2
     repo = SQLiteRepository(conn)
     csv_path = Path(args.csv)
     print(f"Importing camera measurements from {csv_path} ...")
@@ -148,6 +174,8 @@ def cmd_import_camera(conn, args) -> int:
         default_species=args.species,
         default_variety=args.variety,
         auto_register=not args.no_auto_register,
+        initial_age_days=args.age_days,
+        initial_age_measured_on=args.as_of,
     )
     print("Camera measurement import complete:")
     print(f"  Rows read            : {report['rows_read']}")
@@ -366,9 +394,16 @@ def cmd_list(conn, args) -> int:
         return 0
     for r in rows:
         src = (" [SYNTHETIC DEMO]" if r["data_source"] == "synthetic" else "")
+        if r["date_started"]:
+            age_bits = f"started={r['date_started']}"
+        elif r["initial_age_days"] is not None:
+            age_bits = (f"age={r['initial_age_days']}d on "
+                        f"{r['initial_age_measured_on']} (user-provided)")
+        else:
+            age_bits = "age=unknown"
         print(f"#{r['plant_id']:>3}  {r['species']}"
               f"{'/' + r['variety'] if r['variety'] else ''}  "
-              f"started={r['date_started']}  "
+              f"{age_bits}  "
               f"source={r['data_source']}{src}")
     return 0
 
@@ -397,6 +432,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--species", required=True)
     p.add_argument("--variety")
     p.add_argument("--date-started")
+    p.add_argument("--age-days", type=int, metavar="N",
+                   help="current age in days (seed = 0, nursery seedling = N); "
+                        "alternative to --date-started")
+    p.add_argument("--as-of", metavar="YYYY-MM-DD",
+                   help="date the age was observed (default: today)")
     p.add_argument("--source", default="real",
                    choices=list(config.VALID_SOURCES))
     p.add_argument("--conditions", help="growing conditions (free text)")
@@ -501,6 +541,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--variety", help="default variety if plant must be registered")
     p.add_argument("--no-auto-register", action="store_true",
                    help="do not register unknown plants automatically")
+    p.add_argument("--age-days", type=int, metavar="N",
+                   help="age in days of auto-registered plants at their first reading")
+    p.add_argument("--as-of", metavar="YYYY-MM-DD",
+                   help="date the age was observed (default: first reading date)")
     p.set_defaults(func=cmd_import_camera)
 
     return parser

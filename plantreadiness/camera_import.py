@@ -151,16 +151,41 @@ def _previous_observation(repo: BaseRepository, plant_id: int,
     """Latest stored daily observation strictly *before* ``obs_date``.
 
     Using the previous *daily* record (not the previous image) is what keeps
-    four images of one day from being treated as four days of growth.
+    four images of one day from being treated as four days of growth. Rows
+    flagged as suspect are skipped so one bad camera day does not poison the
+    next growth rate.
     """
-    previous: Optional[dict] = None
-    for row in repo.get_observations(plant_id):
-        day = str(row.get("observation_date") or "")
-        if not day or day >= obs_date:
+    rows = sorted(
+        (row for row in repo.get_observations(plant_id)
+         if row.get("observation_date")
+         and str(row["observation_date"]) < obs_date),
+        key=lambda row: str(row["observation_date"]))
+    accepted: list[dict] = []
+    for row in rows:
+        height = row.get("height_cm")
+        is_suspect = bool(row.get("quality_flag"))
+        if (not is_suspect
+                and row.get("calibration_source")
+                == config.CALIBRATION_SOURCE_CAMERA
+                and height is not None):
+            is_suspect = dbm.is_height_outlier(
+                height, [a.get("height_cm") for a in accepted])
+        if is_suspect:
             continue
-        if previous is None or day > str(previous.get("observation_date")):
-            previous = row
-    return previous
+        accepted.append(row)
+    return accepted[-1] if accepted else None
+
+
+def _trailing_heights(repo: BaseRepository, plant_id: int,
+                      obs_date: str, limit: int = 3) -> list[float]:
+    """Heights of the most recent prior observations (for the outlier check)."""
+    rows = sorted(
+        (row for row in repo.get_observations(plant_id)
+         if row.get("observation_date")
+         and str(row["observation_date"]) < obs_date
+         and row.get("height_cm") is not None),
+        key=lambda row: str(row["observation_date"]))
+    return [float(row["height_cm"]) for row in rows[-limit:]]
 
 
 def import_camera_measurements(
@@ -172,6 +197,8 @@ def import_camera_measurements(
     auto_register: bool = True,
     data_source: str = "real",
     stage_only: bool = False,
+    initial_age_days: Optional[int] = None,
+    initial_age_measured_on: Optional[str] = None,
 ) -> dict:
     """Import measurements from an ESP32-CAM output CSV into the repository.
 
@@ -409,6 +436,10 @@ def import_camera_measurements(
                         variety=default_variety,
                         external_ref=raw_id,
                         data_source=data_source,
+                        initial_age_days=initial_age_days,
+                        initial_age_measured_on=(
+                            (initial_age_measured_on or obs_date_iso)
+                            if initial_age_days is not None else None),
                     )
                     target_plant = repo.get_plant(new_id)
                     if target_plant:
@@ -528,19 +559,24 @@ def import_camera_measurements(
             # 3. Age (only from a real planting date) and growth rate (only from
             #    a previous DAILY record, using real elapsed days).
             # ------------------------------------------------------------------
-            age_days = None
-            if target_plant.get("date_started"):
-                try:
-                    delta = dbm.days_between(
-                        target_plant["date_started"], obs_date_iso)
-                    if delta >= 0:
-                        age_days = delta
-                except Exception:
-                    pass
+            age_days = dbm.age_days_for_plant(target_plant, obs_date_iso)
+
+            # A >50% jump from the previous accepted height is stored but flagged:
+            # visible for review, excluded from growth rates and medians.
+            suspect = dbm.is_height_outlier(
+                height, _trailing_heights(repo, plant_id, obs_date_iso))
+            quality_flag = "height_jump_suspect" if suspect else None
+            quality_note = (
+                "Height differs by more than "
+                f"{int(config.HEIGHT_JUMP_SUSPECT_RATIO * 100)}% from the "
+                "previous accepted height. Kept for review; excluded from "
+                "growth rates and medians." if suspect else None)
+            if suspect:
+                report["suspect_records"] = report.get("suspect_records", 0) + 1
 
             growth_rate = None
             previous = _previous_observation(repo, plant_id, obs_date_iso)
-            if (previous and previous.get("height_cm") is not None
+            if (not suspect and previous and previous.get("height_cm") is not None
                     and previous.get("observation_date")):
                 span = dbm.days_between(
                     previous["observation_date"], obs_date_iso)
@@ -565,6 +601,8 @@ def import_camera_measurements(
                     rod_length_cm=row_rod_length,
                     calibration_source=config.CALIBRATION_SOURCE_CAMERA,
                     calibration_verified=rod_verified,
+                    quality_flag=quality_flag,
+                    quality_note=quality_note,
                     data_source=data_source,
                     reason="camera import",
                 )
@@ -629,18 +667,20 @@ def rebuild_daily_observation_from_captures(
     calibration_source = accepted[0].get("calibration_source") \
         or config.CALIBRATION_SOURCE_CAMERA
 
-    age_days = None
-    if plant.get("date_started"):
-        try:
-            delta = dbm.days_between(plant["date_started"], obs_date_iso)
-            if delta >= 0:
-                age_days = delta
-        except Exception:
-            pass
+    age_days = dbm.age_days_for_plant(plant, obs_date_iso)
+
+    suspect = dbm.is_height_outlier(
+        height, _trailing_heights(repo, plant_id, obs_date_iso))
+    quality_flag = "height_jump_suspect" if suspect else None
+    quality_note = (
+        "Height differs by more than "
+        f"{int(config.HEIGHT_JUMP_SUSPECT_RATIO * 100)}% from the trailing "
+        "median. Kept for review; excluded from growth rates and medians."
+        if suspect else None)
 
     growth_rate = None
     previous = _previous_observation(repo, plant_id, obs_date_iso)
-    if (previous and previous.get("height_cm") is not None
+    if (not suspect and previous and previous.get("height_cm") is not None
             and previous.get("observation_date")):
         span = dbm.days_between(previous["observation_date"], obs_date_iso)
         if span > 0:
@@ -660,6 +700,8 @@ def rebuild_daily_observation_from_captures(
         rod_length_cm=rod_length_cm,
         calibration_source=calibration_source,
         calibration_verified=calibration_verified,
+        quality_flag=quality_flag,
+        quality_note=quality_note,
         data_source=data_source,
         reason=reason,
     )

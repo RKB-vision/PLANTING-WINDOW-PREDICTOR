@@ -21,6 +21,7 @@ interface CameraCapture {
   calibration_verified: boolean | number
   validity: string
   problem: string | null
+  quality_flag?: string | null
 }
 
 interface CaptureGroup {
@@ -30,6 +31,15 @@ interface CaptureGroup {
   variety: string | null
   observation_date: string
   captures: CameraCapture[]
+  proposed?: {
+    median_height_cm?: number | null
+    median_stem_width_cm?: number | null
+    median_visible_true_leaf_count?: number | null
+    n_valid?: number
+    n_total?: number
+    suspect?: boolean
+    suspect_note?: string | null
+  }
 }
 
 interface PredictionResult {
@@ -40,6 +50,14 @@ interface PredictionResult {
   days_remaining?: number
   predicted_readiness_date?: string | null
   days_remaining_uncertainty_days?: number | null
+  age_source?: string
+  estimate_basis?: string
+  target_height_cm?: number | null
+  robust_growth_rate_cm_per_day?: number | null
+  n_history_readings?: number | null
+  suspect_rows_excluded?: number
+  date_stability?: string | null
+  stability_note?: string | null
   cohort_snapshot?: {
     median_height_cm?: number | null
     median_growth_rate_cm_per_day?: number | null
@@ -59,6 +77,11 @@ function queryString(value: string | string[] | undefined): string {
 function formatValue(value: number | string | null | undefined): string {
   if (value === null || value === undefined || value === '') return '—'
   return String(value)
+}
+
+function isFutureDate(value: string | null | undefined): boolean {
+  if (!value) return false
+  return value > new Date().toISOString().slice(0, 10)
 }
 
 export default function VerifyReadings() {
@@ -263,7 +286,11 @@ export default function VerifyReadings() {
               <div className="verification-slide-topbar">
                 <div className="verification-group-heading">
                   <h2>{activeGroup?.external_ref || `Plant ${activeGroup?.plant_id}`}</h2>
-                  <p>{activeGroup?.species}{activeGroup?.variety ? ` · ${activeGroup.variety}` : ''} · {activeGroup?.observation_date}</p>
+                  <p>{activeGroup?.species}{activeGroup?.variety ? ` · ${activeGroup.variety}` : ''} · {activeGroup?.observation_date}
+                    {isFutureDate(activeGroup?.observation_date) && (
+                      <span className="badge badge-neutral" style={{ marginLeft: 8 }} title="Future-dated reading: shown for information, not excluded">Future-dated</span>
+                    )}
+                  </p>
                 </div>
                 <div className="verification-slide-navigation">
                   <button className="btn btn-secondary btn-sm" disabled={activeIndex === 0} onClick={() => setActiveIndex(index => Math.max(0, index - 1))} aria-label="Previous reading">← Previous</button>
@@ -297,7 +324,25 @@ export default function VerifyReadings() {
                         <span className={`badge ${activeCapture.validity === 'valid' ? 'badge-success' : 'badge-warning'}`}>
                           {activeCapture.validity || 'unknown'}
                         </span>
+                        {activeCapture.quality_flag === 'height_jump_suspect' && (
+                          <span className="badge badge-warning" title="Differs by more than 50% from the previous accepted height">Height jump</span>
+                        )}
                       </div>
+                      {activeGroup?.proposed && (
+                        <div className="small" style={{ margin: '4px 0 10px' }}>
+                          <p style={{ margin: 0 }}>
+                            Proposed daily median: <strong>{formatValue(activeGroup.proposed.median_height_cm)} cm</strong>
+                            {activeGroup.proposed.n_valid != null && activeGroup.proposed.n_total != null
+                              ? ` from ${activeGroup.proposed.n_valid} valid of ${activeGroup.proposed.n_total} image(s)`
+                              : ''}
+                          </p>
+                          {activeGroup.proposed.suspect && (
+                            <p className="alert alert-warning" style={{ marginTop: 6 }} role="status">
+                              {activeGroup.proposed.suspect_note || 'This reading differs by more than 50% from the previous accepted height. It will be stored as suspect and excluded from growth rates and medians.'}
+                            </p>
+                          )}
+                        </div>
+                      )}
                       <dl className="verification-measurements">
                         <div><dt>Plant height</dt><dd>{formatValue(activeCapture.height_cm)} cm</dd></div>
                         <div><dt>Stem width</dt><dd>{activeCapture.stem_width_cm == null || activeCapture.stem_width_cm <= 0 ? 'not detected' : `${formatValue(activeCapture.stem_width_cm)} cm`}</dd></div>
@@ -350,6 +395,20 @@ export default function VerifyReadings() {
                   <h2>{prediction.days_remaining != null ? `${prediction.days_remaining} days remaining` : 'Prediction available'}</h2>
                   {prediction.predicted_readiness_date && <p>Estimated readiness date: <strong>{prediction.predicted_readiness_date}</strong></p>}
                   {prediction.provisional && <p className="muted small">Provisional historical baseline, not a validated model.</p>}
+                  {prediction.estimate_basis === 'growth_trajectory' && (
+                    <p className="muted small">
+                      Projected from {formatValue(prediction.n_history_readings)} readings at{' '}
+                      {formatValue(prediction.robust_growth_rate_cm_per_day)} cm/day toward the historical
+                      transplant height of {formatValue(prediction.target_height_cm)} cm.
+                    </p>
+                  )}
+                  {prediction.age_source === 'user_estimated_initial_age' && (
+                    <p className="muted small">Plant age is a user-provided estimate, not a measured sowing date.</p>
+                  )}
+                  {(prediction.suspect_rows_excluded ?? 0) > 0 && (
+                    <p className="muted small">{prediction.suspect_rows_excluded} suspect reading(s) excluded (&gt;50% height jump).</p>
+                  )}
+                  {prediction.stability_note && <p className="muted small">{prediction.stability_note}</p>}
                 </>
               ) : <p>{prediction.message}</p>}
             </>

@@ -4,10 +4,12 @@
   "variety": null,
   "data_source": "real",
   "source_label": "Sunflower (SuperOrange) successful cohort",
-  "generated_at": "2026-10-28T04:55:59.243714+00:00",
+  "generated_at": "2026-10-29T03:09:20.340136+00:00",
   "n_plants": 10,
   "n_points": 250,
   "n_plants_contributing_to_medians": 10,
+  "median_transplant_height_cm": 7.25,
+  "transplant_height_iqr_cm": 0.875,
   "transplant_reference": {
     "assumption": true,
     "rule": "transplant_date = day after the plant's final monitoring day (assumed for the successful cohort; not an independently verified transplant date)",
@@ -578,6 +580,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 8.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -590,6 +593,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 8.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -602,6 +606,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -614,6 +619,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -626,6 +632,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.5,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -638,6 +645,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -650,6 +658,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.5,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -662,6 +671,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -674,6 +684,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 7.0,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     },
@@ -686,6 +697,7 @@
       "transplant_date": "2026-09-28",
       "transplant_source": "assumed_day_after_last_observation",
       "transplant_is_assumption": true,
+      "final_height_cm": 8.5,
       "n_growth_rates_derived": 0,
       "median_growth_rate_cm_per_day": 0.2
     }

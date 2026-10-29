@@ -50,7 +50,9 @@ class BaseRepository:
                        data_source: str = "real",
                        growing_conditions: Optional[str] = None,
                        external_ref: Optional[str] = None,
-                       cohort: Optional[str] = None) -> int:
+                       cohort: Optional[str] = None,
+                       initial_age_days: Optional[int] = None,
+                       initial_age_measured_on: Optional[str] = None) -> int:
         raise NotImplementedError
 
     def get_plant(self, plant_id: int) -> Optional[dict]:
@@ -326,12 +328,15 @@ class SQLiteRepository(BaseRepository):
     # -- plants ------------------------------------------------------------ #
     def register_plant(self, *, species, variety=None, date_started=None,
                        data_source="real", growing_conditions=None,
-                       external_ref=None, cohort=None) -> int:
+                       external_ref=None, cohort=None,
+                       initial_age_days=None,
+                       initial_age_measured_on=None) -> int:
         return dbm.register_plant(
             self.conn, species=species, variety=variety,
             date_started=date_started, data_source=data_source,
             growing_conditions=growing_conditions, external_ref=external_ref,
-            cohort=cohort)
+            cohort=cohort, initial_age_days=initial_age_days,
+            initial_age_measured_on=initial_age_measured_on)
 
     def get_plant(self, plant_id) -> Optional[dict]:
         try:

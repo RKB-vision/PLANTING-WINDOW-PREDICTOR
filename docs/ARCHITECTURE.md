@@ -155,6 +155,20 @@ only one valid measurement exists, the system must not invent a growth rate. An
 age-based or reference-based estimate is acceptable only when its limitations are
 made explicit.
 
+Plant age comes from recorded evidence only: either an exact planting date, or a
+user-supplied initial age with the date it was observed (for a nursery seedling).
+A user-supplied age is labelled as an estimate; the system never derives a fake
+planting date from it.
+
+For a plant with no reliable age, the provisional fallback may project the
+plant's robust (Theil-Sen median) growth rate to the cohort's historical median
+transplant height. While the plant keeps growing, the predicted date is never
+moved later: it is held at the previous estimate. A later date is allowed only
+when the height did not increase (a genuine stall). A reading whose height differs
+from the previous accepted height by more than 50% is flagged as suspect, kept
+for review, and excluded from growth rates and medians. A future-dated reading is
+informational: it is not excluded from the cohort.
+
 A prediction must use only information available at the prediction time.
 Historical evaluation must not leak later observations or eventual outcomes into
 earlier predictions.
